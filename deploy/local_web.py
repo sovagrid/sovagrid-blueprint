@@ -201,7 +201,7 @@ class LocalWeb:
         require(state is None, "PUBLIC_ACTIVE")
 
     def local_health(self):
-        # A promoted Home Hub has its own CA. /etc/sovagrid/hub-ca.pem may
+        # A local Hub promoted from an external Agent has its own CA. /etc/sovagrid/hub-ca.pem may
         # still belong to the independent external Agent and must not be used
         # to validate the local Hub's TLS listener.
         ca = ("/var/lib/sovagrid/local-hub-ca.pem" if

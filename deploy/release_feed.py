@@ -686,7 +686,7 @@ def _check_expected_state(expected_state: str | None) -> None:
 def _require_full_server() -> None:
     """The signed feed currently arms only the full-server update worker.
 
-    Hub-only Home keeps an independent external Agent and reverse tunnel.
+    A Hub-only installation keeps an independent external Agent and reverse tunnel.
     Even a partial or unsafe promotion footprint must block full updates.
     """
     for path in (PROMOTION_STATE_DIR, *HUB_ONLY_ARTIFACTS, HUB_ONLY_MANUAL_POLICY):
