@@ -11,14 +11,15 @@
 Для ручной установки на свой Ubuntu-сервер склонируйте пять публичных репозиториев рядом. Адрес `SERVER_ADDRESS` ниже означает адрес **вашего** сервера; установщик не содержит заранее заданного сервера или общей учётной записи:
 
 ```sh
-sudo mkdir -p /opt/sovagrid-src
-sudo chown "$(id -u):$(id -g)" /opt/sovagrid-src
+sudo apt-get update
+sudo apt-get install -y git
+sudo install -d -o root -g root -m 0755 /opt/sovagrid-src
 cd /opt/sovagrid-src
-git clone https://github.com/sovagrid/sovagrid-blueprint.git
-git clone https://github.com/sovagrid/sovagrid-hub.git
-git clone https://github.com/sovagrid/sovagrid-web.git
-git clone https://github.com/sovagrid/sovagrid-agent.git
-git clone https://github.com/sovagrid/sovagrid-vpn.git
+sudo git clone https://github.com/sovagrid/sovagrid-blueprint.git
+sudo git clone https://github.com/sovagrid/sovagrid-hub.git
+sudo git clone https://github.com/sovagrid/sovagrid-web.git
+sudo git clone https://github.com/sovagrid/sovagrid-agent.git
+sudo git clone https://github.com/sovagrid/sovagrid-vpn.git
 ```
 
 Итоговое расположение:
@@ -32,7 +33,7 @@ git clone https://github.com/sovagrid/sovagrid-vpn.git
   sovagrid-vpn/
 ```
 
-Для установки без клонирования GitHub-репозиториев подготовьте один пакет на доверенном компьютере из этих пяти репозиториев: `python3 sovagrid-blueprint/package_server.py`. Полученный `SovaGrid-server-source.tar.gz` передайте на сервер через доверенный SFTP-клиент и распакуйте в `/opt/sovagrid-src`. Упаковщик берёт только уже сохранённые в Git файлы и не кладёт в архив локальные пароли, базу, `.git` и кеши. На сервере для установки не нужен GitHub-токен.
+Для установки без клонирования GitHub-репозиториев скачайте [проверенный серверный пакет](https://github.com/sovagrid/sovagrid-blueprint/releases/tag/v0.10.0-preview) и сверьте SHA-256 со значением на странице выпуска. Передайте архив на сервер через доверенный SFTP-клиент и распакуйте от root в `/opt/sovagrid-src`: `sudo install -d -o root -g root -m 0755 /opt/sovagrid-src && sudo tar -xzf SovaGrid-server-source-0.10.0-preview.tar.gz -C /opt/sovagrid-src`. При самостоятельной сборке пакета из пяти репозиториев запустите на доверенном компьютере `python3 sovagrid-blueprint/package_server.py`. Упаковщик берёт только уже сохранённые в Git файлы и не кладёт в архив локальные пароли, базу, `.git` и кеши. На сервере для установки не нужен GitHub-токен.
 
 Затем запустите:
 
