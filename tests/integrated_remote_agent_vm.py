@@ -120,6 +120,7 @@ def setup(state_dir: Path) -> None:
              "host_socket_active": command("systemctl", "is-active", "--quiet", "ssh.socket", check=False).returncode == 0,
              "host_service_enabled": command("systemctl", "is-enabled", "--quiet", "ssh.service", check=False).returncode == 0,
              "host_socket_enabled": command("systemctl", "is-enabled", "--quiet", "ssh.socket", check=False).returncode == 0,
+             "host_sshd_runtime_existed": Path("/run/sshd").exists(),
              "auth_file_existed": Path("/root/.ssh/authorized_keys").exists(),
              "known_hosts_existed": Path("/root/.ssh/known_hosts").exists()}
     save(state_dir, state)
@@ -187,6 +188,11 @@ def setup(state_dir: Path) -> None:
     if not Path("/usr/sbin/sshd").exists():
         command("apt-get", "update")
         command("apt-get", "install", "-y", "--no-install-recommends", "openssh-server")
+    # Ubuntu's ssh.service normally creates this volatile directory before
+    # ExecStart. We validate sshd ourselves before starting the unit, so make
+    # the same runtime prerequisite explicit on a fresh GitHub runner.
+    require(not Path("/run/sshd").is_symlink(), "SSH runtime directory is a symlink")
+    command("install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/run/sshd")
     command("ssh-keygen", "-A")
     command("/usr/sbin/sshd", "-t")
     command("systemctl", "disable", "--now", "ssh.socket", check=False)
@@ -333,6 +339,8 @@ def cleanup(state_dir: Path) -> None:
         if network_exists(name):
             attempt("network " + name, lambda name=name: command("docker", "network", "rm", name))
     attempt("stop CI SSH", lambda: command("systemctl", "stop", "ssh.service", check=False))
+    if state.get("host_sshd_runtime_existed") is False and Path("/run/sshd").is_dir():
+        attempt("SSH runtime directory", lambda: Path("/run/sshd").rmdir())
     if SSH_CONFIG.exists() or SSH_CONFIG.is_symlink():
         def remove_policy():
             require(SSH_CONFIG.is_file() and not SSH_CONFIG.is_symlink() and
