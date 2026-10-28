@@ -1,0 +1,3 @@
+# The upstream package is copied byte-for-byte and checked against SOURCE.json.
+# Keep legal texts verbatim, including their original trailing spaces.
+sovagrid_connect/** -whitespace
