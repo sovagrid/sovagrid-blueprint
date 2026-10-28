@@ -30,6 +30,7 @@ class StopProofTests(unittest.TestCase):
         self.state = "active"
         self.substate = "running"
         self.mainpid = str(self.pid)
+        self.invocation = "a" * 32
         self.fragment = worker.AGENT_UNIT_FILE
         self.cgroup_property = self.cgroup
         self.controllers = self.root / "sys/fs/cgroup/cgroup.controllers"
@@ -58,8 +59,8 @@ class StopProofTests(unittest.TestCase):
             "Id": "sovagrid-agent.service", "ActiveState": self.state,
             "SubState": self.substate, "MainPID": self.mainpid,
             "ControlGroup": self.cgroup_property,
-            "InvocationID": "a" * 32, "FragmentPath": self.fragment,
-            "NeedDaemonReload": "no",
+            "InvocationID": self.invocation, "FragmentPath": self.fragment,
+            "NeedDaemonReload": "no", "User": "sovagrid", "Group": "sovagrid",
         }
         output = "".join(f"{key}={value}\n" for key, value in fields.items())
         return subprocess.CompletedProcess(command, 0, output.encode(), b"")
@@ -101,6 +102,12 @@ class StopProofTests(unittest.TestCase):
         self.stop()
         self.stat.write_text(self.proc_stat(12346))
         self.assertTrue(proof.stopped())
+
+    def test_restart_and_second_stop_cannot_prove_original_invocation(self):
+        proof = self.proof()
+        self.stop()
+        self.invocation = "b" * 32
+        self.assertFalse(proof.stopped())
 
     def test_restart_between_unit_and_cgroup_reads_blocks_switch(self):
         proof = self.proof()

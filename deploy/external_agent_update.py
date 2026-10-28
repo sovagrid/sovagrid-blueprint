@@ -4,8 +4,8 @@
 # Additional author attribution terms: see ATTRIBUTION.md.
 """Read-only planning for a future update of a preserved external Agent.
 
-A promoted Home has two independent Agents. The Hub-only updater deliberately
-never adopts the original Agent. This helper verifies that boundary and shows
+A server with its own Hub has two independent Agents. The Hub-only updater
+deliberately never adopts the original Agent. This helper verifies that boundary and shows
 the exact Agent source and enrollment metadata a separate transaction would
 need to change. It has no apply command and does not write a policy, journal,
 file or systemd unit. A live apply also requires an original-Hub lease that
@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import fcntl
+import grp
 import hashlib
 import http.client
 import importlib.util
@@ -25,6 +26,7 @@ import json
 import math
 import os
 from pathlib import Path
+import pwd
 import re
 import secrets
 import socket
@@ -60,6 +62,13 @@ ORIGINAL_HUB_LEASE_TOKEN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 EXTERNAL_AGENT_CGROUP = re.compile(
     r"/(?:[A-Za-z0-9_.:-]+/)*sovagrid-agent\.service\Z")
 EXTERNAL_AGENT_UNIT = "sovagrid-agent.service"
+AGENT_IDLE_SOCKET = Path("/run/sovagrid-agent-control/agent.sock")
+AGENT_IDLE_FIELDS = frozenset(("jobs_inflight", "file_operations",
+                               "terminal_sessions", "upload_sessions",
+                               "network_checks", "probe_helpers"))
+AGENT_IDLE_MAX_HOLD = 880.0
+AGENT_IDLE_ACK_TIMEOUT = 185.0
+AGENT_IDLE_LINE_MAX = 512
 
 
 def _module(name: str, filename: str):
@@ -748,7 +757,7 @@ def _original_hub_lease_request(state: dict, action: str, payload: dict) -> dict
     """Use the enrolled original-Hub tunnel, with no redirect or proxy.
 
     The Agent token and CA are rechecked against enrollment on every request.
-    The remote Unix time is never compared with Home's clock: a monotonic
+    The remote Unix time is never compared with the local clock: a monotonic
     local deadline and each renewal response bound the lease instead.
     """
     paths = {"acquire": "lease", "renew": "lease/renew",
@@ -988,7 +997,7 @@ class OriginalHubLease:
 def _external_unit_properties(*, run=subprocess.run) -> dict[str, str]:
     """Read the one systemd unit without parsing human-facing status output."""
     fields = ("Id", "ActiveState", "SubState", "MainPID", "ControlGroup",
-              "InvocationID", "FragmentPath", "NeedDaemonReload")
+              "InvocationID", "FragmentPath", "NeedDaemonReload", "User", "Group")
     try:
         result = run(["/usr/bin/systemctl", "show", EXTERNAL_AGENT_UNIT,
                       *("--property=" + name for name in fields), "--no-pager"],
@@ -1137,7 +1146,8 @@ class ExternalAgentStopProof:
         if (before["ActiveState"] != "inactive" or
                 before["SubState"] != "dead" or
                 before["MainPID"] != "0" or
-                before["ControlGroup"] not in ("", self.cgroup)):
+                before["ControlGroup"] not in ("", self.cgroup) or
+                before["InvocationID"] != self.invocation_id):
             return False
         old_process = _proc_start_ticks(self.pid, root=self.root)
         if old_process == self.start_ticks:
@@ -1150,7 +1160,285 @@ class ExternalAgentStopProof:
                 after["SubState"] == "dead" and
                 after["MainPID"] == "0" and
                 after["ControlGroup"] in ("", self.cgroup) and
-                after["InvocationID"] == before["InvocationID"])
+                after["InvocationID"] == self.invocation_id)
+
+
+def _agent_idle_peer(connection: socket.socket) -> tuple[int, int, int]:
+    """Use kernel credentials from the connected socket, never protocol text."""
+    need(sys.platform.startswith("linux") and hasattr(socket, "SO_PEERCRED"),
+         "AGENT_IDLE_UNAVAILABLE")
+    try:
+        raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                    struct.calcsize("3i"))
+        need(len(raw) == struct.calcsize("3i"), "AGENT_IDLE_PEER")
+        return struct.unpack("3i", raw)
+    except Refused:
+        raise
+    except (OSError, ValueError, struct.error):
+        raise Refused("AGENT_IDLE_PEER") from None
+
+
+def _agent_idle_line(connection: socket.socket, *, deadline: float,
+                     limit: int = AGENT_IDLE_LINE_MAX) -> bytes:
+    """Read a single bounded line with a wall-clock deadline."""
+    raw = bytearray()
+    while len(raw) < limit:
+        remaining = deadline - time.monotonic()
+        need(remaining > 0, "AGENT_IDLE_TIMEOUT")
+        try:
+            connection.settimeout(remaining)
+            item = connection.recv(1)
+        except socket.timeout:
+            raise Refused("AGENT_IDLE_TIMEOUT") from None
+        except OSError:
+            raise Refused("AGENT_IDLE_CLOSED") from None
+        need(item != b"", "AGENT_IDLE_CLOSED")
+        raw.extend(item)
+        if item == b"\n":
+            return bytes(raw)
+    raise Refused("AGENT_IDLE_PROTOCOL")
+
+
+def _agent_idle_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        need(key not in value, "AGENT_IDLE_PROTOCOL")
+        value[key] = item
+    return value
+
+
+def _agent_idle_ack(raw: bytes, pid: int) -> str:
+    if raw == b"BUSY 1\n":
+        raise Refused("AGENT_IDLE_BUSY")
+    try:
+        value = json.loads(raw, object_pairs_hook=_agent_idle_pairs)
+    except Refused:
+        raise
+    except (ValueError, UnicodeError, TypeError):
+        raise Refused("AGENT_IDLE_PROTOCOL") from None
+    need(isinstance(value, dict) and
+         set(value) == AGENT_IDLE_FIELDS | {"protocol", "state", "pid", "epoch"} and
+         type(value["protocol"]) is int and value["protocol"] == 1 and
+         value["state"] == "idle" and
+         type(value["pid"]) is int and value["pid"] == pid and
+         isinstance(value["epoch"], str) and
+         re.fullmatch(r"[0-9a-f]{32}", value["epoch"]) is not None and
+         all(type(value[key]) is int and value[key] == 0 for key in AGENT_IDLE_FIELDS),
+         "AGENT_IDLE_PROTOCOL")
+    return value["epoch"]
+
+
+class AgentIdleProof:
+    """Hold the original Agent's idle ACK until its exact unit has stopped.
+
+    This primitive neither stops the unit nor changes files. A future writer
+    must hold its original-Hub lease and transaction locks independently, then
+    call ``begin_stop`` before stopping the service and ``confirm_stopped``
+    before switching any source. An EOF after begin_stop is accepted only when
+    the exact cgroup/PID proof confirms the service is fully stopped.
+    """
+
+    def __init__(self, stop_proof: ExternalAgentStopProof, *,
+                 socket_path: Path = AGENT_IDLE_SOCKET):
+        need(isinstance(stop_proof, ExternalAgentStopProof), "AGENT_IDLE_REQUEST")
+        self.stop_proof = stop_proof
+        self.socket_path = Path(socket_path)
+        self.connection: socket.socket | None = None
+        self.endpoint_identity: tuple[int, int] | None = None
+        self.uid: int | None = None
+        self.gid: int | None = None
+        self.epoch: str | None = None
+        self.started: float | None = None
+        self.last_pong: float | None = None
+        self.stopping = False
+        self.confirmed = False
+        self.failed = False
+        self.closed_during_stop = False
+        self._stop = threading.Event()
+        self._state_lock = threading.Lock()
+        self._io_lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def _identity(self) -> tuple[int, int, int]:
+        properties = _external_unit_properties(run=self.stop_proof.run)
+        need(properties["ActiveState"] == "active" and
+             properties["SubState"] == "running" and
+             properties["MainPID"] == str(self.stop_proof.pid) and
+             properties["ControlGroup"] == self.stop_proof.cgroup and
+             properties["InvocationID"] == self.stop_proof.invocation_id and
+             properties["User"] == "sovagrid" and
+             properties["Group"] == "sovagrid" and
+             _proc_start_ticks(self.stop_proof.pid,
+                               root=self.stop_proof.root) == self.stop_proof.start_ticks,
+             "AGENT_IDLE_IDENTITY")
+        try:
+            uid = pwd.getpwnam("sovagrid").pw_uid
+            gid = grp.getgrnam("sovagrid").gr_gid
+        except KeyError:
+            raise Refused("AGENT_IDLE_IDENTITY") from None
+        need(type(uid) is int and type(gid) is int and uid > 0 and gid > 0,
+             "AGENT_IDLE_IDENTITY")
+        return self.stop_proof.pid, uid, gid
+
+    def _endpoint(self, uid: int, gid: int) -> tuple[int, int]:
+        try:
+            parent = self.socket_path.parent.lstat()
+            endpoint = self.socket_path.lstat()
+        except OSError:
+            raise Refused("AGENT_IDLE_PATH") from None
+        need(stat.S_ISDIR(parent.st_mode) and parent.st_uid == uid and
+             parent.st_gid == gid and stat.S_IMODE(parent.st_mode) == 0o700 and
+             stat.S_ISSOCK(endpoint.st_mode) and endpoint.st_uid == uid and
+             endpoint.st_gid == gid and stat.S_IMODE(endpoint.st_mode) == 0o600 and
+             endpoint.st_nlink == 1, "AGENT_IDLE_PATH")
+        return endpoint.st_dev, endpoint.st_ino
+
+    def _ping(self) -> None:
+        need(self.connection is not None and self.epoch is not None,
+             "AGENT_IDLE_NOT_HELD")
+        with self._io_lock:
+            try:
+                self.connection.settimeout(5)
+                self.connection.sendall(b"PING 1\n")
+            except OSError:
+                raise Refused("AGENT_IDLE_CLOSED") from None
+            response = _agent_idle_line(self.connection,
+                                        deadline=time.monotonic() + 5, limit=64)
+            need(response == b"PONG 1 " + self.epoch.encode("ascii") + b"\n",
+                 "AGENT_IDLE_PROTOCOL")
+        with self._state_lock:
+            self.last_pong = time.monotonic()
+
+    def _heartbeat(self) -> None:
+        while not self._stop.wait(10):
+            try:
+                self._ping()
+            except Refused as exc:
+                stopped_at_close = False
+                if self.stopping and str(exc) == "AGENT_IDLE_CLOSED":
+                    try:
+                        stopped_at_close = self.stop_proof.stopped()
+                    except Exception:
+                        pass
+                with self._state_lock:
+                    if stopped_at_close:
+                        self.closed_during_stop = True
+                    else:
+                        self.failed = True
+                return
+
+    def acquire(self) -> "AgentIdleProof":
+        need(sys.platform.startswith("linux") and os.geteuid() == 0,
+             "AGENT_IDLE_UNAVAILABLE")
+        pid, uid, gid = self._identity()
+        endpoint_identity = self._endpoint(uid, gid)
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.settimeout(5)
+            try:
+                connection.connect(str(self.socket_path))
+            except (ConnectionRefusedError, FileNotFoundError):
+                raise Refused("AGENT_IDLE_BUSY") from None
+            except OSError:
+                raise Refused("AGENT_IDLE_PATH") from None
+            need(_agent_idle_peer(connection) == (pid, uid, gid), "AGENT_IDLE_PEER")
+            need(self._endpoint(uid, gid) == endpoint_identity and
+                 self._identity() == (pid, uid, gid), "AGENT_IDLE_IDENTITY")
+            try:
+                connection.sendall(b"QUIESCE 1\n")
+            except OSError:
+                raise Refused("AGENT_IDLE_CLOSED") from None
+            epoch = _agent_idle_ack(
+                _agent_idle_line(connection,
+                                 deadline=time.monotonic() + AGENT_IDLE_ACK_TIMEOUT), pid)
+            need(self._identity() == (pid, uid, gid) and
+                 self._endpoint(uid, gid) == endpoint_identity,
+                 "AGENT_IDLE_IDENTITY")
+            self.connection = connection
+            self.epoch = epoch
+            self.uid, self.gid = uid, gid
+            self.endpoint_identity = endpoint_identity
+            self.started = time.monotonic()
+            self._ping()
+            self._thread = threading.Thread(target=self._heartbeat, daemon=True,
+                                            name="sovagrid-external-agent-idle")
+            self._thread.start()
+            self.assert_held()
+            return self
+        except BaseException:
+            if self.connection is not None:
+                self.close()
+            else:
+                connection.close()
+            raise
+
+    def assert_held(self) -> None:
+        with self._state_lock:
+            failed, pong = self.failed, self.last_pong
+        need(not self.stopping and not failed and
+             self.connection is not None and self._thread is not None and
+             self._thread.is_alive() and self.started is not None and
+             pong is not None and time.monotonic() - pong <= 25 and
+             time.monotonic() - self.started < AGENT_IDLE_MAX_HOLD,
+             "AGENT_IDLE_LOST")
+        need(self._identity() == (self.stop_proof.pid, self.uid, self.gid) and
+             self._endpoint(self.uid, self.gid) == self.endpoint_identity,
+             "AGENT_IDLE_LOST")
+
+    def begin_stop(self) -> None:
+        self.assert_held()
+        # A fresh reply closes the gap between the last background ping and
+        # the caller's systemctl stop request.
+        self._ping()
+        self.assert_held()
+        with self._state_lock:
+            self.stopping = True
+
+    def confirm_stopped(self) -> None:
+        with self._state_lock:
+            need(self.stopping and not self.failed and self.started is not None and
+                 time.monotonic() - self.started < AGENT_IDLE_MAX_HOLD,
+                 "AGENT_IDLE_LOST")
+        need(self.stop_proof.stopped(), "AGENT_STOP_NOT_PROVEN")
+        # The old process is gone. Its end of this exact connection must now
+        # be closed; an inherited FD or a forged continued PONG is refused.
+        assert self.connection is not None
+        with self._io_lock:
+            try:
+                self.connection.settimeout(3)
+                need(self.connection.recv(1) == b"", "AGENT_IDLE_STILL_OPEN")
+            except socket.timeout:
+                raise Refused("AGENT_IDLE_STILL_OPEN") from None
+            except OSError:
+                raise Refused("AGENT_IDLE_CLOSED") from None
+        with self._state_lock:
+            need(not self.failed, "AGENT_IDLE_LOST")
+        need(self.stop_proof.stopped(), "AGENT_STOP_NOT_PROVEN")
+        with self._state_lock:
+            self.confirmed = True
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=6)
+        if self.connection is not None:
+            if not self.stopping and self._thread is not None and not self._thread.is_alive():
+                try:
+                    with self._io_lock:
+                        self.connection.settimeout(2)
+                        self.connection.sendall(b"RELEASE 1\n")
+                        _agent_idle_line(self.connection,
+                                         deadline=time.monotonic() + 2, limit=64)
+                except (OSError, Refused):
+                    pass
+            self.connection.close()
+            self.connection = None
+
+    def __enter__(self) -> "AgentIdleProof":
+        return self.acquire()
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        self.close()
 
 
 def preview(archive_sha256: str, current_manifest_sha256: str) -> dict:
@@ -1168,7 +1456,7 @@ def preview(archive_sha256: str, current_manifest_sha256: str) -> dict:
         candidate_root, _candidate_commits = common.candidate_source(archive_sha256)
         candidate_sha, candidate_manifest = _manifest(candidate_root)
         # The candidate must be exactly the version already running the local
-        # Hub. The original VPS Hub is checked separately below.
+        # Hub. The original remote Hub is checked separately below.
         need(candidate_sha == current, "CANDIDATE_NOT_LOCAL_HUB")
         changes = _changes(external_manifest, candidate_manifest)
         changes.append({"path": "/opt/sovagrid-agent-installer/source-manifest.json",
