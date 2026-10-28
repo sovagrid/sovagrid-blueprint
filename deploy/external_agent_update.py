@@ -1328,6 +1328,8 @@ class AgentIdleProof:
                 return
 
     def acquire(self) -> "AgentIdleProof":
+        need(self.connection is None and self._thread is None and
+             not self._stop.is_set(), "AGENT_IDLE_REQUEST")
         need(sys.platform.startswith("linux") and os.geteuid() == 0,
              "AGENT_IDLE_UNAVAILABLE")
         pid, uid, gid = self._identity()

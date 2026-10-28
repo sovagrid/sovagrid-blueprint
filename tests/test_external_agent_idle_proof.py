@@ -189,6 +189,13 @@ class IdleProofTests(unittest.TestCase):
         self.assertFalse(self.server_errors)
         self.assertEqual(self.commands[-1], b"RELEASE 1\n")
 
+    def test_second_acquire_cannot_replace_a_live_idle_hold(self):
+        self.start_server()
+        with self.new_guard() as guard:
+            with self.assertRaisesRegex(worker.Refused, "AGENT_IDLE_REQUEST"):
+                guard.acquire()
+            guard.assert_held()
+
     def test_stopped_requires_exact_proof_and_closed_original_socket(self):
         self.start_server()
         with self.new_guard() as guard:
