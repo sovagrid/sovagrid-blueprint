@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+services:
+  web:
+    volumes:
+      - type: bind
+        source: $caddy_dir
+        target: /etc/caddy/public
+        read_only: true
+    ports:
+      - "0.0.0.0:80:9080/tcp"
+      - "0.0.0.0:443:9443/tcp"

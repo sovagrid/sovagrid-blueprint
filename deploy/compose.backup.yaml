@@ -1,0 +1,7 @@
+services:
+  hub:
+    volumes:
+      - type: bind
+        source: /run/sovagrid-hub-backup
+        target: /run/sovagrid-hub-backup
+        read_only: true

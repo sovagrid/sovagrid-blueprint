@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+[Unit]
+Description=Check a locally approved SovaGrid update candidate
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=15min
+RandomizedDelaySec=1min
+AccuracySec=1min
+Unit=sovagrid-auto-update.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+.DS_Store
+Thumbs.db
+deploy/.env
+*.sqlite*
+*.token
+__pycache__/
+*.py[cod]

@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+name: Agent-only promotion on disposable Ubuntu VM
+
+# The root installer runs only after review on main, or by maintainer dispatch.
+# Fork PRs use the non-root validation workflow.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'run.sh'
+      - 'deploy/release_feed.py'
+      - 'deploy/sovagrid-release-feed.service'
+      - 'deploy/sovagrid-release-feed.timer'
+      - 'deploy/promote_agent_only.py'
+      - 'package_server.py'
+      - 'tests/promotion_candidate.py'
+      - 'tests/promotion_vm.py'
+      - 'tests/release_feed_vm.py'
+      - 'tests/test_promote_agent_only.py'
+      - '.github/workflows/promotion-vm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promotion-vm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  promotion:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Confirm disposable VM and Docker prerequisites
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$(cat /proc/1/comm)" = systemd
+          test -d /opt && test ! -L /opt
+          # The hosted image may leave /opt with nonstandard mode. Match a
+          # fresh Ubuntu server without weakening production run.sh checks.
+          sudo -n install -d -o root -g root -m 0755 /opt
+          test "$(stat -c '%u:%a' /opt)" = 0:755
+          sudo -n systemctl start docker
+          sudo -n docker info >/dev/null
+          sudo -n docker compose version
+          test ! -e /opt/sovagrid-src
+          test ! -e /etc/sovagrid
+      - name: Download and verify published 0.3.8 dependency bundle
+        env:
+          RELEASE_URL: https://github.com/sovagrid/sovagrid-blueprint/releases/download/v0.3.8-preview/SovaGrid-server-source-0.3.8.tar.gz
+        run: |
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --silent --show-error \
+            "$RELEASE_URL" -o "$RUNNER_TEMP/sovagrid-0.3.8-published.tar.gz"
+          printf '%s  %s\n' \
+            '9deb36ef29aff0b21eff7b2f367dd8642a747ccafc6d2d8f0bc75010d3e5d907' \
+            "$RUNNER_TEMP/sovagrid-0.3.8-published.tar.gz" | sha256sum --check -
+      - name: Build candidate bundle from this Blueprint and pinned component commits
+        run: |
+          python3 tests/promotion_candidate.py \
+            "$RUNNER_TEMP/sovagrid-0.3.8-published.tar.gz" \
+            "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/sovagrid-promotion-candidate" \
+            "$RUNNER_TEMP/sovagrid-promotion-candidate.tar.gz"
+          mkdir "$RUNNER_TEMP/sovagrid-promotion-source"
+          tar -xzf "$RUNNER_TEMP/sovagrid-promotion-candidate.tar.gz" \
+            -C "$RUNNER_TEMP/sovagrid-promotion-source" --no-same-owner
+      - name: Start an existing external Agent and transport units
+        run: |
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 python3 \
+            tests/promotion_vm.py seed "$RUNNER_TEMP/sovagrid-promotion-source"
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 python3 \
+            tests/promotion_vm.py inspect eligible \
+            "$RUNNER_TEMP/sovagrid-promotion-source/sovagrid-blueprint/deploy/promote_agent_only.py"
+      - name: Prepare while local Hub source is absent
+        run: |
+          manifest_sha=$(sha256sum "$RUNNER_TEMP/sovagrid-promotion-source/sovagrid-bundle.json" | cut -d ' ' -f1)
+          sudo python3 "$RUNNER_TEMP/sovagrid-promotion-source/sovagrid-blueprint/deploy/promote_agent_only.py" \
+            prepare --manifest-sha256 "$manifest_sha"
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 python3 \
+            tests/promotion_vm.py inspect prepared \
+            "$RUNNER_TEMP/sovagrid-promotion-source/sovagrid-blueprint/deploy/promote_agent_only.py"
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 python3 tests/promotion_vm.py external
+      - name: Install only the candidate local Hub
+        run: |
+          sudo install -d -o root -g root -m 0755 /opt/sovagrid-src
+          sudo tar -xzf "$RUNNER_TEMP/sovagrid-promotion-candidate.tar.gz" \
+            -C /opt/sovagrid-src --no-same-owner
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 python3 \
+            tests/promotion_vm.py inspect source_staged \
+            /opt/sovagrid-src/sovagrid-blueprint/deploy/promote_agent_only.py
+          sudo /opt/sovagrid-src/sovagrid-blueprint/run.sh --hub-only
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_RELEASE_FEED_VM_FIXTURE=1 \
+            python3 tests/release_feed_vm.py installed
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 python3 \
+            tests/promotion_vm.py inspect hub_installed \
+            /opt/sovagrid-src/sovagrid-blueprint/deploy/promote_agent_only.py
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 python3 tests/promotion_vm.py external
+      - name: Activate isolated local Agent and verify local metrics
+        run: |
+          sudo python3 /opt/sovagrid-src/sovagrid-blueprint/deploy/promote_agent_only.py activate
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 python3 \
+            tests/promotion_vm.py inspect activated \
+            /opt/sovagrid-src/sovagrid-blueprint/deploy/promote_agent_only.py
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 python3 tests/promotion_vm.py local
+      - name: Repeat activation without restarting or re-enrolling either Agent
+        run: |
+          sudo python3 /opt/sovagrid-src/sovagrid-blueprint/deploy/promote_agent_only.py activate
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 python3 \
+            tests/promotion_vm.py inspect activated \
+            /opt/sovagrid-src/sovagrid-blueprint/deploy/promote_agent_only.py
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 python3 tests/promotion_vm.py repeat

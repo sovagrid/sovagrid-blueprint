@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+name: Integrated server install
+
+on:
+  workflow_dispatch:
+    inputs:
+      hub_ref:
+        description: Exact Hub commit SHA
+        required: true
+        type: string
+      web_ref:
+        description: Exact Web commit SHA
+        required: true
+        type: string
+      agent_ref:
+        description: Exact Agent commit SHA
+        required: true
+        type: string
+      vpn_ref:
+        description: Exact VPN commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Require a disposable GitHub-hosted Ubuntu runner
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test ! -e /var/lib/sovagrid/.managed-by-run-sh
+          sudo -n install -d -o root -g root -m 0755 /opt
+          test "$(stat -c '%u:%a' /opt)" = 0:755
+          sudo -n systemctl start docker
+          sudo -n docker info >/dev/null
+      - uses: actions/checkout@v6
+        with:
+          path: sovagrid-blueprint
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: sovagrid/sovagrid-hub
+          ref: ${{ inputs.hub_ref }}
+          path: sovagrid-hub
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: sovagrid/sovagrid-web
+          ref: ${{ inputs.web_ref }}
+          path: sovagrid-web
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: sovagrid/sovagrid-agent
+          ref: ${{ inputs.agent_ref }}
+          path: sovagrid-agent
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: sovagrid/sovagrid-vpn
+          ref: ${{ inputs.vpn_ref }}
+          path: sovagrid-vpn
+          persist-credentials: false
+      - name: Verify exact component revisions and package one bundle
+        env:
+          HUB_REF: ${{ inputs.hub_ref }}
+          WEB_REF: ${{ inputs.web_ref }}
+          AGENT_REF: ${{ inputs.agent_ref }}
+          VPN_REF: ${{ inputs.vpn_ref }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          for name, key in (("sovagrid-hub", "HUB_REF"),
+                            ("sovagrid-web", "WEB_REF"),
+                            ("sovagrid-agent", "AGENT_REF"),
+                            ("sovagrid-vpn", "VPN_REF")):
+              expected = os.environ[key]
+              if re.fullmatch(r"[0-9a-f]{40}", expected) is None:
+                  raise SystemExit(f"{name} ref must be an exact commit SHA")
+              actual = subprocess.check_output(
+                  ["git", "-C", name, "rev-parse", "HEAD"], text=True).strip()
+              if actual != expected:
+                  raise SystemExit(f"{name} checkout differs from its pin")
+          PY
+          python3 sovagrid-blueprint/package_server.py "$RUNNER_TEMP/SovaGrid-server-source.tar.gz"
+          sudo -n install -d -o root -g root -m 0755 /opt/sovagrid-src
+          sudo -n tar -xzf "$RUNNER_TEMP/SovaGrid-server-source.tar.gz" -C /opt/sovagrid-src
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import hashlib
+          from pathlib import Path
+          path = Path("/opt/sovagrid-src/sovagrid-bundle.json")
+          print("SOVAGRID_EXPECTED_MANIFEST=" + hashlib.sha256(path.read_bytes()).hexdigest())
+          PY
+      - name: Install the complete pinned source on the disposable Ubuntu host
+        run: sudo -n bash /opt/sovagrid-src/sovagrid-blueprint/run.sh
+      - name: Verify live Hub image pin, Agent and Web
+        run: >-
+          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
+          SOVAGRID_EXPECTED_MANIFEST="$SOVAGRID_EXPECTED_MANIFEST"
+          python3 sovagrid-blueprint/tests/integrated_install_vm.py
+      - name: Verify external Agent trial watchdog handshake
+        run: >-
+          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
+          SOVAGRID_EXPECTED_MANIFEST="$SOVAGRID_EXPECTED_MANIFEST"
+          python3 sovagrid-blueprint/tests/integrated_external_agent_trial.py

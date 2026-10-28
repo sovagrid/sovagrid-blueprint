@@ -1,0 +1,19 @@
+services:
+  hub:
+    command:
+      - --db
+      - /data/hub.sqlite
+      - serve
+      - --bind
+      - 0.0.0.0
+      - --port
+      - "8765"
+      - --trusted-proxy
+      - 172.30.253.10
+      - --telegram-token-file
+      - /run/secrets/telegram-bot-token
+    volumes:
+      - type: bind
+        source: ${SOVAGRID_BOT_TOKEN_FILE:?Set SOVAGRID_BOT_TOKEN_FILE to an absolute path on the Docker host}
+        target: /run/secrets/telegram-bot-token
+        read_only: true

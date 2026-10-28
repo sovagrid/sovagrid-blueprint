@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+name: Installer validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/checkout@v6
+        with:
+          repository: sovagrid/sovagrid-web
+          ref: 9378e3a2bd3ab90b410f3c85ddcd963dcbe51748
+          path: fixture-web
+          persist-credentials: false
+      - name: Check installer syntax
+        run: bash -n run.sh
+      - name: Check Python source syntax
+        run: |
+          python - <<'PYCODE'
+          import ast
+          from pathlib import Path
+          for source in (Path('package_server.py'), *Path('deploy').glob('*.py'), *Path('tests').glob('*.py')):
+              ast.parse(source.read_text(), filename=str(source))
+          PYCODE
+      - name: Validate Compose without starting services
+        env:
+          SOVAGRID_BOT_TOKEN_FILE: /tmp/sovagrid-test-token
+        run: |
+          docker compose --env-file deploy/.env.example -f deploy/compose.yaml config --quiet
+          docker compose --env-file deploy/.env.example -f deploy/compose.yaml -f deploy/compose.telegram.yaml config --quiet
+
+      - name: Run installer regression tests
+        env:
+          SOVAGRID_TEST_WEB_SOURCE: ${{ github.workspace }}/fixture-web
+        run: python -m unittest discover -s tests -v
+
+  restricted-ssh:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['22.04', '24.04']
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build disposable SSH fixture
+        run: docker build -f tests/Dockerfile.sshd --build-arg UBUNTU_VERSION=${{ matrix.ubuntu }} -t sovagrid-ssh-fixture .
+      - name: Verify actual restricted SSH and owned live revocation
+        run: docker run --rm --init --network none sovagrid-ssh-fixture
+
+  public-web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Check pinned Caddy validator alongside live static-IP Web
+        env:
+          PUBLIC_WEB_DOCKER_TEST: '1'
+        run: python -m unittest discover -s tests -p test_public_web_docker.py -v
+      - uses: actions/checkout@v6
+        with:
+          repository: sovagrid/sovagrid-hub
+          ref: 99ff6fcfbf95f40e382efb1e21e6c442fc0754ba
+          path: fixture-hub
+          persist-credentials: false
+      - name: Extract the pinned official Caddy binary
+        run: |
+          id=$(docker create caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f)
+          docker cp "$id:/usr/bin/caddy" /tmp/sovagrid-caddy
+          docker rm "$id"
+          chmod 0755 /tmp/sovagrid-caddy
+      - name: Actual TLS routing, public Agent denial and real Hub IP rate limiting
+        env:
+          CADDY_BINARY: /tmp/sovagrid-caddy
+          HUB_SOURCE: ${{ github.workspace }}/fixture-hub
+        run: python -m unittest discover -s tests -p test_public_web_caddy.py -v

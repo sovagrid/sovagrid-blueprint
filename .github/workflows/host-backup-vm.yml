@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+name: Managed host backup on disposable Ubuntu VM
+
+# Root operations and a brief Hub/Web stop are confined to a fresh GitHub VM.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'run.sh'
+      - 'deploy/host_backup.py'
+      - 'deploy/host_backup_orchestrator.py'
+      - 'deploy/sovagrid-hub-backup-control.service'
+      - 'deploy/sovagrid-hub-backup-control.socket'
+      - 'deploy/compose.backup.yaml'
+      - 'tests/host_backup_vm.py'
+      - '.github/workflows/host-backup-vm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: managed-host-backup-vm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Confirm a fresh disposable Ubuntu VM
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$(cat /proc/1/comm)" = systemd
+          sudo -n install -d -o root -g root -m 0755 /opt
+          test "$(stat -c '%u:%a' /opt)" = 0:755
+          test ! -e /opt/sovagrid-src
+          test ! -e /etc/sovagrid
+          sudo -n systemctl start docker
+          sudo -n docker info >/dev/null
+          sudo -n docker compose version
+      - name: Package this Blueprint with exact public component commits
+        run: |
+          root="$RUNNER_TEMP/sovagrid-host-backup"
+          mkdir -p "$root"
+          git clone --quiet --no-hardlinks "$GITHUB_WORKSPACE" "$root/sovagrid-blueprint"
+          test "$(git -C "$root/sovagrid-blueprint" rev-parse HEAD)" = "$GITHUB_SHA"
+          for spec in \
+            'sovagrid-hub:99ff6fcfbf95f40e382efb1e21e6c442fc0754ba' \
+            'sovagrid-web:9378e3a2bd3ab90b410f3c85ddcd963dcbe51748' \
+            'sovagrid-agent:f43c00c13cecbf824aa062fec65c0efb85ba1c60' \
+            'sovagrid-vpn:8317390dbf2f41fad22ea6cdda65aa960cae2046'; do
+            name=${spec%%:*}
+            commit=${spec#*:}
+            git clone --quiet "https://github.com/sovagrid/$name.git" "$root/$name"
+            git -C "$root/$name" checkout --quiet --detach "$commit"
+            test "$(git -C "$root/$name" rev-parse HEAD)" = "$commit"
+          done
+          python3 "$root/sovagrid-blueprint/package_server.py" \
+            "$RUNNER_TEMP/sovagrid-host-backup.tar.gz"
+      - name: Install the full Hub and restricted root broker
+        run: |
+          sudo install -d -o root -g root -m 0755 /opt/sovagrid-src
+          sudo tar -xzf "$RUNNER_TEMP/sovagrid-host-backup.tar.gz" \
+            -C /opt/sovagrid-src --no-same-owner
+          sudo /opt/sovagrid-src/sovagrid-blueprint/run.sh
+          sudo systemctl is-active --quiet sovagrid-hub-backup-control.socket
+          sudo systemctl is-active --quiet sovagrid-hub-backup-control.service
+          test "$(sudo stat -c '%U:%G:%a' /var/lib/sovagrid-host-backup-operations)" = root:root:700
+      - name: Snapshot through the broker and verify restart and Web boundary
+        run: |
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            python3 -I /opt/sovagrid-src/sovagrid-blueprint/tests/host_backup_vm.py run

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+# Loopback-only panel routes. This overlay never publishes public ports.
+services:
+  web:
+    volumes:
+      - type: bind
+        source: $caddy_dir
+        target: /etc/caddy/local
+        read_only: true

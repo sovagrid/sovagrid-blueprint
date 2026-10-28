@@ -1,0 +1,17 @@
+[Unit]
+Description=Recover or finalize a SovaGrid external Agent source update
+After=local-fs.target
+Before=sovagrid-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/sovagrid-src/sovagrid-blueprint/deploy/external_agent_update.py recover
+TimeoutStartSec=120
+UMask=0077
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+# RequiredBy and Before make a failed recovery block the original Agent.
+# The normal boot command has no live trial gate and rolls back a trial.
+RequiredBy=sovagrid-agent.service

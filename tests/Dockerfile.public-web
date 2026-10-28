@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+FROM caddy:2.11.7-alpine@sha256:eb4d35b7452d1ab6171fbdbe8d9275b2301dad6dad92115d91e19fb9b24d510f
+RUN cp /usr/bin/caddy /usr/local/bin/caddy-rootless && chmod 0755 /usr/local/bin/caddy-rootless
+USER 10002:10002
+ENTRYPOINT ["/usr/local/bin/caddy-rootless"]
+CMD ["run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]

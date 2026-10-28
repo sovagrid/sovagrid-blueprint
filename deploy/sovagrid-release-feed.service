@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+[Unit]
+Description=Stage one cryptographically signed SovaGrid server release
+ConditionPathExists=/etc/sovagrid/release-feed.json
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/sovagrid-src/sovagrid-blueprint/deploy/release_feed.py poll
+UMask=0077
+TimeoutStartSec=5min
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes

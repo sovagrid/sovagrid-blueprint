@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+ARG UBUNTU_VERSION=24.04
+FROM ubuntu:${UBUNTU_VERSION}
+ENV DEBIAN_FRONTEND=noninteractive SOVAGRID_DISPOSABLE_SSH_FIXTURE=1
+RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod 0755 /usr/sbin/policy-rc.d \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends python3 openssh-server openssh-client \
+       openssl ca-certificates systemd passwd \
+    && rm -rf /var/lib/apt/lists/*
+COPY deploy/remote_agent.py /work/deploy/remote_agent.py
+COPY deploy/agent_features.py /work/deploy/agent_features.py
+COPY tests/sshd_integration.py /work/tests/sshd_integration.py
+COPY tests/test_remote_agent.py /work/tests/test_remote_agent.py
+COPY tests/test_agent_features.py /work/tests/test_agent_features.py
+WORKDIR /work
+# Run with --rm --init --network none, without mounts, ports or --privileged.
+# systemd is installed for version compatibility; it is NOT PID 1 in this test.
+ENTRYPOINT ["/usr/bin/python3", "-I", "-B", "/work/tests/sshd_integration.py"]

@@ -1,0 +1,225 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+name: Inactive release-feed migration on disposable Hub VM
+
+# Root changes run only on a disposable GitHub-hosted Ubuntu VM after a push.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'run.sh'
+      - 'deploy/release_feed.py'
+      - 'deploy/remote_update_worker.py'
+      - 'deploy/sovagrid-release-feed.service'
+      - 'deploy/sovagrid-release-feed.timer'
+      - 'tests/release_feed_vm.py'
+      - '.github/workflows/release-feed-migration-vm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-feed-migration-vm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full-hub:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Confirm a fresh disposable runner
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$(cat /proc/1/comm)" = systemd
+          sudo -n install -d -o root -g root -m 0755 /opt
+          sudo -n systemctl start docker
+          sudo -n docker info >/dev/null
+          sudo -n docker compose version
+          test ! -e /opt/sovagrid-src
+          test ! -e /etc/sovagrid
+      - name: Package this Blueprint with exact public component commits
+        run: |
+          root="$RUNNER_TEMP/sovagrid-feed-full"
+          mkdir -p "$root"
+          git clone --quiet --no-hardlinks "$GITHUB_WORKSPACE" "$root/sovagrid-blueprint"
+          test "$(git -C "$root/sovagrid-blueprint" rev-parse HEAD)" = "$GITHUB_SHA"
+          for spec in \
+            'sovagrid-hub:99ff6fcfbf95f40e382efb1e21e6c442fc0754ba' \
+            'sovagrid-web:9378e3a2bd3ab90b410f3c85ddcd963dcbe51748' \
+            'sovagrid-agent:f43c00c13cecbf824aa062fec65c0efb85ba1c60' \
+            'sovagrid-vpn:8317390dbf2f41fad22ea6cdda65aa960cae2046'; do
+            name=${spec%%:*}
+            commit=${spec#*:}
+            git clone --quiet "https://github.com/sovagrid/$name.git" "$root/$name"
+            git -C "$root/$name" checkout --quiet --detach "$commit"
+            test "$(git -C "$root/$name" rev-parse HEAD)" = "$commit"
+          done
+          python3 "$root/sovagrid-blueprint/package_server.py" "$RUNNER_TEMP/sovagrid-feed-full.tar.gz"
+      - name: Fresh full Hub install keeps signed discovery off
+        run: |
+          sudo install -d -o root -g root -m 0755 /opt/sovagrid-src
+          sudo tar -xzf "$RUNNER_TEMP/sovagrid-feed-full.tar.gz" -C /opt/sovagrid-src --no-same-owner
+          sudo /opt/sovagrid-src/sovagrid-blueprint/run.sh
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_RELEASE_FEED_VM_FIXTURE=1 \
+            python3 tests/release_feed_vm.py installed
+          sudo systemctl is-active --quiet sovagrid-auto-update.timer
+          sudo test -f /etc/sovagrid/.agent-unit-managed-by-run-sh
+      - name: Pin the feed state and installed unit bytes before an upgrade
+        run: |
+          sudo python3 - <<'PY'
+          import json
+          from pathlib import Path
+          state = Path('/var/lib/sovagrid/release-feed-state.json')
+          state.write_text(json.dumps({'format': 1, 'highest_sequence': 3,
+                                       'highest_version': '0.3.10', 'highest_issued_at': 1,
+                                       'last_seen_at': 1}, sort_keys=True) + '\n')
+          state.chmod(0o600)
+          PY
+          sudo sha256sum /etc/systemd/system/sovagrid-release-feed.service \
+            /etc/systemd/system/sovagrid-release-feed.timer \
+            /var/lib/sovagrid/.release-feed-units-managed-by-run-sh \
+            /var/lib/sovagrid/release-feed-state.json > "$RUNNER_TEMP/feed-full-baseline.sha256"
+      - name: Build and stage a source-only upgrade
+        run: |
+          cp -a "$RUNNER_TEMP/sovagrid-feed-full" "$RUNNER_TEMP/sovagrid-feed-full-upgrade"
+          python3 - "$RUNNER_TEMP/sovagrid-feed-full-upgrade/sovagrid-blueprint/run.sh" <<'PY'
+          from pathlib import Path
+          import sys
+          source = Path(sys.argv[1])
+          text = source.read_text()
+          anchor = '# SOVAGRID_RELEASE_FEED_UNITS_V1'
+          assert text.count(anchor) == 1
+          source.write_text(text.replace(anchor, anchor + '\n# Disposable full-Hub upgrade fixture'))
+          PY
+          git -C "$RUNNER_TEMP/sovagrid-feed-full-upgrade/sovagrid-blueprint" add run.sh
+          git -C "$RUNNER_TEMP/sovagrid-feed-full-upgrade/sovagrid-blueprint" \
+            -c user.name='SovaGrid VM Fixture' -c user.email='vm-fixture@example.invalid' \
+            commit -m 'VM fixture: full Hub upgrade'
+          python3 "$RUNNER_TEMP/sovagrid-feed-full-upgrade/sovagrid-blueprint/package_server.py" \
+            "$RUNNER_TEMP/sovagrid-feed-full-upgrade.tar.gz"
+          digest=$(sha256sum "$RUNNER_TEMP/sovagrid-feed-full-upgrade.tar.gz" | cut -d ' ' -f1)
+          sudo install -d -o root -g root -m 0700 /opt/sovagrid-candidates
+          sudo install -d -o root -g root -m 0700 "/opt/sovagrid-candidates/$digest"
+          sudo install -d -o root -g root -m 0755 "/opt/sovagrid-candidates/$digest/source"
+          sudo install -o root -g root -m 0600 "$RUNNER_TEMP/sovagrid-feed-full-upgrade.tar.gz" \
+            "/opt/sovagrid-candidates/$digest/bundle.tar.gz"
+          sudo tar -xzf "$RUNNER_TEMP/sovagrid-feed-full-upgrade.tar.gz" \
+            -C "/opt/sovagrid-candidates/$digest/source" --no-same-owner
+          printf '%s\n' "$digest" | sudo tee "/opt/sovagrid-candidates/$digest/.ready" >/dev/null
+          sudo chmod 0600 "/opt/sovagrid-candidates/$digest/.ready"
+      - name: Apply upgrade with feed-unit snapshot and keep discovery disabled
+        run: |
+          digest=$(sha256sum "$RUNNER_TEMP/sovagrid-feed-full-upgrade.tar.gz" | cut -d ' ' -f1)
+          old_manifest=$(sha256sum /opt/sovagrid-src/sovagrid-bundle.json | cut -d ' ' -f1)
+          sudo python3 -I /opt/sovagrid-src/sovagrid-blueprint/deploy/remote_update_worker.py \
+            preflight "$digest" "$old_manifest"
+          sudo python3 -I /opt/sovagrid-src/sovagrid-blueprint/deploy/remote_update_worker.py \
+            apply "$digest" "$old_manifest"
+          new_manifest=$(sha256sum /opt/sovagrid-src/sovagrid-bundle.json | cut -d ' ' -f1)
+          test "$new_manifest" != "$old_manifest"
+          sudo sha256sum --check "$RUNNER_TEMP/feed-full-baseline.sha256"
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_RELEASE_FEED_VM_FIXTURE=1 \
+            python3 tests/release_feed_vm.py installed
+          sudo systemctl is-active --quiet sovagrid-auto-update.timer
+      - name: Build a valid candidate that changes feed state and fails after installation
+        run: |
+          cp -a "$RUNNER_TEMP/sovagrid-feed-full-upgrade" "$RUNNER_TEMP/sovagrid-feed-full-failure"
+          python3 - "$RUNNER_TEMP/sovagrid-feed-full-failure/sovagrid-blueprint/run.sh" \
+            "$RUNNER_TEMP/sovagrid-feed-full-failure/sovagrid-blueprint/deploy/sovagrid-release-feed.service" <<'PY'
+          from pathlib import Path
+          import sys
+          script = Path(sys.argv[1])
+          source = script.read_text()
+          needle = "say 'host Agent is active under the unprivileged sovagrid user'"
+          assert source.count(needle) == 1
+          script.write_text(source.replace(needle,
+              "printf 'corrupted during rollback fixture\\n' > /var/lib/sovagrid/release-feed-state.json\n"
+              "chmod 0600 /var/lib/sovagrid/release-feed-state.json\n"
+              "die 'intentional full-Hub rollback fixture'\n" + needle))
+          service = Path(sys.argv[2])
+          value = service.read_text()
+          original = 'Description=Stage one cryptographically signed SovaGrid server release'
+          assert value.count(original) == 1
+          service.write_text(value.replace(original, 'Description=Rollback fixture release feed service'))
+          PY
+          git -C "$RUNNER_TEMP/sovagrid-feed-full-failure/sovagrid-blueprint" add \
+            run.sh deploy/sovagrid-release-feed.service
+          git -C "$RUNNER_TEMP/sovagrid-feed-full-failure/sovagrid-blueprint" \
+            -c user.name='SovaGrid VM Fixture' -c user.email='vm-fixture@example.invalid' \
+            commit -m 'VM fixture: fail after full Hub feed install'
+          python3 "$RUNNER_TEMP/sovagrid-feed-full-failure/sovagrid-blueprint/package_server.py" \
+            "$RUNNER_TEMP/sovagrid-feed-full-failure.tar.gz"
+          digest=$(sha256sum "$RUNNER_TEMP/sovagrid-feed-full-failure.tar.gz" | cut -d ' ' -f1)
+          sudo install -d -o root -g root -m 0700 "/opt/sovagrid-candidates/$digest"
+          sudo install -d -o root -g root -m 0755 "/opt/sovagrid-candidates/$digest/source"
+          sudo install -o root -g root -m 0600 "$RUNNER_TEMP/sovagrid-feed-full-failure.tar.gz" \
+            "/opt/sovagrid-candidates/$digest/bundle.tar.gz"
+          sudo tar -xzf "$RUNNER_TEMP/sovagrid-feed-full-failure.tar.gz" \
+            -C "/opt/sovagrid-candidates/$digest/source" --no-same-owner
+          printf '%s\n' "$digest" | sudo tee "/opt/sovagrid-candidates/$digest/.ready" >/dev/null
+          sudo chmod 0600 "/opt/sovagrid-candidates/$digest/.ready"
+      - name: Failed upgrade rolls feed units and ledger back without touching the manual timer
+        run: |
+          digest=$(sha256sum "$RUNNER_TEMP/sovagrid-feed-full-failure.tar.gz" | cut -d ' ' -f1)
+          current_manifest=$(sha256sum /opt/sovagrid-src/sovagrid-bundle.json | cut -d ' ' -f1)
+          set +e
+          result=$(sudo python3 -I /opt/sovagrid-src/sovagrid-blueprint/deploy/remote_update_worker.py \
+            apply "$digest" "$current_manifest" 2>&1)
+          code=$?
+          set -e
+          printf '%s\n' "$result"
+          test "$code" = 40
+          printf '%s\n' "$result" | grep -Fq 'SG_APPLY_STAGE:ROLLED_BACK'
+          test "$(sha256sum /opt/sovagrid-src/sovagrid-bundle.json | cut -d ' ' -f1)" = "$current_manifest"
+          sudo sha256sum --check "$RUNNER_TEMP/feed-full-baseline.sha256"
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_RELEASE_FEED_VM_FIXTURE=1 \
+            python3 tests/release_feed_vm.py installed
+          sudo systemctl is-active --quiet sovagrid-auto-update.timer
+      - name: Report bounded rollback diagnostics from the disposable VM
+        if: ${{ failure() }}
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          sudo -n python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import re
+
+          def safe(value):
+              text = str(value).replace('\n', ' ').replace('\r', ' ')
+              text = re.sub(r'https?://\S+', '[url]', text)
+              text = re.sub(r'(?i)(bearer|token|password|secret)[^ ]*', '[redacted]', text)
+              text = re.sub(r'[A-Za-z0-9_+/=-]{24,}', '[redacted]', text)
+              return text[:240]
+
+          root = Path('/opt/sovagrid-candidates/transactions')
+          if not root.is_dir():
+              print('No rollback transaction journal')
+              raise SystemExit(0)
+          for folder in sorted(root.iterdir())[-3:]:
+              state_path = folder / 'state.json'
+              if not folder.is_dir() or state_path.is_symlink() or not state_path.is_file():
+                  continue
+              raw = state_path.read_bytes()
+              if len(raw) > 65536:
+                  continue
+              try:
+                  state = json.loads(raw)
+              except ValueError:
+                  print('Rollback journal is invalid')
+                  continue
+              print('Rollback phase:', safe(state.get('phase', 'unknown')))
+              for error in state.get('errors', [])[:8]:
+                  print('Rollback error:', safe(error))
+              log = folder / 'install.log'
+              if log.is_file() and not log.is_symlink() and log.stat().st_size <= 4 * 1024 * 1024:
+                  lines = log.read_text(errors='replace').splitlines()
+                  for line in [line for line in lines if line.startswith('SovaGrid:')][-8:]:
+                      print('Installer diagnostic:', safe(line))
+          PY

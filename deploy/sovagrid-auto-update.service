@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+[Unit]
+Description=Apply one locally approved SovaGrid source bundle when idle
+ConditionPathExists=/etc/sovagrid/auto-update.json
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/sovagrid-src/sovagrid-blueprint/deploy/auto_update.py run
+UMask=0077
+TimeoutStartSec=0
+Nice=10
+IOSchedulingClass=idle

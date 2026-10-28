@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+http://$site:9080 {
+    redir https://$site{uri} 308
+}
+
+http://:9080 {
+    respond 404
+}
+
+https://$site:9443 {
+    tls {
+        issuer acme $issuer {
+$profile            alt_http_port 9080
+            alt_tlsalpn_port 9443
+        }
+    }
+    header {
+        Content-Security-Policy "frame-ancestors 'none'"
+        X-Frame-Options "DENY"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "same-origin"
+    }
+
+    # Literal route order is required: Caddy otherwise sorts handle before respond.
+    route {
+    # Agent traffic uses the separate SSH-only ingress, never the public panel.
+    @agent_maintenance path_regexp agent_maintenance ^/api/v1/servers/[^/]+/agent-maintenance(?:/[^/]+)*/?$$
+    respond @agent_maintenance 404
+    @agent_get {
+        method GET
+        path_regexp agent_get ^/api/v1/servers/[^/]+/(agent-compatibility|jobs/next|terminal/next|files/next|terminal/sessions/[^/]+/controls)/?$$
+    }
+    respond @agent_get 404
+    @agent_post {
+        method POST
+        path_regexp agent_post ^/api/v1/servers/[^/]+/(metrics|jobs/[^/]+/result|terminal/sessions/[^/]+/(ready|output|exit)|files/operations/[^/]+/result|checks/(claim|[^/]+/result))/?$$
+    }
+    respond @agent_post 404
+
+    @browser_ssh path /api/v1/browser-ssh/*
+    handle @browser_ssh {
+        reverse_proxy ssh-gateway:8768 {
+            header_up X-SovaGrid-Client-IP {remote_host}
+        }
+    }
+
+    @api path /api/*
+    handle @api {
+        reverse_proxy hub:8765 {
+            header_up X-SovaGrid-Client-IP {remote_host}
+        }
+    }
+    handle /healthz {
+        reverse_proxy hub:8765
+    }
+$panel_routes
+$root_route
+    }
+}
+
+https://:9443 {
+    respond 404
+}

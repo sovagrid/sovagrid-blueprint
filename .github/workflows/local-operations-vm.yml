@@ -1,0 +1,225 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+name: Promoted local operations and CAS on disposable Ubuntu VM
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/promote_agent_only.py'
+      - 'deploy/local_operations.py'
+      - 'deploy/hub_only_update.py'
+      - 'tests/local_operations_vm.py'
+      - '.github/workflows/local-operations-vm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: local-operations-vm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  operations:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Confirm a disposable Ubuntu host
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$(cat /proc/1/comm)" = systemd
+          sudo -n install -d -o root -g root -m 0755 /opt
+          sudo -n systemctl start docker
+          sudo -n docker info >/dev/null
+          sudo -n docker compose version
+          test ! -e /opt/sovagrid-src
+          test ! -e /etc/sovagrid
+      - name: Verify published 0.5.0 source used as the prior dependency
+        run: |
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --silent --show-error \
+            https://github.com/sovagrid/sovagrid-blueprint/releases/download/v0.5.0-preview/SovaGrid-server-source-0.5.0.tar.gz \
+            -o "$RUNNER_TEMP/sovagrid-0.5.0.tar.gz"
+          printf '%s  %s\n' \
+            3914fc8e820b261d674aeaa95a7142662c7b0210a97b3e87dfbf4ff351f4da07 \
+            "$RUNNER_TEMP/sovagrid-0.5.0.tar.gz" | sha256sum --check -
+          mkdir "$RUNNER_TEMP/sovagrid-old-source"
+          tar -xzf "$RUNNER_TEMP/sovagrid-0.5.0.tar.gz" \
+            -C "$RUNNER_TEMP/sovagrid-old-source" --no-same-owner
+      - name: Rebuild the exact reviewed 0.5.1 server source
+        run: |
+          mkdir "$RUNNER_TEMP/ops-components"
+          git clone --quiet --no-hardlinks "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/ops-components/sovagrid-blueprint"
+          for component in sovagrid-hub sovagrid-web sovagrid-agent sovagrid-vpn; do
+            git clone --quiet "https://github.com/sovagrid/$component.git" \
+              "$RUNNER_TEMP/ops-components/$component"
+          done
+          git -C "$RUNNER_TEMP/ops-components/sovagrid-blueprint" checkout --quiet --detach \
+            a5afe56bab1794f5fdeab35fdb2f8a7e0d2d8a3a
+          git -C "$RUNNER_TEMP/ops-components/sovagrid-hub" checkout --quiet --detach \
+            bb996e9a338f69b8bee711edfc51a7453c351410
+          git -C "$RUNNER_TEMP/ops-components/sovagrid-web" checkout --quiet --detach \
+            d71832a6e4696793588f47911f51bd506ee4cbee
+          git -C "$RUNNER_TEMP/ops-components/sovagrid-agent" checkout --quiet --detach \
+            3bb360a54a9ff3c8a28519e856911020192314a8
+          git -C "$RUNNER_TEMP/ops-components/sovagrid-vpn" checkout --quiet --detach \
+            0505dd6ed711deb12c35c88adc264240fb68b054
+          python3 "$RUNNER_TEMP/ops-components/sovagrid-blueprint/package_server.py" \
+            "$RUNNER_TEMP/sovagrid-ops-candidate.tar.gz"
+          printf '%s  %s\n' \
+            c18b067bdb5061f9307df7ed1794b0a3c8f661bb1f0700207e33e8438169c537 \
+            "$RUNNER_TEMP/sovagrid-ops-candidate.tar.gz" | sha256sum --check -
+          mkdir "$RUNNER_TEMP/sovagrid-ops-source"
+          tar -xzf "$RUNNER_TEMP/sovagrid-ops-candidate.tar.gz" \
+            -C "$RUNNER_TEMP/sovagrid-ops-source" --no-same-owner
+      - name: Create an external Agent and reverse-tunnel fixture
+        run: |
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 \
+            python3 tests/promotion_vm.py seed "$RUNNER_TEMP/sovagrid-old-source"
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 \
+            python3 tests/promotion_vm.py inspect eligible \
+            "$RUNNER_TEMP/sovagrid-ops-source/sovagrid-blueprint/deploy/promote_agent_only.py"
+      - name: Promote without changing external Agent or SSH units
+        run: |
+          manifest=$(sha256sum "$RUNNER_TEMP/sovagrid-ops-source/sovagrid-bundle.json" | cut -d ' ' -f1)
+          sudo python3 "$RUNNER_TEMP/sovagrid-ops-source/sovagrid-blueprint/deploy/promote_agent_only.py" \
+            prepare --manifest-sha256 "$manifest"
+          sudo install -d -o root -g root -m 0755 /opt/sovagrid-src
+          sudo tar -xzf "$RUNNER_TEMP/sovagrid-ops-candidate.tar.gz" \
+            -C /opt/sovagrid-src --no-same-owner
+          sudo /opt/sovagrid-src/sovagrid-blueprint/run.sh --hub-only
+          sudo python3 /opt/sovagrid-src/sovagrid-blueprint/deploy/promote_agent_only.py \
+            activate --enable-commands
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 \
+            python3 tests/promotion_vm.py external
+      - name: Enable local operations with CAS and verify real PTY and file access
+        run: |
+          helper=/opt/sovagrid-src/sovagrid-blueprint/deploy/local_operations.py
+          revision=$(sudo python3 "$helper" preview | python3 -c 'import json,sys; print(json.load(sys.stdin)["state_revision"])')
+          sudo python3 "$helper" enable files --expected-state "$revision"
+          set +e
+          stale=$(sudo python3 "$helper" enable terminal --expected-state "$revision" 2>&1)
+          stale_code=$?
+          set -e
+          test "$stale_code" = 40
+          printf '%s\n' "$stale" | grep -Fq 'SG_LOCAL_OPERATIONS_REFUSE:STATE_CHANGED'
+          revision=$(sudo python3 "$helper" preview | python3 -c 'import json,sys; print(json.load(sys.stdin)["state_revision"])')
+          sudo python3 "$helper" enable terminal --expected-state "$revision"
+          sudo systemd-analyze verify \
+            /etc/systemd/system/sovagrid-terminal-local-control.service \
+            /etc/systemd/system/sovagrid-terminal-local-control.socket
+          sudo python3 tests/local_operations_vm.py on
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 \
+            python3 tests/promotion_vm.py external
+          sudo python3 /opt/sovagrid-src/sovagrid-blueprint/deploy/promote_agent_only.py inspect
+      - name: Build and stage a later Hub-only candidate
+        run: |
+          cp -a "$RUNNER_TEMP/ops-components" "$RUNNER_TEMP/ops-update-components"
+          printf '\nDisposable VM update fixture.\n' >> \
+            "$RUNNER_TEMP/ops-update-components/sovagrid-blueprint/PROMOTION.md"
+          git -C "$RUNNER_TEMP/ops-update-components/sovagrid-blueprint" add PROMOTION.md
+          git -C "$RUNNER_TEMP/ops-update-components/sovagrid-blueprint" \
+            -c user.name='SovaGrid VM Fixture' -c user.email='vm-fixture@example.invalid' \
+            commit -m 'VM fixture: update promoted Hub source'
+          python3 "$RUNNER_TEMP/ops-update-components/sovagrid-blueprint/package_server.py" \
+            "$RUNNER_TEMP/sovagrid-ops-update.tar.gz"
+          candidate_sha=$(sha256sum "$RUNNER_TEMP/sovagrid-ops-update.tar.gz" | cut -d ' ' -f1)
+          sudo install -d -o root -g root -m 0700 /opt/sovagrid-candidates
+          sudo install -d -o root -g root -m 0700 "/opt/sovagrid-candidates/$candidate_sha"
+          sudo install -d -o root -g root -m 0755 "/opt/sovagrid-candidates/$candidate_sha/source"
+          sudo install -o root -g root -m 0600 "$RUNNER_TEMP/sovagrid-ops-update.tar.gz" \
+            "/opt/sovagrid-candidates/$candidate_sha/bundle.tar.gz"
+          sudo tar -xzf "$RUNNER_TEMP/sovagrid-ops-update.tar.gz" \
+            -C "/opt/sovagrid-candidates/$candidate_sha/source" --no-same-owner
+          printf '%s\n' "$candidate_sha" | sudo tee "/opt/sovagrid-candidates/$candidate_sha/.ready" >/dev/null
+          sudo chmod 0600 "/opt/sovagrid-candidates/$candidate_sha/.ready"
+      - name: Update with local PTY and files enabled
+        run: |
+          candidate_sha=$(sha256sum "$RUNNER_TEMP/sovagrid-ops-update.tar.gz" | cut -d ' ' -f1)
+          old_manifest=$(sha256sum /opt/sovagrid-src/sovagrid-bundle.json | cut -d ' ' -f1)
+          updater=/opt/sovagrid-src/sovagrid-blueprint/deploy/hub_only_update.py
+          sudo python3 -I "$updater" preflight "$candidate_sha" "$old_manifest"
+          sudo python3 -I "$updater" apply "$candidate_sha" "$old_manifest"
+          sudo python3 tests/local_operations_vm.py survived
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 \
+            python3 tests/promotion_vm.py external
+      - name: Build and stage a candidate that intentionally fails after Hub setup
+        run: |
+          cp -a "$RUNNER_TEMP/ops-update-components" "$RUNNER_TEMP/ops-failure-components"
+          python3 - "$RUNNER_TEMP/ops-failure-components/sovagrid-blueprint/run.sh" <<'PY'
+          from pathlib import Path
+          import sys
+          file = Path(sys.argv[1])
+          source = file.read_text()
+          needle = "  say 'Agent was skipped by --hub-only. Re-run without it to enroll the host.'"
+          assert source.count(needle) == 1
+          file.write_text(source.replace(needle, "  die 'intentional VM rollback fixture'\n" + needle))
+          PY
+          git -C "$RUNNER_TEMP/ops-failure-components/sovagrid-blueprint" add run.sh
+          git -C "$RUNNER_TEMP/ops-failure-components/sovagrid-blueprint" \
+            -c user.name='SovaGrid VM Fixture' -c user.email='vm-fixture@example.invalid' \
+            commit -m 'VM fixture: fail during promoted Hub update'
+          python3 "$RUNNER_TEMP/ops-failure-components/sovagrid-blueprint/package_server.py" \
+            "$RUNNER_TEMP/sovagrid-ops-failure.tar.gz"
+          candidate_sha=$(sha256sum "$RUNNER_TEMP/sovagrid-ops-failure.tar.gz" | cut -d ' ' -f1)
+          sudo install -d -o root -g root -m 0700 "/opt/sovagrid-candidates/$candidate_sha"
+          sudo install -d -o root -g root -m 0755 "/opt/sovagrid-candidates/$candidate_sha/source"
+          sudo install -o root -g root -m 0600 "$RUNNER_TEMP/sovagrid-ops-failure.tar.gz" \
+            "/opt/sovagrid-candidates/$candidate_sha/bundle.tar.gz"
+          sudo tar -xzf "$RUNNER_TEMP/sovagrid-ops-failure.tar.gz" \
+            -C "/opt/sovagrid-candidates/$candidate_sha/source" --no-same-owner
+          printf '%s\n' "$candidate_sha" | sudo tee "/opt/sovagrid-candidates/$candidate_sha/.ready" >/dev/null
+          sudo chmod 0600 "/opt/sovagrid-candidates/$candidate_sha/.ready"
+      - name: Roll back while preserving local PTY and files
+        run: |
+          candidate_sha=$(sha256sum "$RUNNER_TEMP/sovagrid-ops-failure.tar.gz" | cut -d ' ' -f1)
+          current_manifest=$(sha256sum /opt/sovagrid-src/sovagrid-bundle.json | cut -d ' ' -f1)
+          updater=/opt/sovagrid-src/sovagrid-blueprint/deploy/hub_only_update.py
+          sudo python3 -I "$updater" preflight "$candidate_sha" "$current_manifest"
+          set +e
+          result=$(sudo python3 -I "$updater" apply "$candidate_sha" "$current_manifest" 2>&1)
+          code=$?
+          set -e
+          printf '%s\n' "$result"
+          test "$code" = 40
+          printf '%s\n' "$result" | grep -Fq 'SG_HUB_ONLY_STAGE:ROLLED_BACK'
+          test "$(sha256sum /opt/sovagrid-src/sovagrid-bundle.json | cut -d ' ' -f1)" = "$current_manifest"
+          sudo python3 tests/local_operations_vm.py survived
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 \
+            python3 tests/promotion_vm.py external
+      - name: Disable both while preserving workspace and external Agent
+        run: |
+          helper=/opt/sovagrid-src/sovagrid-blueprint/deploy/local_operations.py
+          revision=$(sudo python3 "$helper" preview | python3 -c 'import json,sys; print(json.load(sys.stdin)["state_revision"])')
+          sudo python3 "$helper" disable terminal --expected-state "$revision"
+          revision=$(sudo python3 "$helper" preview | python3 -c 'import json,sys; print(json.load(sys.stdin)["state_revision"])')
+          sudo python3 "$helper" disable files --expected-state "$revision"
+          sudo python3 tests/local_operations_vm.py off
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 \
+            python3 tests/promotion_vm.py external
+      - name: Recover a journal left immediately after power loss
+        run: |
+          sudo python3 tests/local_operations_vm.py pending
+          sudo python3 /opt/sovagrid-src/sovagrid-blueprint/deploy/local_operations.py preview
+          sudo python3 /opt/sovagrid-src/sovagrid-blueprint/deploy/local_operations.py recover
+          sudo python3 tests/local_operations_vm.py off
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 \
+            python3 tests/promotion_vm.py external
+      - name: Report local service state after a failed proof
+        if: failure()
+        run: |
+          sudo systemctl show sovagrid-agent-local.service \
+            -p ActiveState -p SubState -p Result -p NRestarts -p ExecMainStatus \
+            --no-pager || true
+          sudo systemctl show sovagrid-terminal-local-control.service \
+            -p ActiveState -p SubState -p Result -p NRestarts -p ExecMainStatus \
+            --no-pager || true
+          sudo journalctl -u sovagrid-agent-local.service --no-pager -n 25 \
+            -o short-iso | sed -E 's/(token|password|secret)=[^ ]+/\1=[redacted]/Ig' || true
