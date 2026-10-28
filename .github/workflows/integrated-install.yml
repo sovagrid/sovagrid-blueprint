@@ -104,6 +104,7 @@ jobs:
               if actual != expected:
                   raise SystemExit(f"{name} checkout differs from its pin")
           PY
+          python3 sovagrid-blueprint/tools/sync_connect_vendor.py check --source sovagrid-connect
           python3 sovagrid-blueprint/package_server.py "$RUNNER_TEMP/SovaGrid-server-source.tar.gz"
           sudo -n install -d -o root -g root -m 0755 /opt/sovagrid-src
           sudo -n tar -xzf "$RUNNER_TEMP/SovaGrid-server-source.tar.gz" -C /opt/sovagrid-src
