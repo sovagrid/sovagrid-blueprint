@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+# Disposable Ubuntu target for the GitHub-hosted two-server install check.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates dbus openssh-client openssh-server passwd python3 \
+       systemd systemd-sysv \
+    && rm -rf /var/lib/apt/lists/* \
+    && install -d -m 0700 /root/.ssh \
+    && install -d -m 0755 /run/sshd \
+    && ssh-keygen -A \
+    && printf '%s\n' \
+       'PermitRootLogin prohibit-password' \
+       'PasswordAuthentication no' \
+       'KbdInteractiveAuthentication no' \
+       'PubkeyAuthentication yes' \
+       > /etc/ssh/sshd_config.d/05-sovagrid-ci.conf \
+    && systemctl enable ssh.service
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

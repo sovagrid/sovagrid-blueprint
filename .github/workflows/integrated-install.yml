@@ -22,6 +22,10 @@ on:
         description: Exact VPN commit SHA
         required: true
         type: string
+      connect_ref:
+        description: Exact Connect commit SHA for remote Agent enrollment
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -68,12 +72,19 @@ jobs:
           ref: ${{ inputs.vpn_ref }}
           path: sovagrid-vpn
           persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: sovagrid/sovagrid-connect
+          ref: ${{ inputs.connect_ref }}
+          path: sovagrid-connect
+          persist-credentials: false
       - name: Verify exact component revisions and package one bundle
         env:
           HUB_REF: ${{ inputs.hub_ref }}
           WEB_REF: ${{ inputs.web_ref }}
           AGENT_REF: ${{ inputs.agent_ref }}
           VPN_REF: ${{ inputs.vpn_ref }}
+          CONNECT_REF: ${{ inputs.connect_ref }}
         run: |
           python3 - <<'PY'
           import os
@@ -83,7 +94,8 @@ jobs:
           for name, key in (("sovagrid-hub", "HUB_REF"),
                             ("sovagrid-web", "WEB_REF"),
                             ("sovagrid-agent", "AGENT_REF"),
-                            ("sovagrid-vpn", "VPN_REF")):
+                            ("sovagrid-vpn", "VPN_REF"),
+                            ("sovagrid-connect", "CONNECT_REF")):
               expected = os.environ[key]
               if re.fullmatch(r"[0-9a-f]{40}", expected) is None:
                   raise SystemExit(f"{name} ref must be an exact commit SHA")
@@ -101,6 +113,13 @@ jobs:
           path = Path("/opt/sovagrid-src/sovagrid-bundle.json")
           print("SOVAGRID_EXPECTED_MANIFEST=" + hashlib.sha256(path.read_bytes()).hexdigest())
           PY
+      - name: Prepare a private SSH and systemd Ubuntu target
+        run: >-
+          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
+          RUNNER_TEMP="$RUNNER_TEMP"
+          python3 sovagrid-blueprint/tests/integrated_remote_agent_vm.py
+          prepare "$RUNNER_TEMP/sovagrid-remote-ci"
       - name: Install the complete pinned source on the disposable Ubuntu host
         run: sudo -n bash /opt/sovagrid-src/sovagrid-blueprint/run.sh
       - name: Verify live Hub image pin, Agent and Web
@@ -115,3 +134,22 @@ jobs:
           RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
           SOVAGRID_EXPECTED_MANIFEST="$SOVAGRID_EXPECTED_MANIFEST"
           python3 sovagrid-blueprint/tests/integrated_external_agent_trial.py
+      - name: Enroll the second server through pinned Connect and verify continuing metrics
+        env:
+          CONNECT_REF: ${{ inputs.connect_ref }}
+        run: >-
+          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
+          RUNNER_TEMP="$RUNNER_TEMP" GITHUB_WORKSPACE="$GITHUB_WORKSPACE"
+          SOVAGRID_EXPECTED_MANIFEST="$SOVAGRID_EXPECTED_MANIFEST"
+          CONNECT_REF="$CONNECT_REF"
+          python3 sovagrid-blueprint/tests/integrated_remote_agent_vm.py
+          verify "$RUNNER_TEMP/sovagrid-remote-ci"
+      - name: Remove disposable server and SSH identities
+        if: always()
+        run: >-
+          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
+          RUNNER_TEMP="$RUNNER_TEMP"
+          python3 sovagrid-blueprint/tests/integrated_remote_agent_vm.py
+          cleanup "$RUNNER_TEMP/sovagrid-remote-ci"
