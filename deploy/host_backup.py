@@ -602,6 +602,10 @@ def _web_agent_marker() -> bool:
 
 
 def _active_writers(layout: str) -> tuple[list[str], list[str]]:
+    if layout == "hub-only" and _present(
+            "/etc/systemd/system/sovagrid-agent.service.requires/"
+            "sovagrid-external-agent-recovery.service"):
+        raise Refused("EXTERNAL_AGENT_UPDATE_BUSY")
     expected = WRITERS[layout]
     gateway_managed = _gateway_marker()
     web_agent_managed = _web_agent_marker()

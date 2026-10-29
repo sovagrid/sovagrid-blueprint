@@ -288,6 +288,12 @@ def inspect() -> tuple[str, dict, dict[str, str], str]:
     need(os.geteuid() == 0, "ROOT")
     release = Path("/etc/os-release").read_text()
     need(re.search(r"(?m)^ID=ubuntu$", release) is not None, "UBUNTU")
+    external_recovery_dependency = Path(
+        "/etc/systemd/system/sovagrid-agent.service.requires/"
+        "sovagrid-external-agent-recovery.service")
+    need(not external_recovery_dependency.exists() and
+         not external_recovery_dependency.is_symlink(),
+         "EXTERNAL_AGENT_RECOVERY_PENDING")
     if common.managed_routing_enabled():
         need(_unit_state(ROUTING_UNIT)["active"], "ROUTING")
     for marker in FORBIDDEN_MARKERS:

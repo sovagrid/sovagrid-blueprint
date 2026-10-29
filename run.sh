@@ -1137,11 +1137,6 @@ if (( hub_only )); then
   fi
   install -o root -g root -m 0600 /dev/null "$recovery_marker"
   systemctl daemon-reload
-  if [[ -f /etc/systemd/system/sovagrid-agent.service &&
-        ! -L /etc/systemd/system/sovagrid-agent.service ]]; then
-    systemctl enable "$recovery_unit" || die 'external Agent recovery unit could not be enabled'
-    systemctl is-enabled --quiet "$recovery_unit" || die 'external Agent recovery unit is not enabled'
-  fi
   install_release_feed_units
   say 'Agent was skipped by --hub-only. Re-run without it to enroll the host.'
   exit 0

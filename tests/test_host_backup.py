@@ -366,6 +366,15 @@ class HostBackupTest(unittest.TestCase):
             with self.assertRaisesRegex(backup.Refused, "SERVICES_RUNNING"):
                 backup._require_offline("hub-only")
 
+    def test_hub_only_refuses_temporary_external_recovery_dependency(self) -> None:
+        dependency = self.root / "etc/systemd/system/sovagrid-agent.service.requires"
+        dependency.mkdir(parents=True)
+        (dependency / "sovagrid-external-agent-recovery.service").symlink_to(
+            "../sovagrid-external-agent-recovery.service")
+        with patch.object(backup, "_layout", return_value="hub-only"):
+            with self.assertRaisesRegex(backup.Refused, "EXTERNAL_AGENT_UPDATE_BUSY"):
+                backup.plan()
+
     def test_optional_gateway_is_managed_without_accepting_foreign_containers(self) -> None:
         identities = {"hub": "a" * 12, "web": "b" * 12,
                       "ssh-gateway": "c" * 12}
