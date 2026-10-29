@@ -37,6 +37,7 @@ def bundle(main_hash: str) -> dict:
         "sovagrid-agent/NOTICE": "3" * 64,
         "sovagrid-agent/ATTRIBUTION.md": "4" * 64,
         "sovagrid-agent/deploy/sovagrid-agent.service": "5" * 64,
+        "sovagrid-agent/sovagrid_agent/trial_gate.py": "8" * 64,
         "sovagrid-agent/sovagrid_agent/__main__.py": main_hash,
     }}
 
@@ -115,6 +116,7 @@ class CandidateAndTreeTests(unittest.TestCase):
             "sovagrid-agent/NOTICE": b"notice\n",
             "sovagrid-agent/ATTRIBUTION.md": b"attribution\n",
             "sovagrid-agent/deploy/sovagrid-agent.service": b"[Service]\n",
+            "sovagrid-agent/sovagrid_agent/trial_gate.py": b"# watchdog\n",
             "sovagrid-agent/sovagrid_agent/__main__.py": b"print('agent')\n",
         }
         for relative, raw in self.data.items():
@@ -130,7 +132,7 @@ class CandidateAndTreeTests(unittest.TestCase):
             projection = planner._candidate_agent_files(self.root, self.manifest)
         self.assertEqual(projection[planner.remote.TARGET_HELPER],
                          self.manifest["sha256"][planner.remote.SELF_NAME])
-        self.assertEqual(len(projection), 6)
+        self.assertEqual(len(projection), 7)
         self.data["sovagrid-agent/sovagrid_agent/__main__.py"] = b"def broken(:\n"
         path = self.root / "sovagrid-agent/sovagrid_agent/__main__.py"
         path.write_bytes(self.data["sovagrid-agent/sovagrid_agent/__main__.py"])
@@ -189,12 +191,12 @@ class PreflightContractTests(unittest.TestCase):
                 stack.enter_context(patcher)
             result = planner.preflight(ARCHIVE, NEW)
         self.assertFalse(result["apply_supported"])
-        self.assertEqual(result["candidate_agent_file_count"], 6)
+        self.assertEqual(result["candidate_agent_file_count"], 7)
         self.assertEqual(result["apply_blockers"],
                          ["ORIGINAL_HUB_AGENT_UPDATE_LEASE_NOT_VERIFIED",
                           "AGENT_IDLE_ACK_NOT_VERIFIED",
                           "TRIAL_FD_WATCHDOG_NOT_VERIFIED",
-                          "EXTERNAL_AGENT_APPLY_NOT_ENABLED"])
+                          "EXPLICIT_REVIEW_AND_LIVE_GATES_REQUIRED"])
         self.assertNotIn("agent.token", json.dumps(result))
 
 

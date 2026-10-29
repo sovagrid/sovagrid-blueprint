@@ -2,15 +2,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Jigokuraku01
 # Additional author attribution terms: see ATTRIBUTION.md.
-"""Read-only planning for a future update of a preserved external Agent.
+"""Plan and coordinate a guarded update of a preserved external Agent.
 
 A server with its own Hub has two independent Agents. The Hub-only updater
-deliberately never adopts the original Agent. This helper verifies that boundary and shows
-the exact Agent source and enrollment metadata a separate transaction would
-need to change. It has no apply command and does not write a policy, journal,
-file or systemd unit. A live apply also requires an original-Hub lease that
-atomically drains and pauses command delivery; the compatibility GET is not
-such a lease.
+deliberately never adopts the original Agent. A separate, explicit transaction
+requires the original Hub's command drain lease and the original Agent's idle
+acknowledgement before changing its source. The read-only compatibility GET is
+not such a lease.
 """
 
 from __future__ import annotations
@@ -49,6 +47,8 @@ COMPATIBILITY_TIMEOUT = 5.0
 SOURCE_PREFIX = "/opt/sovagrid-agent/"
 MANIFEST_FILE = "/opt/sovagrid-agent-installer/source-manifest.json"
 AGENT_UNIT_FILE = "/etc/systemd/system/sovagrid-agent.service"
+RECOVERY_UNIT = "sovagrid-external-agent-recovery.service"
+RECOVERY_UNIT_FILE = Path("/etc/systemd/system") / RECOVERY_UNIT
 TRIAL_WATCH_DIR = Path("/run/sovagrid-external-agent-trial")
 TRIAL_WATCH_SOCKET = TRIAL_WATCH_DIR / "gate.sock"
 TRIAL_WATCH_EPOCH = TRIAL_WATCH_DIR / "epoch.env"
@@ -128,18 +128,17 @@ def _watch_line(connection: socket.socket) -> str:
 
 
 class TrialWatchServer:
-    """Future trial supervisor's live Agent watchdog socket.
+    """Trial supervisor's live Agent watchdog socket.
 
-    This primitive has no public caller or apply route. A writer must keep the
-    original Hub lease and old Agent idle ACK alive in its callbacks, prove the
-    exact journal, and identify the systemd Agent cgroup for every ping. An
-    active Agent cannot reach Hub until HELLO and PING 0 both succeed.
+    Apply keeps the original Hub lease and old Agent idle ACK alive in its
+    callbacks, proves the exact journal, and checks the Agent process identity.
+    An active Agent cannot reach Hub until HELLO and PING 0 both succeed.
     """
 
     def __init__(self, journal_sha256: str, *, group: int, agent_uid: int,
                  journal_current, lease_active, agent_idle_proven,
                  agent_peer_allowed, directory: Path = TRIAL_WATCH_DIR,
-                 owner: int = 0):
+                 owner: int = 0, committed_current=None):
         need(isinstance(journal_sha256, str) and SHA.fullmatch(journal_sha256) is not None and
              type(group) is int and group >= 0 and type(agent_uid) is int and agent_uid >= 0,
              "TRIAL_WATCH_REQUEST")
@@ -158,6 +157,7 @@ class TrialWatchServer:
         self.lease_active = lease_active
         self.agent_idle_proven = agent_idle_proven
         self.agent_peer_allowed = agent_peer_allowed
+        self.committed_current = committed_current or (lambda: False)
         self.started = time.monotonic()
         self.closed = threading.Event()
         self.listener: socket.socket | None = None
@@ -165,6 +165,37 @@ class TrialWatchServer:
         self.thread: threading.Thread | None = None
         self.socket_inode: int | None = None
         self.epoch_inode: int | None = None
+        self.ready = threading.Event()
+        self.last_ping: float | None = None
+        self.ping_count = 0
+        self.normal_ready = threading.Event()
+        self.released = threading.Event()
+        self._state_lock = threading.Lock()
+        self._promotion_nonce: str | None = None
+        self._promotion_sent = False
+        self._release_requested = False
+
+    def request_promotion(self) -> str:
+        """Ask the exact trial Agent for a read-only normal configuration test."""
+        with self._state_lock:
+            need(self.ready.is_set() and not self.closed.is_set() and
+                 self.active is not None and self.last_ping is not None and
+                 time.monotonic() - self.last_ping < 3 and
+                 self._promotion_nonce is None, "TRIAL_PROMOTION_NOT_READY")
+            self._promotion_nonce = secrets.token_hex(16)
+            return self._promotion_nonce
+
+    def request_release(self) -> None:
+        """Release dispatch only after the committed journal is durable."""
+        with self._state_lock:
+            committed = self.committed_current()
+            need(type(committed) is bool and committed and
+                 self.normal_ready.is_set() and self._promotion_sent and
+                 self.active is not None and self.last_ping is not None and
+                 time.monotonic() - self.last_ping < 3 and
+                 not self._release_requested and not self.closed.is_set(),
+                 "TRIAL_RELEASE_NOT_READY")
+            self._release_requested = True
 
     def _directory(self) -> None:
         info = self.directory.lstat()
@@ -279,10 +310,39 @@ class TrialWatchServer:
         connection.sendall(f"READY 1 {self.epoch}\n".encode("ascii"))
         sequence = 0
         while not self.closed.is_set() and time.monotonic() - self.started < TRIAL_WATCH_MAX_AGE:
-            need(_watch_line(connection) == f"PING {sequence}", "TRIAL_WATCH_PROTOCOL")
+            line = _watch_line(connection)
             need(self._eligible(pid, uid, gid), "TRIAL_WATCH_DENIED")
-            connection.sendall(f"PONG {sequence}\n".encode("ascii"))
+            with self._state_lock:
+                nonce = self._promotion_nonce
+                if nonce is not None and not self._promotion_sent:
+                    need(line == f"PING {sequence}", "TRIAL_WATCH_PROTOCOL")
+                    response = f"PROMOTE {sequence} {nonce}\n"
+                    self._promotion_sent = True
+                elif nonce is not None and line == f"PING {sequence} READY {nonce}":
+                    self.normal_ready.set()
+                    if self._release_requested:
+                        committed = self.committed_current()
+                        need(type(committed) is bool and committed,
+                             "TRIAL_RELEASE_NOT_READY")
+                        response = f"RELEASE {sequence} {nonce}\n"
+                    else:
+                        response = f"PONG {sequence}\n"
+                else:
+                    need(line == f"PING {sequence}" and
+                         not self.normal_ready.is_set(), "TRIAL_WATCH_PROTOCOL")
+                    response = f"PONG {sequence}\n"
+                releasing = response.startswith("RELEASE ")
+            connection.sendall(response.encode("ascii"))
+            self.last_ping = time.monotonic()
             sequence += 1
+            self.ping_count = sequence
+            self.ready.set()
+            if releasing:
+                need(_watch_line(connection) == f"ACK RELEASE {nonce}",
+                     "TRIAL_WATCH_PROTOCOL")
+                self.released.set()
+                self.close()
+                return
 
     def close(self) -> None:
         if self.closed.is_set():
@@ -331,6 +391,26 @@ def _promotion_lock():
         os.close(descriptor)
 
 
+def _exclusive_lock(path: Path) -> int:
+    """Never wait behind a live supervisor from a systemd child process."""
+    need(not path.is_symlink(), "LOCK_UNSAFE")
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        common.validate_lock(os.fstat(descriptor))
+        need(os.fstat(descriptor).st_nlink == 1, "LOCK_UNSAFE")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return descriptor
+    except BaseException as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if isinstance(exc, BlockingIOError):
+            raise Refused("BUSY") from None
+        if isinstance(exc, Refused):
+            raise
+        raise Refused("LOCK_UNAVAILABLE") from None
+
+
 def _manifest(root: Path) -> tuple[str, dict]:
     """Read a manifest only after its whole source tree was verified."""
     path = root / "sovagrid-bundle.json"
@@ -346,36 +426,41 @@ def _manifest(root: Path) -> tuple[str, dict]:
     return hashlib.sha256(raw).hexdigest(), value
 
 
+def _external_snapshot_locked(enrollment) -> tuple[str, dict, dict]:
+    """Validate an enrollment whose caller already holds its target lock."""
+    state = enrollment.load_state("target")
+    need(isinstance(state, dict) and state.get("kind") == "target" and
+         state.get("phase") == "active" and not state.get("removed") and
+         not state.get("pending_writes") and isinstance(state.get("identity"), dict),
+         "EXTERNAL_ENROLLMENT")
+    request_id = remote.canonical_uuid(state["identity"].get("request_id"))
+    state = enrollment.target_state(request_id, required=True)
+    source_sha, source_manifest = enrollment.source("target")
+    enrollment.verify_installed_files(state)
+    enrollment.verify_credentials(state)
+    enrollment.check_loaded_unit("sovagrid-agent-tunnel.service", state)
+    enrollment.check_loaded_unit("sovagrid-agent.service", state)
+    need(enrollment.services() == {"tunnel": True, "agent": True}, "EXTERNAL_SERVICE")
+    need(state.get("source_manifest_sha256") == source_sha and
+         state.get("source_files") == enrollment.installed_projection(source_manifest),
+         "EXTERNAL_SOURCE")
+    config = json.loads(enrollment.files.read("/etc/sovagrid/agent.json", limit=32768),
+                        object_pairs_hook=_unique_pairs)
+    need(isinstance(config, dict) and type(state.get("local_port")) is int and
+         1024 <= state["local_port"] <= 65535, "EXTERNAL_IDENTITY")
+    need(config.get("server_id") == state["identity"]["server_id"] and
+         config.get("hub_url") == f"https://localhost:{state.get('local_port')}" and
+         config.get("token_file") == "/etc/sovagrid/agent.token" and
+         config.get("ca_file") == "/etc/sovagrid/hub-ca.pem" and
+         isinstance(state.get("transport"), dict), "EXTERNAL_IDENTITY")
+    return source_sha, source_manifest, state
+
+
 def _external_snapshot() -> tuple[str, dict, dict]:
     """Verify the installed helper, runtime, enrollment and active units."""
     enrollment = remote.Enrollment(executable=remote.TARGET_HELPER)
     with enrollment.locked("target", readonly=True):
-        state = enrollment.load_state("target")
-        need(isinstance(state, dict) and state.get("kind") == "target" and
-             state.get("phase") == "active" and not state.get("removed") and
-             not state.get("pending_writes") and isinstance(state.get("identity"), dict),
-             "EXTERNAL_ENROLLMENT")
-        request_id = remote.canonical_uuid(state["identity"].get("request_id"))
-        state = enrollment.target_state(request_id, required=True)
-        source_sha, source_manifest = enrollment.source("target")
-        enrollment.verify_installed_files(state)
-        enrollment.verify_credentials(state)
-        enrollment.check_loaded_unit("sovagrid-agent-tunnel.service", state)
-        enrollment.check_loaded_unit("sovagrid-agent.service", state)
-        need(enrollment.services() == {"tunnel": True, "agent": True}, "EXTERNAL_SERVICE")
-        need(state.get("source_manifest_sha256") == source_sha and
-             state.get("source_files") == enrollment.installed_projection(source_manifest),
-             "EXTERNAL_SOURCE")
-        config = json.loads(enrollment.files.read("/etc/sovagrid/agent.json", limit=32768),
-                            object_pairs_hook=_unique_pairs)
-        need(isinstance(config, dict) and type(state.get("local_port")) is int and
-             1024 <= state["local_port"] <= 65535, "EXTERNAL_IDENTITY")
-        need(config.get("server_id") == state["identity"]["server_id"] and
-             config.get("hub_url") == f"https://localhost:{state.get('local_port')}" and
-             config.get("token_file") == "/etc/sovagrid/agent.token" and
-             config.get("ca_file") == "/etc/sovagrid/hub-ca.pem" and
-             isinstance(state.get("transport"), dict), "EXTERNAL_IDENTITY")
-        return source_sha, source_manifest, state
+        return _external_snapshot_locked(enrollment)
 
 
 def _changes(before: dict, after: dict) -> list[dict[str, str]]:
@@ -509,13 +594,133 @@ def _installed_agent_tree(projection: dict[str, str], *, root: Path | None = Non
     need(found == expected and found_dirs == expected_dirs, "EXTERNAL_SOURCE")
 
 
+def _review_digest(archive_sha256: str, current_sha256: str,
+                   external_sha256: str, baseline_sha256: str,
+                   state: dict, changes: list[dict[str, str]]) -> str:
+    """Bind one review to the exact source and enrollment transition."""
+    payload = {"protocol": 1, "archive_sha256": archive_sha256,
+               "current_hub_manifest_sha256": current_sha256,
+               "external_agent_manifest_sha256": external_sha256,
+               "baseline_sha256": baseline_sha256,
+               "enrollment_sha256": hashlib.sha256(remote.encode(state)).hexdigest(),
+               "source_paths_to_change": changes}
+    return hashlib.sha256(remote.encode(payload)).hexdigest()
+
+
+def _systemctl(*arguments: str, timeout: int = 30) -> None:
+    try:
+        result = subprocess.run(["/usr/bin/systemctl", *arguments],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=timeout, check=False)
+        need(result.returncode == 0, "SYSTEMD_ACTION_FAILED")
+    except (OSError, subprocess.TimeoutExpired):
+        raise Refused("SYSTEMD_ACTION_FAILED") from None
+
+
+def _recovery_unit_ready(*, require_enabled: bool = True) -> None:
+    """Prove the boot rollback unit is loaded and required by the Agent."""
+    template = Path(__file__).with_name(RECOVERY_UNIT)
+    try:
+        info = RECOVERY_UNIT_FILE.lstat()
+        need(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and
+             info.st_gid == 0 and info.st_nlink == 1 and
+             stat.S_IMODE(info.st_mode) == 0o644 and
+             RECOVERY_UNIT_FILE.read_bytes() == template.read_bytes(),
+             "BOOT_RECOVERY_UNAVAILABLE")
+        if require_enabled:
+            enabled = subprocess.run(["/usr/bin/systemctl", "is-enabled", "--quiet",
+                                      RECOVERY_UNIT], stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, timeout=5, check=False)
+            need(enabled.returncode == 0, "BOOT_RECOVERY_UNAVAILABLE")
+        result = subprocess.run(["/usr/bin/systemctl", "show", EXTERNAL_AGENT_UNIT,
+                                 RECOVERY_UNIT, "--property=Id", "--property=Requires",
+                                 "--property=Before", "--property=FragmentPath",
+                                 "--property=NeedDaemonReload", "--no-pager"],
+                                capture_output=True, timeout=5, check=False)
+        need(result.returncode == 0 and len(result.stdout) <= 16384,
+             "BOOT_RECOVERY_UNAVAILABLE")
+        sections = result.stdout.decode("utf-8").strip().split("\n\n")
+        need(len(sections) == 2, "BOOT_RECOVERY_UNAVAILABLE")
+        values = []
+        for section in sections:
+            pairs = [line.split("=", 1) for line in section.splitlines()]
+            need(all(len(pair) == 2 for pair in pairs), "BOOT_RECOVERY_UNAVAILABLE")
+            item = dict(pairs)
+            need(len(item) == len(pairs) and item.get("NeedDaemonReload") == "no",
+                 "BOOT_RECOVERY_UNAVAILABLE")
+            values.append(item)
+        agent, guard = values
+        need(agent.get("Id") == EXTERNAL_AGENT_UNIT and
+             agent.get("FragmentPath") == AGENT_UNIT_FILE and
+             (not require_enabled or
+              RECOVERY_UNIT in agent.get("Requires", "").split()) and
+             guard.get("Id") == RECOVERY_UNIT and
+             guard.get("FragmentPath") == str(RECOVERY_UNIT_FILE) and
+             EXTERNAL_AGENT_UNIT in guard.get("Before", "").split(),
+             "BOOT_RECOVERY_UNAVAILABLE")
+    except Refused:
+        raise
+    except (OSError, UnicodeError, ValueError, subprocess.TimeoutExpired):
+        raise Refused("BOOT_RECOVERY_UNAVAILABLE") from None
+
+
+def _enable_recovery_unit() -> None:
+    _recovery_unit_ready(require_enabled=False)
+    _systemctl("enable", RECOVERY_UNIT)
+    _systemctl("daemon-reload")
+    _recovery_unit_ready()
+
+
+def _disable_recovery_unit() -> None:
+    _systemctl("disable", RECOVERY_UNIT)
+    _systemctl("daemon-reload")
+    try:
+        result = subprocess.run(["/usr/bin/systemctl", "is-enabled", "--quiet",
+                                 RECOVERY_UNIT], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=5, check=False)
+        need(result.returncode != 0, "BOOT_RECOVERY_STILL_ENABLED")
+    except (OSError, subprocess.TimeoutExpired):
+        raise Refused("BOOT_RECOVERY_STILL_ENABLED") from None
+
+
+def _new_metadata(candidate_root: Path, manifest: dict, state: dict,
+                  old_manifest: dict, candidate_sha256: str,
+                  baseline: dict) -> tuple[dict[str, str], dict[str, str], dict[str, bytes]]:
+    old_projection = remote.Enrollment.installed_projection(old_manifest)
+    new_projection = remote.Enrollment.installed_projection(manifest)
+    old_tree = {name.removeprefix(SOURCE_PREFIX): digest
+                for name, digest in old_projection.items()
+                if name.startswith(SOURCE_PREFIX)}
+    new_tree = {name.removeprefix(SOURCE_PREFIX): digest
+                for name, digest in new_projection.items()
+                if name.startswith(SOURCE_PREFIX)}
+    projected = _project_target_state(state, old_manifest, manifest, candidate_sha256)
+    source_manifest = promotion._read_regular(candidate_root / "sovagrid-bundle.json",
+                                              512 * 1024)
+    need(hashlib.sha256(source_manifest).hexdigest() == candidate_sha256,
+         "CANDIDATE_CHANGED")
+    raw = {
+        recovery.META[0][0]: promotion._read_regular(candidate_root / remote.SELF_NAME,
+                                                     1024 * 1024),
+        recovery.META[1][0]: promotion._read_regular(
+            candidate_root / "sovagrid-agent/deploy/sovagrid-agent.service", 65536),
+        recovery.META[2][0]: source_manifest,
+        recovery.META[3][0]: remote.encode(projected) + b"\n",
+    }
+    updated_baseline = copy.deepcopy(baseline)
+    for path in (recovery.META[1][0], recovery.META[2][0], recovery.META[3][0]):
+        need(path in updated_baseline["files"], "EXTERNAL_CHANGED")
+        updated_baseline["files"][path]["sha256"] = hashlib.sha256(raw[path]).hexdigest()
+    raw[recovery.META[4][0]] = remote.encode(updated_baseline) + b"\n"
+    need(set(raw) == {name for name, _mode, _limit in recovery.META}, "META_INVALID")
+    return old_tree, new_tree, raw
+
+
 def preflight(archive_sha256: str, current_manifest_sha256: str) -> dict:
     """Validate the exact local source/state transition without writing it.
 
-    The result cannot be replayed as an authorization: all locks, source bytes,
-    enrollment state and the original Hub must be checked again by an eventual
-    transactional writer. In particular, a read-only compatibility response
-    cannot prove that a remote command queue is idle.
+    The returned digest is only an exact review token. Apply rechecks all
+    locks, bytes, enrollment state and original-Hub gates before a write.
     """
     earlier = preview(archive_sha256, current_manifest_sha256)
     with _promotion_lock():
@@ -534,6 +739,8 @@ def preflight(archive_sha256: str, current_manifest_sha256: str) -> dict:
         old = remote.Enrollment.installed_projection(before)
         new = _candidate_agent_files(candidate_root, after)
         _installed_agent_tree(old)
+        need("sovagrid-agent/sovagrid_agent/trial_gate.py" in after["sha256"],
+             "TRIAL_CAPABILITY_MISSING")
         need(old.keys() <= new.keys(), "UNSUPPORTED_SOURCE_REMOVAL")
         # Atomic tree exchange can add vetted source files and directories.
         # Removing an old installed file is intentionally a separate review.
@@ -546,7 +753,13 @@ def preflight(archive_sha256: str, current_manifest_sha256: str) -> dict:
         need(promotion.capture_external() == promotion._private_json(promotion.BASELINE) and
              update._hash_file(promotion.BASELINE) == baseline,
              "EXTERNAL_CHANGED")
+    review_sha256 = _review_digest(archive_sha256, current, external_sha,
+                                   baseline, state, earlier["source_paths_to_change"])
     result = {**earlier, "candidate_agent_file_count": len(new),
+              "archive_sha256": archive_sha256,
+              "baseline_sha256": baseline,
+              "enrollment_sha256": hashlib.sha256(remote.encode(state)).hexdigest(),
+              "review_sha256": review_sha256,
               "metadata_paths_to_change": [MANIFEST_FILE,
                                            "/var/lib/sovagrid-agent-enrollment/state.json",
                                            "/var/lib/sovagrid-promotion/baseline.json"],
@@ -554,7 +767,7 @@ def preflight(archive_sha256: str, current_manifest_sha256: str) -> dict:
               "apply_blockers": ["ORIGINAL_HUB_AGENT_UPDATE_LEASE_NOT_VERIFIED",
                                  "AGENT_IDLE_ACK_NOT_VERIFIED",
                                  "TRIAL_FD_WATCHDOG_NOT_VERIFIED",
-                                 "EXTERNAL_AGENT_APPLY_NOT_ENABLED"]}
+                                 "EXPLICIT_REVIEW_AND_LIVE_GATES_REQUIRED"]}
     need(len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) <= MAX_OUTPUT,
          "OUTPUT_TOO_LARGE")
     return result
@@ -563,13 +776,15 @@ def preflight(archive_sha256: str, current_manifest_sha256: str) -> dict:
 def recover_pending() -> dict:
     """Boot-safe rollback entry point, ordered before the original Agent unit.
 
-    The install/enable step for the accompanying RequiredBy unit belongs to a
-    future lease-guarded updater. A read-only preflight never installs it.
+    A live supervisor may grant one trial start while it holds the transaction
+    locks. Without that root socket, boot takes the normal locked rollback path.
     """
     need(os.geteuid() == 0, "ROOT")
+    if _live_trial_permit("recover"):
+        return {"protocol": 1, "recovered": False, "trial_authorized": True}
     with contextlib.ExitStack() as locks:
-        locks.callback(os.close, update._lock(update.PROMOTION_LOCK))
-        locks.callback(os.close, update._lock(update.CANDIDATES / ".lock"))
+        locks.callback(os.close, _exclusive_lock(update.PROMOTION_LOCK))
+        locks.callback(os.close, _exclusive_lock(update.CANDIDATES / ".lock"))
         enrollment = remote.Enrollment(executable=remote.TARGET_HELPER)
         locks.enter_context(enrollment.locked("target"))
         transaction = recovery.Recovery(enrollment.files)
@@ -581,15 +796,27 @@ def recover_pending() -> dict:
                                     timeout=10, check=False)
             return status.returncode != 0
 
-        # Deliberately omit trial_authorized until the Agent can keep a
-        # supervisor FD alive through ExecStart and fail closed on its loss.
-        # The root-only socket primitive is present but not a live apply path.
         changed = transaction.recover_pending(agent_stopped=stopped)
         if changed:
             subprocess.run(["/usr/bin/systemctl", "daemon-reload"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            timeout=30, check=True)
+        need(transaction._load_journal() is None, "RECOVERY_PENDING")
+        _disable_recovery_unit()
     return {"protocol": 1, "recovered": changed}
+
+
+def _live_trial_permit(operation: str) -> bool:
+    """Allow only a validated trial backed by a live one-use root gate."""
+    enrollment = remote.Enrollment(executable=remote.TARGET_HELPER)
+    transaction = recovery.Recovery(enrollment.files)
+    journal = transaction._load_journal()
+    if journal is None or journal["phase"] != "trial":
+        return False
+    need(_systemd_trial_guard_loaded(), "TRIAL_GATE_REQUIRED")
+    digest = transaction.verify_trial_state()
+    allowed = recovery.probe_trial_gate(operation, digest)
+    return type(allowed) is bool and allowed
 
 
 def _systemd_trial_guard_loaded() -> bool:
@@ -624,14 +851,16 @@ def _systemd_trial_guard_loaded() -> bool:
 def trial_start_guard() -> dict:
     """Run immediately before Agent ExecStart from the guarded drop-in.
 
-    No transaction is a normal service start. Trial startup is deliberately
-    closed until an Agent-side live-socket watchdog closes the gap between
-    ExecStartPre and ExecStart. Other pending phases also fail closed.
+    No transaction is a normal service start. The live one-use root gate
+    authorizes this pre-start step; the Agent's own watchdog closes the gap
+    between ExecStartPre and ExecStart.
     """
     need(os.geteuid() == 0, "ROOT")
+    if _live_trial_permit("start"):
+        return {"protocol": 1, "trial": True, "allowed": True}
     with contextlib.ExitStack() as locks:
-        locks.callback(os.close, update._lock(update.PROMOTION_LOCK))
-        locks.callback(os.close, update._lock(update.CANDIDATES / ".lock"))
+        locks.callback(os.close, _exclusive_lock(update.PROMOTION_LOCK))
+        locks.callback(os.close, _exclusive_lock(update.CANDIDATES / ".lock"))
         enrollment = remote.Enrollment(executable=remote.TARGET_HELPER)
         locks.enter_context(enrollment.locked("target"))
         transaction = recovery.Recovery(enrollment.files)
@@ -645,7 +874,7 @@ def trial_start_guard() -> dict:
         need(journal["phase"] == "trial" and _systemd_trial_guard_loaded(),
              "TRIAL_GATE_REQUIRED")
         transaction.verify_trial_state()
-        raise Refused("TRIAL_RUNTIME_NOT_READY")
+        raise Refused("TRIAL_GATE_REQUIRED")
 
 
 def _compatibility_pairs(pairs):
@@ -868,12 +1097,11 @@ def _lease_reply(value: dict, *, acquired: bool, epoch: str | None = None,
 
 
 class OriginalHubLease:
-    """Future writer's in-memory renewable command/relay drain lease.
+    """In-memory renewable command/relay drain lease.
 
-    This is intentionally not an Agent idle proof and has no public apply
-    caller. A lost renewal is terminal even if a later HTTP request succeeds.
-    The candidate Agent watchdog calls ``active`` for a synchronous proof on
-    every heartbeat; a commit must also call ``assert_held(fresh=True)``.
+    This is intentionally not an Agent idle proof. A lost renewal is terminal
+    even if a later HTTP request succeeds. A commit refreshes synchronously;
+    the Agent watchdog checks the background renewal state without blocking.
     """
 
     def __init__(self, state: dict, bundle_manifest_sha256: str, *,
@@ -971,6 +1199,14 @@ class OriginalHubLease:
         except Refused:
             return False
 
+    def valid(self) -> bool:
+        """Check the background-renewed lease without blocking a 3s socket."""
+        try:
+            self.assert_held()
+            return True
+        except Refused:
+            return False
+
     def close(self) -> None:
         self._closed.set()
         if (self._thread is not None and self._thread.is_alive() and
@@ -994,7 +1230,8 @@ class OriginalHubLease:
         self.close()
 
 
-def _external_unit_properties(*, run=subprocess.run) -> dict[str, str]:
+def _external_unit_properties(*, run=subprocess.run,
+                              allow_reload: bool = False) -> dict[str, str]:
     """Read the one systemd unit without parsing human-facing status output."""
     fields = ("Id", "ActiveState", "SubState", "MainPID", "ControlGroup",
               "InvocationID", "FragmentPath", "NeedDaemonReload", "User", "Group")
@@ -1015,7 +1252,9 @@ def _external_unit_properties(*, run=subprocess.run) -> dict[str, str]:
         need(set(value) == set(fields) and
              value["Id"] == EXTERNAL_AGENT_UNIT and
              value["FragmentPath"] == AGENT_UNIT_FILE and
-             value["NeedDaemonReload"] == "no", "EXTERNAL_UNIT_INVALID")
+             (value["NeedDaemonReload"] == "no" or
+              (allow_reload and value["NeedDaemonReload"] == "yes")),
+             "EXTERNAL_UNIT_INVALID")
         return value
     except Refused:
         raise
@@ -1112,9 +1351,9 @@ def _cgroup_empty(cgroup: str, *, root: Path = Path("/"), owner: int = 0) -> boo
 class ExternalAgentStopProof:
     """Read-only evidence that the exact pre-stop Agent is fully gone.
 
-    A future writer must install a boot-safe start guard before stopping the
-    service and call ``stopped`` immediately before every source switch.
-    This object does not stop, mask, or start a service on its own.
+    Apply installs a boot-safe start guard before stopping the service and
+    calls ``stopped`` immediately before the source switch. This object does
+    not stop, mask, or start a service on its own.
     """
 
     def __init__(self, *, run=subprocess.run, root: Path = Path("/"),
@@ -1231,11 +1470,10 @@ def _agent_idle_ack(raw: bytes, pid: int) -> str:
 class AgentIdleProof:
     """Hold the original Agent's idle ACK until its exact unit has stopped.
 
-    This primitive neither stops the unit nor changes files. A future writer
-    must hold its original-Hub lease and transaction locks independently, then
-    call ``begin_stop`` before stopping the service and ``confirm_stopped``
-    before switching any source. An EOF after begin_stop is accepted only when
-    the exact cgroup/PID proof confirms the service is fully stopped.
+    This primitive neither stops the unit nor changes files. Apply holds its
+    original-Hub lease and transaction locks independently, calls
+    ``begin_stop`` before stopping, and confirms the exact stopped cgroup/PID
+    before switching source. EOF alone is never an idle proof.
     """
 
     def __init__(self, stop_proof: ExternalAgentStopProof, *,
@@ -1479,10 +1717,347 @@ def preview(archive_sha256: str, current_manifest_sha256: str) -> dict:
                                             "/var/lib/sovagrid-promotion/baseline.json"],
                   "original_hub_compatibility": "verified_same_bundle",
                   "apply_supported": False,
-                  "apply_blockers": ["EXTERNAL_AGENT_TRANSACTION_MISSING"]}
+                  "apply_blockers": ["EXTERNAL_AGENT_PREFLIGHT_REQUIRED"]}
         raw = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
         need(len(raw) <= MAX_OUTPUT, "OUTPUT_TOO_LARGE")
         return result
+
+
+def _runtime_directory(path: Path, *, group: int, mode: int) -> None:
+    need(path.parent == Path("/run") and os.geteuid() == 0,
+         "TRIAL_RUNTIME_PATH")
+    try:
+        parent = path.parent.lstat()
+        need(stat.S_ISDIR(parent.st_mode) and parent.st_uid == 0 and
+             not parent.st_mode & 0o022, "TRIAL_RUNTIME_PATH")
+        if not path.exists() and not path.is_symlink():
+            path.mkdir(mode=mode)
+            os.chown(path, 0, group)
+            os.chmod(path, mode)
+        info = path.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and
+             info.st_gid == group and stat.S_IMODE(info.st_mode) == mode,
+             "TRIAL_RUNTIME_PATH")
+    except Refused:
+        raise
+    except OSError:
+        raise Refused("TRIAL_RUNTIME_PATH") from None
+
+
+def _agent_fully_stopped(cgroup: str) -> bool:
+    """Check the exact service and its cgroup, including after partial writes."""
+    first = _external_unit_properties(allow_reload=True)
+    if (first["ActiveState"] != "inactive" or first["SubState"] != "dead" or
+            first["MainPID"] != "0" or
+            first["ControlGroup"] not in ("", cgroup) or
+            not _cgroup_empty(cgroup)):
+        return False
+    second = _external_unit_properties(allow_reload=True)
+    return (second["ActiveState"] == "inactive" and
+            second["SubState"] == "dead" and second["MainPID"] == "0" and
+            second["ControlGroup"] in ("", cgroup))
+
+
+def _trial_peer(pid: int, uid: int, gid: int, *, expected_uid: int,
+                expected_gid: int, old: ExternalAgentStopProof,
+                identity: dict, full: bool = False) -> bool:
+    if uid != expected_uid or gid != expected_gid:
+        return False
+    if identity and not full:
+        return (identity["pid"] == pid and
+                _proc_start_ticks(pid) == identity["ticks"] and
+                _read_kernel_file(Path("/proc") / str(pid) / "cgroup", 4096,
+                                  "EXTERNAL_CGROUP_UNAVAILABLE") ==
+                f"0::{old.cgroup}\n".encode("ascii"))
+    props = _external_unit_properties()
+    if (props["ActiveState"] != "active" or props["SubState"] != "running" or
+            props["MainPID"] != str(pid) or props["ControlGroup"] != old.cgroup or
+            props["InvocationID"] == old.invocation_id or
+            props["User"] != "sovagrid" or props["Group"] != "sovagrid" or
+            not _systemd_trial_guard_loaded()):
+        return False
+    ticks = _proc_start_ticks(pid)
+    if ticks is None or _read_kernel_file(Path("/proc") / str(pid) / "cgroup", 4096,
+                                          "EXTERNAL_CGROUP_UNAVAILABLE") != \
+            f"0::{old.cgroup}\n".encode("ascii"):
+        return False
+    observed = {"pid": pid, "ticks": ticks, "invocation": props["InvocationID"]}
+    if identity:
+        return identity == observed
+    identity.update(observed)
+    return True
+
+
+def _trial_journal_current(transaction, trial_sha256: str,
+                           committed_sha256: str) -> str | None:
+    journal = transaction._load_journal()
+    if journal is None:
+        return None
+    item = transaction._read(recovery.JOURNAL, recovery.MAX_JOURNAL, mode=0o600)
+    if item is None:
+        return None
+    actual = hashlib.sha256(item[0]).hexdigest()
+    if ((journal["phase"] == "trial" and actual == trial_sha256) or
+            (journal["phase"] == "committed" and actual == committed_sha256)):
+        return trial_sha256
+    return None
+
+
+def _committed_journal_current(transaction, trial_sha256: str,
+                               committed_sha256: str) -> bool:
+    journal = transaction._load_journal()
+    return (journal is not None and journal["phase"] == "committed" and
+            _trial_journal_current(transaction, trial_sha256,
+                                   committed_sha256) == trial_sha256)
+
+
+def _repair_interrupted(transaction, cgroup: str, *, idle: AgentIdleProof,
+                        lease: OriginalHubLease) -> str | None:
+    """Finish a committed update or restore the old Agent before restart."""
+    journal = transaction._load_journal()
+    if journal is None:
+        return None
+    if not _agent_fully_stopped(cgroup):
+        if journal["phase"] == "prepared":
+            # Do not interrupt the old Agent without a fresh drain + idle ACK.
+            _systemctl("daemon-reload")
+            lease.assert_held(fresh=True)
+            if not idle.stopping:
+                idle.begin_stop()
+        _systemctl("stop", EXTERNAL_AGENT_UNIT, timeout=60)
+    need(_agent_fully_stopped(cgroup), "RECOVERY_REQUIRES_REVIEW")
+    if journal["phase"] == "committed":
+        transaction.finalize_committed()
+        result = "new"
+    else:
+        transaction.recover_pending(agent_stopped=lambda: _agent_fully_stopped(cgroup))
+        result = "old"
+    _systemctl("daemon-reload")
+    return result
+
+
+def _normal_activation_ready() -> bool:
+    # Enabled only after the Agent-side in-process PROMOTE/RELEASE protocol and
+    # its integrated Linux trial are available in the exact candidate bundle.
+    return False
+
+
+def apply(archive_sha256: str, current_manifest_sha256: str,
+          external_manifest_sha256: str, review_sha256: str) -> dict:
+    """Apply one explicitly reviewed external-Agent transition.
+
+    The Agent remains separate from the local Hub. Every mutable step is
+    journaled before stop. A dead supervisor loses its in-memory trial gates;
+    the required systemd recovery unit then rolls the new source back.
+    """
+    need(os.geteuid() == 0 and os.getegid() == 0 and
+         sys.platform.startswith("linux"), "ROOT_LINUX")
+    need(_normal_activation_ready(), "NORMAL_ACTIVATION_GATE_MISSING")
+    need(all(isinstance(item, str) and SHA.fullmatch(item) is not None
+             for item in (archive_sha256, current_manifest_sha256,
+                          external_manifest_sha256, review_sha256)), "HASH")
+    review = preflight(archive_sha256, current_manifest_sha256)
+    need(review["external_agent_manifest_sha256"] == external_manifest_sha256 and
+         review["review_sha256"] == review_sha256, "REVIEW_CHANGED")
+    failure: Exception | None = None
+    restart: str | None = None
+    succeeded = False
+    watch: TrialWatchServer | None = None
+    with contextlib.ExitStack() as stack:
+        stack.callback(os.close, _exclusive_lock(update.PROMOTION_LOCK))
+        stack.callback(os.close, _exclusive_lock(update.CANDIDATES / ".lock"))
+        enrollment = remote.Enrollment(executable=remote.TARGET_HELPER)
+        stack.enter_context(enrollment.locked("target"))
+        transaction = recovery.Recovery(enrollment.files)
+        current, promoted, _commits, baseline_sha256 = update.inspect()
+        need(current == current_manifest_sha256 and
+             promoted.get("phase") == "activated" and
+             promoted.get("external_agent_preserved") is True and
+             promoted.get("baseline_sha256") == baseline_sha256,
+             "PROMOTION_CHANGED")
+        external_sha, before, state = _external_snapshot_locked(enrollment)
+        need(external_sha == external_manifest_sha256, "EXTERNAL_CHANGED")
+        candidate_root, _ = common.candidate_source(archive_sha256)
+        candidate_sha, after = _manifest(candidate_root)
+        need(candidate_sha == current, "CANDIDATE_NOT_LOCAL_HUB")
+        old_projection = remote.Enrollment.installed_projection(before)
+        new_projection = _candidate_agent_files(candidate_root, after)
+        _installed_agent_tree(old_projection)
+        need(old_projection.keys() <= new_projection.keys() and
+             "sovagrid-agent/sovagrid_agent/trial_gate.py" in after["sha256"],
+             "TRIAL_CAPABILITY_MISSING")
+        changes = _changes(before, after)
+        changes.append({"path": MANIFEST_FILE, "operation": "replace"})
+        need(_review_digest(archive_sha256, current, external_sha,
+                            baseline_sha256, state, changes) == review_sha256,
+             "REVIEW_CHANGED")
+        baseline = promotion._private_json(promotion.BASELINE)
+        need(promotion.capture_external() == baseline and
+             update._hash_file(promotion.BASELINE) == baseline_sha256,
+             "EXTERNAL_CHANGED")
+        _original_hub_compatibility(state, candidate_sha)
+        _recovery_unit_ready(require_enabled=False)
+        old_tree, new_tree, new_meta = _new_metadata(candidate_root, after,
+                                                       state, before, candidate_sha,
+                                                       baseline)
+        stop_proof = ExternalAgentStopProof()
+        with OriginalHubLease(state, candidate_sha) as lease:
+            with AgentIdleProof(stop_proof) as idle:
+                try:
+                    _enable_recovery_unit()
+                    lease.assert_held(fresh=True)
+                    idle.assert_held()
+                    transaction.prepare(candidate_tree=str(candidate_root / "sovagrid-agent"),
+                                        old_tree=old_tree, new_tree=new_tree,
+                                        new_meta=new_meta)
+                    _systemctl("daemon-reload")
+                    need(_systemd_trial_guard_loaded(), "TRIAL_GUARD_UNAVAILABLE")
+                    lease.assert_held(fresh=True)
+                    idle.begin_stop()
+                    _systemctl("stop", EXTERNAL_AGENT_UNIT, timeout=60)
+                    idle.confirm_stopped()
+                    lease.assert_held(fresh=True)
+
+                    def old_idle() -> bool:
+                        return (idle.confirmed and not idle.failed and
+                                idle.started is not None and
+                                time.monotonic() - idle.started < AGENT_IDLE_MAX_HOLD and
+                                _proc_start_ticks(stop_proof.pid) != stop_proof.start_ticks)
+
+                    transaction._switch_under_quiescence(
+                        agent_stopped=stop_proof.stopped,
+                        remote_lease_active=lease.valid, agent_idle_ack=old_idle)
+                    _systemctl("daemon-reload")
+                    need(_systemd_trial_guard_loaded(), "TRIAL_GUARD_UNAVAILABLE")
+                    switched = transaction._load_journal()
+                    need(switched is not None and switched["phase"] == "switched",
+                         "JOURNAL_INVALID")
+                    trial_sha = hashlib.sha256(remote.encode({**switched,
+                                                               "phase": "trial"}) + b"\n").hexdigest()
+                    committed_sha = hashlib.sha256(remote.encode({**switched,
+                                                                   "phase": "committed"}) + b"\n").hexdigest()
+                    uid, gid = pwd.getpwnam("sovagrid").pw_uid, grp.getgrnam("sovagrid").gr_gid
+                    _runtime_directory(Path(recovery.TRIAL_GATE_DIR), group=0, mode=0o700)
+                    _runtime_directory(TRIAL_WATCH_DIR, group=gid, mode=0o710)
+                    identity: dict = {}
+                    gate = recovery.TrialGateServer(
+                        trial_sha, lease_active=lease.valid,
+                        agent_idle_proven=old_idle).start()
+                    stack.callback(gate.close)
+                    watch = TrialWatchServer(
+                        trial_sha, group=gid, agent_uid=uid,
+                        journal_current=lambda: _trial_journal_current(
+                            transaction, trial_sha, committed_sha),
+                        committed_current=lambda: _committed_journal_current(
+                            transaction, trial_sha, committed_sha),
+                        lease_active=lease.valid, agent_idle_proven=old_idle,
+                        agent_peer_allowed=lambda pid, peer_uid, peer_gid: _trial_peer(
+                            pid, peer_uid, peer_gid, expected_uid=uid,
+                            expected_gid=gid, old=stop_proof, identity=identity)).start()
+                    stack.callback(watch.close)
+
+                    def supervisor_active() -> bool:
+                        return (gate.thread is not None and gate.thread.is_alive() and
+                                not gate.closed.is_set() and watch.thread is not None and
+                                watch.thread.is_alive() and not watch.closed.is_set())
+
+                    lease.assert_held(fresh=True)
+                    transaction.begin_trial(
+                        agent_stopped=stop_proof.stopped,
+                        remote_lease_active=lease.valid,
+                        supervisor_active=supervisor_active,
+                        agent_idle_proven=old_idle)
+                    need(transaction.trial_journal_sha256() == trial_sha,
+                         "JOURNAL_CHANGED")
+                    _systemctl("start", EXTERNAL_AGENT_UNIT, timeout=60)
+                    need(gate.granted == {"recover", "start"} and
+                         watch.ready.wait(20), "TRIAL_START_FAILED")
+                    deadline = time.monotonic() + 15
+                    while watch.ping_count < 3 and not watch.closed.is_set() and \
+                            time.monotonic() < deadline:
+                        time.sleep(0.2)
+
+                    def trial_healthy() -> bool:
+                        return (supervisor_active() and watch.normal_ready.is_set() and
+                                watch.active is not None and
+                                watch.ping_count >= 3 and watch.last_ping is not None and
+                                time.monotonic() - watch.last_ping < 3 and
+                                "pid" in identity and
+                                _trial_peer(identity["pid"], uid, gid,
+                                            expected_uid=uid, expected_gid=gid,
+                                            old=stop_proof, identity=identity,
+                                            full=True) and
+                                _original_hub_compatibility(state, candidate_sha) is None)
+
+                    watch.request_promotion()
+                    need(watch.normal_ready.wait(120) and trial_healthy(),
+                         "NORMAL_READINESS_FAILED")
+                    lease.assert_held(fresh=True)
+                    transaction.commit_trial(
+                        agent_running=lambda: "pid" in identity and
+                        _trial_peer(identity["pid"], uid, gid, expected_uid=uid,
+                                    expected_gid=gid, old=stop_proof,
+                                    identity=identity, full=True),
+                        agent_healthy=trial_healthy,
+                        remote_lease_active=lease.valid,
+                        supervisor_active=supervisor_active,
+                        agent_idle_proven=old_idle)
+                    need(_trial_peer(identity["pid"], uid, gid,
+                                     expected_uid=uid, expected_gid=gid,
+                                     old=stop_proof, identity=identity,
+                                     full=True), "TRIAL_AGENT_CHANGED")
+                    watch.request_release()
+                    need(watch.released.wait(10), "RELEASE_ACK_MISSING")
+                    transaction.finalize_committed()
+                    _systemctl("daemon-reload")
+                    observed_sha, _manifest_value, _state = _external_snapshot_locked(enrollment)
+                    running = _external_unit_properties()
+                    need(observed_sha == current_manifest_sha256 and
+                         running["ActiveState"] == "active" and
+                         running["SubState"] == "running" and
+                         running["MainPID"] == str(identity["pid"]) and
+                         _proc_start_ticks(identity["pid"]) == identity["ticks"] and
+                         promotion.capture_external() ==
+                         promotion._private_json(promotion.BASELINE),
+                         "POST_RELEASE_HEALTH_FAILED")
+                    succeeded = True
+                except Exception as exc:
+                    failure = exc
+                    try:
+                        journal = transaction._load_journal()
+                        if (journal is not None and journal["phase"] == "committed" and
+                                watch is not None and watch.released.is_set()):
+                            # The normal Agent is already released. Retry
+                            # idempotent cleanup without stopping it.
+                            transaction.finalize_committed()
+                            _systemctl("daemon-reload")
+                        else:
+                            restart = _repair_interrupted(transaction,
+                                                           stop_proof.cgroup,
+                                                           idle=idle, lease=lease)
+                    except Exception as repair_exc:
+                        raise Refused("RECOVERY_REQUIRES_REVIEW") from repair_exc
+                if transaction._load_journal() is None:
+                    _disable_recovery_unit()
+    if restart is not None:
+        _systemctl("start", EXTERNAL_AGENT_UNIT, timeout=60)
+        observed_sha, _manifest_value, _state = _external_snapshot()
+        running = _external_unit_properties()
+        need(observed_sha == (current_manifest_sha256 if restart == "new" else
+                              external_manifest_sha256) and
+             running["ActiveState"] == "active" and
+             running["SubState"] == "running" and
+             running["MainPID"].isdecimal() and int(running["MainPID"]) > 1 and
+             promotion.capture_external() == promotion._private_json(promotion.BASELINE),
+             "POST_RESTART_HEALTH_FAILED")
+    if failure is not None:
+        if isinstance(failure, Refused):
+            raise failure
+        raise Refused("APPLY_ROLLED_BACK") from failure
+    need(succeeded, "APPLY_INCOMPLETE")
+    return {"protocol": 1, "applied": True,
+            "external_agent_manifest_sha256": current_manifest_sha256,
+            "review_sha256": review_sha256}
 
 
 def main(argv: list[str] | None = None) -> int:

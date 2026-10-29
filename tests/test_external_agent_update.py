@@ -83,7 +83,7 @@ class ExternalAgentPreviewTests(unittest.TestCase):
         self.assertTrue(result["external_agent_preserved"] and result["tunnel_active"])
         self.assertFalse(result["apply_supported"])
         self.assertEqual(result["original_hub_compatibility"], "verified_same_bundle")
-        self.assertEqual(result["apply_blockers"], ["EXTERNAL_AGENT_TRANSACTION_MISSING"])
+        self.assertEqual(result["apply_blockers"], ["EXTERNAL_AGENT_PREFLIGHT_REQUIRED"])
         self.assertNotIn("token", json.dumps(result).lower())
 
     def test_changed_external_baseline_or_stopped_tunnel_refuses(self):

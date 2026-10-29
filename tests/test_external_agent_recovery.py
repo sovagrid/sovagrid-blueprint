@@ -605,7 +605,7 @@ class InterruptedRecoveryTests(unittest.TestCase):
                  mock.patch.object(planner.subprocess, "run", return_value=loaded(environment, reload, epoch_file)):
                 self.assertFalse(planner._systemd_trial_guard_loaded())
 
-    def test_trial_start_cli_stays_closed_before_fd_watchdog(self):
+    def test_trial_start_cli_requires_live_one_use_gate(self):
         planner_spec = importlib.util.spec_from_file_location(
             "sovagrid_external_trial_guard_cli_test", DEPLOY / "external_agent_update.py")
         assert planner_spec and planner_spec.loader
@@ -619,13 +619,17 @@ class InterruptedRecoveryTests(unittest.TestCase):
         with mock.patch.object(planner.os, "geteuid", return_value=0), \
              mock.patch.object(planner.remote, "Enrollment", return_value=enrollment), \
              mock.patch.object(planner.recovery, "Recovery", return_value=transaction), \
-             mock.patch.object(planner.update, "_lock",
+             mock.patch.object(planner, "_exclusive_lock",
                                side_effect=lambda _path: os.open(os.devnull, os.O_RDONLY)), \
              mock.patch.object(planner, "_systemd_trial_guard_loaded", return_value=True), \
-             mock.patch.object(planner.recovery, "probe_trial_gate") as probe:
-            with self.assertRaisesRegex(planner.Refused, "TRIAL_RUNTIME_NOT_READY"):
+             mock.patch.object(planner.recovery, "probe_trial_gate", return_value=False) as probe:
+            with self.assertRaisesRegex(planner.Refused, "TRIAL_GATE_REQUIRED"):
                 planner.trial_start_guard()
-            probe.assert_not_called()
+            probe.assert_called_once_with("start", "a" * 64)
+            probe.reset_mock(return_value=True)
+            probe.return_value = True
+            self.assertEqual(planner.trial_start_guard(),
+                             {"protocol": 1, "trial": True, "allowed": True})
             transaction._load_journal.return_value = None
             transaction._load_committed_marker.return_value = None
             transaction.files.inspect.return_value = None
