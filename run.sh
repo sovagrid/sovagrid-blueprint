@@ -1112,7 +1112,36 @@ if (( hub_only )); then
       die "Hub-only update unit $auto_unit could not be installed"
     fi
   done
+  recovery_unit=sovagrid-external-agent-recovery.service
+  recovery_source="$source_root/sovagrid-blueprint/deploy/$recovery_unit"
+  recovery_destination="/etc/systemd/system/$recovery_unit"
+  recovery_marker=/etc/sovagrid/.external-agent-recovery-managed-by-run-sh
+  [[ -f $recovery_source && ! -L $recovery_source ]] || die 'external Agent recovery unit is missing or a symlink'
+  systemd-analyze verify "$recovery_source" || die 'external Agent recovery unit is invalid'
+  if [[ -e $recovery_destination || -L $recovery_destination ]]; then
+    [[ -f $recovery_destination && ! -L $recovery_destination &&
+       -f $recovery_marker && ! -L $recovery_marker &&
+       $(stat -c '%u:%g:%a' "$recovery_marker") == 0:0:600 ]] ||
+      die 'external Agent recovery unit is not managed by run.sh'
+  fi
+  if [[ -e $recovery_marker || -L $recovery_marker ]]; then
+    [[ -f $recovery_marker && ! -L $recovery_marker &&
+       $(stat -c '%u:%g:%a' "$recovery_marker") == 0:0:600 ]] ||
+      die 'external Agent recovery marker is unsafe'
+  fi
+  recovery_temporary=$(mktemp "$recovery_destination.XXXXXXXX")
+  if ! install -o root -g root -m 0644 "$recovery_source" "$recovery_temporary" ||
+     ! mv -Tf -- "$recovery_temporary" "$recovery_destination"; then
+    rm -f -- "$recovery_temporary"
+    die 'external Agent recovery unit could not be installed'
+  fi
+  install -o root -g root -m 0600 /dev/null "$recovery_marker"
   systemctl daemon-reload
+  if [[ -f /etc/systemd/system/sovagrid-agent.service &&
+        ! -L /etc/systemd/system/sovagrid-agent.service ]]; then
+    systemctl enable "$recovery_unit" || die 'external Agent recovery unit could not be enabled'
+    systemctl is-enabled --quiet "$recovery_unit" || die 'external Agent recovery unit is not enabled'
+  fi
   install_release_feed_units
   say 'Agent was skipped by --hub-only. Re-run without it to enroll the host.'
   exit 0

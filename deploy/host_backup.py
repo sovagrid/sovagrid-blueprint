@@ -213,6 +213,8 @@ FULL = (
 HUB_ONLY = (
     Source("/etc/sovagrid-hub", kind="dir", private=True, exact_mode=0o750,
            gid=HUB_GID, excluded=frozenset({"bot.token"})),
+    Source("/etc/sovagrid/.external-agent-recovery-managed-by-run-sh", private=True,
+           exact_mode=0o600, gid=ROOT_GID),
     Source("/opt/sovagrid-agent-local", kind="dir"),
     Source("/etc/sovagrid-local", kind="dir", private=True),
     # Local Agent's /files workspace, and the independent external Agent,

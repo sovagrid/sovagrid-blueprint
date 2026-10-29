@@ -119,6 +119,8 @@ SNAPSHOT = LOCAL_CONTAINERS_SNAPSHOT + (
     WEB_AGENT_MARKER,
     WEB_AGENT_DIR,
     *(f"/etc/systemd/system/{unit}" for unit in WEB_AGENT_UNITS),
+    "/etc/sovagrid/.external-agent-recovery-managed-by-run-sh",
+    "/etc/systemd/system/sovagrid-external-agent-recovery.service",
 )
 LEGACY_UNITS = ("sovagrid-agent-local.service", "sovagrid-terminal-local-control.socket",
          "sovagrid-terminal-local-control.service", "sovagrid-vpn-status.service",
