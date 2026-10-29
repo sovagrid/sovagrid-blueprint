@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Jigokuraku01
 # Additional author attribution terms: see ATTRIBUTION.md.
-"""Install a second Agent through the real Connect and Hub on disposable CI.
+"""Install remote Agents through Connect and Web on disposable CI.
 
 The Ubuntu target is a privileged systemd container because the production
 installer checks systemd units, credentials and the effective OpenSSH policy.
@@ -246,6 +246,35 @@ def api_request(method: str, path: str, *, token: str | None = None, body: dict 
     return value
 
 
+def browser_ssh_request(path: str, body: dict, token: str, *, timeout: int = 30) -> dict:
+    """Call the same-origin Web route, reporting only stable error codes."""
+    require(path.startswith("/api/v1/browser-ssh/") and isinstance(body, dict),
+            "Unexpected browser SSH request")
+    headers = {"Accept": "application/json", "Content-Type": "application/json",
+               "Origin": "http://127.0.0.1:8766", "Authorization": "Bearer " + token}
+    request = Request("http://127.0.0.1:8766" + path, method="POST",
+                      data=json.dumps(body, separators=(",", ":")).encode("utf-8"),
+                      headers=headers)
+    opener = build_opener(ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            require(response.status == 200, "Browser SSH route returned an unexpected status")
+            raw = response.read(65537)
+    except HTTPError as error:
+        try:
+            payload = json.loads(error.read(513))
+            code = payload.get("error") if isinstance(payload, dict) else None
+        except (ValueError, UnicodeError, TypeError):
+            code = None
+        raise RuntimeError("Browser SSH route refused " + path.rsplit("/", 1)[-1] +
+                           ": " + (code if isinstance(code, str) and
+                                   re.fullmatch(r"[A-Z_]{3,48}", code) else "HTTP_ERROR")) from None
+    require(len(raw) <= 65536, "Browser SSH route reply is too large")
+    value = json.loads(raw)
+    require(isinstance(value, dict), "Browser SSH route did not return an object")
+    return value
+
+
 def panel_probe(port: int) -> dict[str, str]:
     """Report only fixed route/status categories; never response or SSH data."""
     checks = (("health", "/healthz", 512),
@@ -306,6 +335,140 @@ def host_forward_policy() -> dict[str, bool]:
     return {"tcp_forwarding": values.get("allowtcpforwarding") in ("yes", "local"),
             "forwarding_enabled": values.get("disableforwarding") == "no",
             "panel_destination": "any" in permit or "127.0.0.1:8766" in permit}
+
+
+def start_web_target(state_dir: Path, state: dict) -> str:
+    """Add one fresh Ubuntu target to the gateway's private Docker bridge."""
+    name = "sovagrid-ci-web-target-" + state["container"].rsplit("-", 1)[-1]
+    state["web_container"] = name
+    save(state_dir, state)  # Cleanup can find it if a later step is interrupted.
+    key = state_dir / "ci_ed25519.pub"
+    command("docker", "run", "-d", "--name", name,
+            "--network", COMPOSE_NETWORK, "--privileged", "--cgroupns=host",
+            "--tmpfs", "/run", "--tmpfs", "/run/lock",
+            "--volume", "/sys/fs/cgroup:/sys/fs/cgroup:rw",
+            "--mount", f"type=bind,src={key},dst=/root/.ssh/authorized_keys,readonly",
+            state["image"])
+    target = docker_json("inspect", name)[0]
+    require(target["HostConfig"]["NetworkMode"] == COMPOSE_NETWORK
+            and not any(target["NetworkSettings"].get("Ports", {}).values()),
+            "Web Agent target unexpectedly publishes a port")
+    address = target["NetworkSettings"]["Networks"][COMPOSE_NETWORK]["IPAddress"]
+    require(isinstance(address, str) and address.startswith("172.30.253."),
+            "Web Agent target has no private bridge address")
+    state["web_target_ip"] = address
+    save(state_dir, state)
+    # The image contains a host key from its build. Give this second host a
+    # distinct key so Web must review a distinct SSH identity.
+    command("docker", "exec", name, "systemctl", "stop", "ssh.socket", check=False)
+    command("docker", "exec", name, "systemctl", "stop", "ssh.service", check=False)
+    command("docker", "exec", name, "find", "/etc/ssh", "-maxdepth", "1",
+            "-type", "f", "-name", "ssh_host_*", "-delete")
+    command("docker", "exec", name, "ssh-keygen", "-A")
+    public = command("docker", "exec", name, "cat",
+                     "/etc/ssh/ssh_host_ed25519_key.pub").stdout.split()
+    require(len(public) >= 2 and public[1] != state["known_lines"][1].split()[2],
+            "Web Agent target reused the Connect target's host key")
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        if command("docker", "exec", name, "systemctl", "start", "ssh.service",
+                   check=False).returncode == 0:
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError("Web Agent target SSH did not start")
+    require(command("docker", "exec", name, "systemctl", "is-active", "--quiet",
+                    "ssh.service", check=False).returncode == 0,
+            "Web Agent target SSH is inactive")
+    return address
+
+
+def verify_web_agent(state_dir: Path, state: dict, host_id: str, connect_id: str) -> None:
+    """Use real Web gateway routes to enroll a distinct Ubuntu target."""
+    address = start_web_target(state_dir, state)
+    password = Path("/etc/sovagrid/admin-password").read_text(encoding="ascii").strip()
+    token = api_request("POST", "/api/v1/session",
+                        body={"username": "admin", "password": password})["token"]
+    web_id = None
+    initial_seen = None
+    try:
+        host_key = browser_ssh_request("/api/v1/browser-ssh/target-host-key",
+                                       {"host": address, "port": 22}, token)
+        require(host_key.get("protocol") == 1 and host_key.get("scope") == "entered_target"
+                and host_key.get("host") == address and
+                re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", host_key.get("fingerprint", "")),
+                "Web gateway did not review the target SSH key")
+        credential = {"host": address, "port": 22, "username": "root",
+                      "method": "private_key", "fingerprint": host_key["fingerprint"],
+                      "password": "", "private_key": (state_dir / "ci_ed25519").read_text(),
+                      "passphrase": ""}
+        status = browser_ssh_request("/api/v1/browser-ssh/target-status", credential, token)
+        require(status.get("protocol") == 1 and status.get("kind") == "missing" and
+                status.get("host_key_fingerprint") == host_key["fingerprint"],
+                "Web gateway did not confirm an empty target")
+        fields = {**credential, "name": state["web_container"],
+                  "hub_host": COMPOSE_GATEWAY, "hub_port": 22, "local_port": 18767}
+        preview = browser_ssh_request("/api/v1/browser-ssh/target-install-preview",
+                                      fields, token, timeout=45)
+        require(preview.get("protocol") == 1 and preview.get("writes") is False and
+                preview.get("target_kind") == "missing" and
+                preview.get("hub_route") == "reachable" and
+                preview.get("preflight_passed") is True,
+                "Web gateway did not return a safe install preview")
+        job = browser_ssh_request("/api/v1/browser-ssh/agent/prepare", fields, token,
+                                  timeout=600)
+        require(job.get("protocol") == 1 and job.get("phase") == "prepared" and
+                job.get("writes") is True and job.get("activation_writes") is False and
+                isinstance(job.get("request_id"), str) and
+                isinstance(job.get("revision"), int) and
+                job.get("platform", {}).get("ubuntu_version") == "24.04",
+                "Web Agent prepare did not return a reviewed job")
+        credential["private_key"] = fields["private_key"] = ""
+        installed = browser_ssh_request("/api/v1/browser-ssh/agent/apply",
+                {"request_id": job["request_id"], "expected_revision": job["revision"]},
+                token, timeout=600)
+        web_id = installed.get("server_id")
+        require(installed.get("protocol") == 1 and installed.get("phase") == "active" and
+                installed.get("registration_state") == "active" and
+                isinstance(web_id, str) and web_id not in (host_id, connect_id),
+                "Web Agent apply did not activate an independent server")
+        for unit in ("sovagrid-agent.service", "sovagrid-agent-tunnel.service"):
+            require(command("docker", "exec", state["web_container"], "systemctl",
+                            "is-active", "--quiet", unit, check=False).returncode == 0,
+                    "Web Agent target service is inactive")
+        rows = api_request("GET", "/api/v1/servers", token=token).get("servers")
+        require(isinstance(rows, list), "Hub returned no server inventory")
+        web_row = next((item for item in rows if item.get("id") == web_id), None)
+        require(web_row is not None, "Hub lacks the Web Agent server identity")
+        initial_seen = web_row.get("last_seen")
+    finally:
+        api_request("DELETE", "/api/v1/session", token=token)
+
+    # A new Web session observes later metrics, proving the Agent remains
+    # connected after the browser administrator session has been revoked.
+    token = api_request("POST", "/api/v1/session",
+                        body={"username": "admin", "password": password})["token"]
+    try:
+        deadline = time.monotonic() + 85
+        while True:
+            rows = api_request("GET", "/api/v1/servers", token=token).get("servers")
+            require(isinstance(rows, list), "Hub returned no server inventory")
+            by_id = {row["id"]: row for row in rows}
+            require(host_id in by_id and connect_id in by_id and web_id in by_id,
+                    "Hub lacks a server identity after Web Agent apply")
+            seen = by_id[web_id]["last_seen"]
+            history = api_request("GET", f"/api/v1/servers/{web_id}/metrics?limit=5",
+                                  token=token).get("metrics")
+            if (by_id[web_id]["online"] is True and type(seen) is int and
+                    (initial_seen is None or seen > initial_seen) and
+                    isinstance(history, list) and len(history) >= 2):
+                break
+            require(time.monotonic() < deadline,
+                    "Web Agent did not persist later metrics after browser logout")
+            time.sleep(2)
+    finally:
+        api_request("DELETE", "/api/v1/session", token=token)
+    print("INTEGRATED_WEB_AGENT_PERSISTS_AFTER_BROWSER", flush=True)
 
 
 def verify(state_dir: Path) -> None:
@@ -422,6 +585,7 @@ def verify(state_dir: Path) -> None:
         time.sleep(2)
     api_request("DELETE", "/api/v1/session", token=token)
     print("INTEGRATED_REMOTE_AGENT_PERSISTS_AFTER_CONNECT", flush=True)
+    verify_web_agent(state_dir, state, host_id, remote_id)
 
 
 def cleanup(state_dir: Path) -> None:
@@ -438,6 +602,12 @@ def cleanup(state_dir: Path) -> None:
 
     compose = SOURCE / "sovagrid-blueprint/deploy/compose.yaml"
     attempt("host Agent stop", lambda: command("systemctl", "stop", "sovagrid-agent.service", check=False))
+    # The Web target shares Compose's private bridge. Remove it before
+    # Compose down so only managed containers remain on that network.
+    if state.get("web_container") and command("docker", "inspect", state["web_container"],
+                                               check=False).returncode == 0:
+        attempt("Web target removal", lambda: command("docker", "rm", "-f",
+                                                      state["web_container"]))
     if compose.is_file() and Path("/etc/sovagrid/deploy.env").is_file():
         attempt("compose down", lambda: command("docker", "compose", "--env-file", "/etc/sovagrid/deploy.env",
                   "-f", str(compose), "down", "--remove-orphans"))
