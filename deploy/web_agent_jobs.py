@@ -29,6 +29,7 @@ from typing import Callable
 
 
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
+_BUNDLE_NAME = re.compile(r"source-([0-9a-f]{64})\.tar\.gz\Z")
 _BEARER = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 _PHASES = frozenset({"prepared", "transport_ready", "registered", "active"})
@@ -141,7 +142,9 @@ class WebAgentJobs:
         self._journal_error = EnrollmentJournalError
         self.journal = EnrollmentJournal(Path(journal_root))
         self._bundle_path = Path(bundle_path)
-        if not self._bundle_path.is_absolute() or not isinstance(bundle_sha256, str) or _SHA.fullmatch(bundle_sha256) is None:
+        if (not self._bundle_path.is_absolute() or ".." in self._bundle_path.parts or
+                not isinstance(bundle_sha256, str) or _SHA.fullmatch(bundle_sha256) is None or
+                self._bundle_path.name != f"source-{bundle_sha256}.tar.gz"):
             raise JobError("INVALID_BUNDLE_PIN")
         self._bundle_sha256 = bundle_sha256
         if not callable(controller_factory):
@@ -158,25 +161,36 @@ class WebAgentJobs:
         if not self._root_check():
             raise JobError("ROOT_REQUIRED")
 
-    def _bundle(self) -> Path:
+    def _bundle(self, path: Path | None = None, sha256: str | None = None) -> Path:
+        selected = self._bundle_path if path is None else Path(path)
+        digest_pin = self._bundle_sha256 if sha256 is None else sha256
+        if (not selected.is_absolute() or ".." in selected.parts or
+                selected.parent != self._bundle_path.parent or
+                not isinstance(digest_pin, str) or _SHA.fullmatch(digest_pin) is None or
+                selected.name != f"source-{digest_pin}.tar.gz"):
+            raise JobError("SOURCE_UNTRUSTED")
         try:
-            before = self._bundle_path.lstat()
-            descriptor = os.open(self._bundle_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            directory = selected.parent.lstat()
+            if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid() or
+                    stat.S_IMODE(directory.st_mode) != 0o700):
+                raise JobError("SOURCE_UNTRUSTED")
+            before = selected.lstat()
+            descriptor = os.open(selected, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             with os.fdopen(descriptor, "rb") as stream:
                 info = os.fstat(stream.fileno())
                 if ((before.st_dev, before.st_ino) != (info.st_dev, info.st_ino) or
                         not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
-                        info.st_uid != os.geteuid() or info.st_mode & 0o022 or
+                        info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or
                         not 0 < info.st_size <= _MAX_BUNDLE):
                     raise JobError("SOURCE_UNTRUSTED")
                 digest = hashlib.sha256()
                 for block in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(block)
-            if not hmac.compare_digest(digest.hexdigest(), self._bundle_sha256):
+            if not hmac.compare_digest(digest.hexdigest(), digest_pin):
                 raise JobError("SOURCE_UNTRUSTED")
         except OSError:
             raise JobError("SOURCE_UNTRUSTED") from None
-        return self._bundle_path
+        return selected
 
     @contextmanager
     def _exclusive(self):
@@ -414,7 +428,8 @@ class WebAgentJobs:
             if not hmac.compare_digest(record["target_connection"]["host_key_alias"] or "", _alias(reviewed_fingerprint)):
                 raise JobError("HOST_KEY_MISMATCH", request_id)
             self._release()
-            bundle_path = self._bundle()
+            saved_bundle = record["bundle"]
+            bundle_path = self._bundle(Path(saved_bundle["path"]), saved_bundle["sha256"])
             try:
                 binding = self._binding(target_options, reviewed_fingerprint, credential)
             except Exception:

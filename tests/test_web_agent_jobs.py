@@ -63,6 +63,7 @@ class FakeController:
         self.cancelled = threading.Event()
         self.closed = False
         self.fail_apply = fail_apply
+        self.resumed_bundle = None
 
     @staticmethod
     def _connection(options):
@@ -100,6 +101,7 @@ class FakeController:
     def resume(self, request_id, *, session_token, target_identity, jump_identity, bundle_path):
         assert session_token == BEARER
         assert Path(bundle_path).exists()
+        self.resumed_bundle = Path(bundle_path)
         self.record = self.journal.load(request_id)
         assert self.record is not None
         connection = dict(self.record["target_connection"])
@@ -151,9 +153,11 @@ class JobsTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory(dir=trusted_tmp)
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        self.bundle = self.root / "bundle.tar.gz"
-        self.bundle.write_bytes(b"fixture bundle, not a real installer")
-        self.sha = hashlib.sha256(self.bundle.read_bytes()).hexdigest()
+        contents = b"fixture bundle, not a real installer"
+        self.sha = hashlib.sha256(contents).hexdigest()
+        self.bundle = self.root / f"source-{self.sha}.tar.gz"
+        self.bundle.write_bytes(contents)
+        self.bundle.chmod(0o600)
         self.created = []
         self.controller_created = threading.Event()
         self.fail_apply = False
@@ -340,6 +344,43 @@ class JobsTests(unittest.TestCase):
             jobs.apply(review["request_id"], review["revision"])
         self.assertEqual(raised.exception.code, "RESUME_REQUIRED")
         self.assertTrue(jobs.status(review["request_id"])["recoverable"])
+
+    def test_pending_job_resumes_with_old_content_addressed_bundle_after_update(self):
+        first = self.jobs()
+        review = self.prepare(first)
+        first.close()
+        old_bundle = self.bundle
+        new_bytes = b"updated source bundle fixture"
+        new_sha = hashlib.sha256(new_bytes).hexdigest()
+        new_bundle = self.root / f"source-{new_sha}.tar.gz"
+        new_bundle.write_bytes(new_bytes)
+        new_bundle.chmod(0o600)
+        second = WebAgentJobs(journal_root=self.root / "journal", bundle_path=new_bundle,
+            bundle_sha256=new_sha, controller_factory=self.factory, root_check=lambda: True)
+        self.addCleanup(second.close)
+        self.assertEqual(second.status(review["request_id"])["phase"], "prepared")
+        resumed = second.resume(review["request_id"], target_options=self.options(),
+            reviewed_fingerprint=FINGERPRINT, credential=Credential(), session_token=BEARER)
+        self.assertEqual(self.created[-1].resumed_bundle, old_bundle)
+        self.assertTrue(second.cleanup(resumed["request_id"], resumed["revision"])["removed"])
+        self.assertTrue(old_bundle.exists())  # A separate safe GC may remove it later.
+
+    def test_resume_rejects_journal_bundle_outside_private_directory(self):
+        first = self.jobs()
+        review = self.prepare(first)
+        first.close()
+        outside = self.root.parent / f"source-{self.sha}.tar.gz"
+        record = first.journal.load(review["request_id"])
+        first.journal.update(review["request_id"],
+            {"bundle": {"path": str(outside), "sha256": self.sha}},
+            expected_revision=record["revision"])
+        second = self.jobs()
+        credential = Credential()
+        with self.assertRaises(JobError) as raised:
+            second.resume(review["request_id"], target_options=self.options(),
+                reviewed_fingerprint=FINGERPRINT, credential=credential, session_token=BEARER)
+        self.assertEqual(raised.exception.code, "SOURCE_UNTRUSTED")
+        self.assertTrue(credential.wiped)
 
 
 if __name__ == "__main__":
