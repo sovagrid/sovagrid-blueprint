@@ -6,8 +6,16 @@
 
 This module has no HTTP listener. A narrow host-side service must authenticate
 its caller, create a headless SSH binding, and call these blocking methods on a
-worker thread. Only the existing Connect EnrollmentJournal persists; passwords,
-private keys and borrowed Hub bearer sessions remain in the live binding.
+worker thread. The Connect EnrollmentJournal and completed-record audit persist;
+passwords, private keys and borrowed Hub bearer sessions remain in the live binding.
+
+Connect caps its recovery journal at 128 records. Before that cap is reached,
+completed, cleanup-free enrollments beyond the most recent 64 are copied to a
+private, hash-chained, append-only audit file and fsynced before their journal
+records are removed. Incomplete jobs are never retired. This version caps the
+audit file at 64 MiB, matching host backup; when full, a new preparation fails
+before any remote write with ARCHIVE_FULL. Archived completions remain visible
+through the audit file, while per-request installer status returns NOT_FOUND.
 """
 
 from __future__ import annotations
@@ -18,6 +26,7 @@ from dataclasses import asdict, dataclass, field
 import fcntl
 import hashlib
 import hmac
+import json
 import os
 from pathlib import Path
 import re
@@ -35,6 +44,10 @@ _FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 _PHASES = frozenset({"prepared", "transport_ready", "registered", "active"})
 _MAX_BUNDLE = 64 * 1024 * 1024
 _LEASE_SECONDS = 600
+_COMPLETED_ARCHIVE = "completed-enrollments.jsonl"
+_ARCHIVE_TAIL_BYTES = 128 * 1024
+_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024  # Matches the host-backup inventory limit.
+_ZERO_SHA = "0" * 64
 
 
 class JobError(RuntimeError):
@@ -123,6 +136,15 @@ def _public_record(record: dict) -> dict:
             "recoverable": phase != "active" or record.get("cleanup_required") is True}
 
 
+def _unique_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate archive field")
+        value[key] = item
+    return value
+
+
 class WebAgentJobs:
     """One mutating enrollment at a time; durable public state survives restart.
 
@@ -138,9 +160,14 @@ class WebAgentJobs:
                  root_check: Callable[[], bool] | None = None,
                  monotonic: Callable[[], float] = time.monotonic):
         ConnectionOptions, EnrollmentJournal, EnrollmentJournalError = _vendor()
+        import sys
+        max_records = sys.modules["sovagrid_connect.enrollment_journal"].MAX_RECORDS
+        if type(max_records) is not int or max_records < 2:
+            raise JobError("RUNTIME_UNAVAILABLE")
         self._options_class = ConnectionOptions
         self._journal_error = EnrollmentJournalError
         self.journal = EnrollmentJournal(Path(journal_root))
+        self._journal_max_records = max_records
         self._bundle_path = Path(bundle_path)
         if (not self._bundle_path.is_absolute() or ".." in self._bundle_path.parts or
                 not isinstance(bundle_sha256, str) or _SHA.fullmatch(bundle_sha256) is None or
@@ -342,8 +369,170 @@ class WebAgentJobs:
                     pass
             raise JobError("SSH_UNAVAILABLE") from None
 
-    def _pending(self):
-        return [row for row in self.journal.list() if row["phase"] != "active" or row["cleanup_required"]]
+    @staticmethod
+    def _canonical(value: dict) -> bytes:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False,
+                          separators=(",", ":")).encode("utf-8")
+
+    @classmethod
+    def _archive_entry(cls, line: bytes, previous_sha: str | None = None,
+                       sequence: int | None = None) -> dict:
+        try:
+            value = json.loads(line, object_pairs_hook=_unique_json_object)
+            if (type(value) is not dict or set(value) != {"protocol", "sequence", "archived_at",
+                    "record", "record_sha256", "previous_sha256", "entry_sha256"} or
+                    type(value["protocol"]) is not int or value["protocol"] != 1 or
+                    type(value["sequence"]) is not int or value["sequence"] < 1 or
+                    type(value["archived_at"]) is not int or value["archived_at"] < 1 or
+                    type(value["record"]) is not dict or
+                    value["record"].get("phase") != "active" or
+                    value["record"].get("cleanup_required") is not False or
+                    _SHA.fullmatch(value["record_sha256"]) is None or
+                    _SHA.fullmatch(value["previous_sha256"]) is None or
+                    _SHA.fullmatch(value["entry_sha256"]) is None or
+                    cls._canonical(value) != line or
+                    hashlib.sha256(cls._canonical(value["record"])).hexdigest() != value["record_sha256"] or
+                    hashlib.sha256(cls._canonical({key: item for key, item in value.items()
+                                                  if key != "entry_sha256"})).hexdigest() != value["entry_sha256"] or
+                    (previous_sha is not None and value["previous_sha256"] != previous_sha) or
+                    (sequence is not None and value["sequence"] != sequence)):
+                raise ValueError
+            _uuid(value["record"].get("request_id"))
+            return value
+        except (ValueError, TypeError, KeyError, UnicodeError, OverflowError,
+                RecursionError, JobError):
+            raise JobError("ARCHIVE_UNSAFE") from None
+
+    def _archive_fd(self, *, create: bool) -> tuple[int, bool]:
+        directory = self._bundle_path.parent
+        try:
+            info = directory.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or
+                    stat.S_IMODE(info.st_mode) != 0o700):
+                raise JobError("ARCHIVE_UNSAFE")
+            path = directory / _COMPLETED_ARCHIVE
+            existed = os.path.lexists(path)
+            if not existed and not create:
+                return -1, False
+            flags = os.O_RDWR | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+            if create:
+                flags |= os.O_CREAT | (os.O_EXCL if not existed else 0)
+            descriptor = os.open(path, flags, 0o600)
+            if not existed:
+                os.fchmod(descriptor, 0o600)
+            opened = os.fstat(descriptor)
+            named = path.lstat()
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or
+                    opened.st_uid != os.geteuid() or stat.S_IMODE(opened.st_mode) != 0o600 or
+                    (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+                os.close(descriptor)
+                raise JobError("ARCHIVE_UNSAFE")
+            return descriptor, not existed
+        except OSError:
+            raise JobError("ARCHIVE_UNSAFE") from None
+
+    @classmethod
+    def _archive_tail(cls, descriptor: int) -> dict | None:
+        try:
+            size = os.fstat(descriptor).st_size
+            if size > _ARCHIVE_MAX_BYTES:
+                raise JobError("ARCHIVE_UNSAFE")
+            if size == 0:
+                return None
+            start = max(0, size - _ARCHIVE_TAIL_BYTES)
+            os.lseek(descriptor, start, os.SEEK_SET)
+            tail = os.read(descriptor, size - start)
+            if len(tail) != size - start:
+                raise JobError("ARCHIVE_UNSAFE")
+            if not tail.endswith(b"\n"):
+                last_newline = tail.rfind(b"\n")
+                if last_newline < 0 and start:
+                    raise JobError("ARCHIVE_UNSAFE")
+                # A torn final append cannot have been followed by a journal
+                # removal. Discard only this incomplete tail and retry it.
+                new_size = start + last_newline + 1
+                os.ftruncate(descriptor, new_size)
+                os.fsync(descriptor)
+                if new_size == 0:
+                    return None
+                tail = tail[:last_newline + 1]
+            line = tail[:-1].rsplit(b"\n", 1)[-1]
+            if not line:
+                raise JobError("ARCHIVE_UNSAFE")
+            return cls._archive_entry(line)
+        except OSError:
+            raise JobError("ARCHIVE_UNSAFE") from None
+
+    def _archive_completed(self, record: dict) -> None:
+        if record["phase"] != "active" or record["cleanup_required"]:
+            raise JobError("ARCHIVE_UNSAFE")
+        descriptor, created = self._archive_fd(create=True)
+        try:
+            previous = self._archive_tail(descriptor)
+            record_sha = hashlib.sha256(self._canonical(record)).hexdigest()
+            if previous is not None and previous["record"]["request_id"] == record["request_id"]:
+                if previous["record_sha256"] != record_sha:
+                    raise JobError("ARCHIVE_UNSAFE")
+                return  # Crash after durable append, before journal removal.
+            entry = {"protocol": 1, "sequence": previous["sequence"] + 1 if previous else 1,
+                     "archived_at": max(1, int(time.time())), "record": record,
+                     "record_sha256": record_sha,
+                     "previous_sha256": previous["entry_sha256"] if previous else _ZERO_SHA}
+            entry["entry_sha256"] = hashlib.sha256(self._canonical(entry)).hexdigest()
+            line = self._canonical(entry) + b"\n"
+            if len(line) > _ARCHIVE_TAIL_BYTES // 2:
+                raise JobError("ARCHIVE_UNSAFE")
+            if os.fstat(descriptor).st_size + len(line) > _ARCHIVE_MAX_BYTES:
+                raise JobError("ARCHIVE_FULL")
+            while line:
+                written = os.write(descriptor, line)
+                if written <= 0:
+                    raise JobError("ARCHIVE_UNSAFE")
+                line = line[written:]
+            os.fsync(descriptor)
+            if created:
+                parent = os.open(self._bundle_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(parent)
+                finally:
+                    os.close(parent)
+        except OSError:
+            raise JobError("ARCHIVE_UNSAFE") from None
+        finally:
+            os.close(descriptor)
+
+    def _retire_completed(self, rows: list[dict]) -> None:
+        if len(rows) < self._journal_max_records - 1:
+            return
+        # Keep a recent installer history while guaranteeing room for new
+        # installations. Recoverable records are checked before this method.
+        retain = max(1, min(64, self._journal_max_records // 2))
+        completed = sorted(rows, key=lambda row: (row["updated_at"], row["created_at"],
+                                                  row["request_id"]))
+        for record in completed[:max(0, len(rows) - retain)]:
+            self._archive_completed(record)
+            self.journal.remove(record["request_id"], record["revision"])
+
+    def verify_completed_archive(self) -> dict:
+        """Verify the whole private archive chain for backup or local audit."""
+        with self._exclusive():
+            descriptor, _created = self._archive_fd(create=False)
+            if descriptor < 0:
+                return {"records": 0, "last_sha256": _ZERO_SHA}
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                with os.fdopen(os.dup(descriptor), "rb") as stream:
+                    previous = _ZERO_SHA
+                    count = 0
+                    for line in stream:
+                        if len(line) > _ARCHIVE_TAIL_BYTES // 2 or not line.endswith(b"\n"):
+                            raise JobError("ARCHIVE_UNSAFE")
+                        entry = self._archive_entry(line[:-1], previous, count + 1)
+                        previous = entry["entry_sha256"]
+                        count += 1
+                return {"records": count, "last_sha256": previous}
+            finally:
+                os.close(descriptor)
 
     def _current(self, request_id: str, expected_revision: int) -> _Live:
         _uuid(request_id)
@@ -368,11 +557,13 @@ class WebAgentJobs:
         with self._credential_guard(credential), self._exclusive():
             if not isinstance(session_token, str) or _BEARER.fullmatch(session_token) is None:
                 raise JobError("AUTH_REQUIRED")
-            pending = self._pending()
+            rows = self.journal.list()
+            pending = [row for row in rows if row["phase"] != "active" or row["cleanup_required"]]
             if pending:
                 raise JobError("RECOVERY_REQUIRED", pending[0]["request_id"])
             self._release()
             bundle_path = self._bundle()
+            self._retire_completed(rows)
             try:
                 binding = self._binding(target_options, reviewed_fingerprint, credential)
             except Exception:

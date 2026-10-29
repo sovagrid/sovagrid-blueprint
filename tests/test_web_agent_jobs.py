@@ -17,6 +17,7 @@ import tempfile
 import threading
 import unittest
 import uuid
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,8 +25,10 @@ sys.path.insert(0, str(ROOT / "vendor/connect"))
 sys.path.insert(0, str(ROOT / "deploy"))
 
 from sovagrid_connect.core import ConnectionOptions
+from sovagrid_connect import enrollment_journal
 from sovagrid_connect.enrollment_protocol import public_key_fingerprint
 from web_agent_jobs import ControllerBinding, JobError, WebAgentJobs
+import web_agent_jobs
 
 
 BEARER = "b" * 43
@@ -381,6 +384,93 @@ class JobsTests(unittest.TestCase):
                 reviewed_fingerprint=FINGERPRINT, credential=credential, session_token=BEARER)
         self.assertEqual(raised.exception.code, "SOURCE_UNTRUSTED")
         self.assertTrue(credential.wiped)
+
+    def test_completed_enrollments_archive_before_pruning_and_never_prune_pending(self):
+        with patch.object(enrollment_journal, "MAX_RECORDS", 4):
+            jobs = self.jobs()
+            completed = []
+            for _ in range(6):
+                prepared = self.prepare(jobs)
+                completed.append(jobs.apply(prepared["request_id"], prepared["revision"]))
+            archive = self.root / "completed-enrollments.jsonl"
+            self.assertEqual(archive.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(len(jobs.list()), 3)
+            verification = jobs.verify_completed_archive()
+            self.assertEqual(verification["records"], 3)
+            archived_ids = [json.loads(line)["record"]["request_id"]
+                            for line in archive.read_text().splitlines()]
+            self.assertEqual(len(set(archived_ids)), 3)
+            self.assertEqual(set(archived_ids) | {row["request_id"] for row in jobs.list()},
+                             {row["request_id"] for row in completed})
+            for request_id in archived_ids:
+                with self.assertRaises(JobError) as error:
+                    jobs.status(request_id)
+                self.assertEqual(error.exception.code, "NOT_FOUND")
+            pending = self.prepare(jobs)
+            with self.assertRaises(JobError) as error:
+                self.prepare(jobs)
+            self.assertEqual(error.exception.code, "RECOVERY_REQUIRED")
+            self.assertEqual(error.exception.request_id, pending["request_id"])
+            self.assertEqual(jobs.verify_completed_archive()["records"], 4)
+            self.assert_secretless(jobs)
+            self.assertNotIn(BEARER, archive.read_text())
+
+    def test_crash_after_durable_archive_retries_without_duplicate(self):
+        with patch.object(enrollment_journal, "MAX_RECORDS", 4):
+            jobs = self.jobs()
+            for _ in range(3):
+                prepared = self.prepare(jobs)
+                jobs.apply(prepared["request_id"], prepared["revision"])
+            with patch.object(jobs.journal, "remove", side_effect=enrollment_journal.EnrollmentJournalError("interrupted")):
+                with self.assertRaises(JobError) as error:
+                    self.prepare(jobs)
+            self.assertEqual(error.exception.code, "JOURNAL_UNAVAILABLE")
+            self.assertEqual(jobs.verify_completed_archive()["records"], 1)
+            self.assertEqual(len(jobs.list()), 3)
+            prepared = self.prepare(jobs)
+            self.assertEqual(prepared["phase"], "prepared")
+            self.assertEqual(jobs.verify_completed_archive()["records"], 1)
+            self.assertEqual(len(jobs.list()), 3)
+
+    def test_archive_capacity_refuses_new_prepare_without_remote_writes(self):
+        with patch.object(enrollment_journal, "MAX_RECORDS", 4):
+            jobs = self.jobs()
+            for _ in range(4):
+                prepared = self.prepare(jobs)
+                jobs.apply(prepared["request_id"], prepared["revision"])
+            archive = self.root / "completed-enrollments.jsonl"
+            before = archive.read_bytes()
+            controllers = len(self.created)
+            credential = Credential()
+            with patch.object(web_agent_jobs, "_ARCHIVE_MAX_BYTES", len(before) + 1):
+                with self.assertRaises(JobError) as error:
+                    self.prepare(jobs, credential)
+            self.assertEqual(error.exception.code, "ARCHIVE_FULL")
+            self.assertTrue(credential.wiped)
+            self.assertEqual(len(self.created), controllers)
+            self.assertEqual(len(jobs.list()), 3)
+            self.assertEqual(archive.read_bytes(), before)
+
+    def test_archive_tamper_fails_closed_and_incomplete_append_recovers(self):
+        with patch.object(enrollment_journal, "MAX_RECORDS", 4):
+            jobs = self.jobs()
+            for _ in range(4):
+                prepared = self.prepare(jobs)
+                jobs.apply(prepared["request_id"], prepared["revision"])
+            archive = self.root / "completed-enrollments.jsonl"
+            self.assertEqual(jobs.verify_completed_archive()["records"], 1)
+            with archive.open("ab") as stream:
+                stream.write(b'{"partial":')
+                stream.flush(); os.fsync(stream.fileno())
+            for _ in range(2):
+                prepared = self.prepare(jobs)
+                jobs.apply(prepared["request_id"], prepared["revision"])
+            self.assertEqual(jobs.verify_completed_archive()["records"], 3)
+            raw = archive.read_bytes()
+            archive.write_bytes(raw.replace(b'"active"', b'"broken"', 1))
+            with self.assertRaises(JobError) as error:
+                jobs.verify_completed_archive()
+            self.assertEqual(error.exception.code, "ARCHIVE_UNSAFE")
 
 
 if __name__ == "__main__":
