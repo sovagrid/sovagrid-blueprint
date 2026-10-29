@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import time
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 import uuid
 
@@ -148,7 +149,9 @@ def setup(state_dir: Path) -> None:
         "# SovaGrid disposable GitHub CI bridge listeners\n"
         f"ListenAddress {COMPOSE_GATEWAY}\nListenAddress {gateway}\n"
         "PermitRootLogin prohibit-password\nPasswordAuthentication no\n"
-        "KbdInteractiveAuthentication no\nPubkeyAuthentication yes\n",
+        "KbdInteractiveAuthentication no\nPubkeyAuthentication yes\n"
+        "DisableForwarding no\nAllowTcpForwarding local\n"
+        "PermitOpen 127.0.0.1:8766 127.0.0.1:8767\n",
         encoding="ascii")
     SSH_CONFIG.chmod(0o644)
 
@@ -195,6 +198,8 @@ def setup(state_dir: Path) -> None:
     command("install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/run/sshd")
     command("ssh-keygen", "-A")
     command("/usr/sbin/sshd", "-t")
+    require(all(host_forward_policy().values()),
+            "CI host SSH policy does not allow the private panel forward")
     command("systemctl", "disable", "--now", "ssh.socket", check=False)
     command("systemctl", "enable", "--now", "ssh.service")
     command("systemctl", "restart", "ssh.service")
@@ -241,6 +246,68 @@ def api_request(method: str, path: str, *, token: str | None = None, body: dict 
     return value
 
 
+def panel_probe(port: int) -> dict[str, str]:
+    """Report only fixed route/status categories; never response or SSH data."""
+    checks = (("health", "/healthz", 512),
+              ("location", "/api/v1/panel-location", 512),
+              ("page", "/sovagrid/monitoring/", 16384),
+              ("manifest", "/sovagrid/monitoring/manifest.webmanifest", 8192))
+    opener = build_opener(ProxyHandler({}), NoRedirect())
+    result = {}
+    for name, path, limit in checks:
+        try:
+            with opener.open(f"http://127.0.0.1:{port}{path}", timeout=1.2) as response:
+                status = response.status
+                kind = response.headers.get("Content-Type", "")
+                raw = response.read(limit + 1)
+            if status != 200:
+                result[name] = f"http_{status}"
+            elif len(raw) > limit:
+                result[name] = "oversized"
+            elif name == "health":
+                result[name] = "ok" if json.loads(raw).get("ok") is True else "invalid"
+            elif name == "location":
+                value = json.loads(raw)
+                result[name] = ("ok" if kind.startswith("application/json") and
+                                value == {"panel_path": "/sovagrid/monitoring/"} else "invalid")
+            elif name == "page":
+                result[name] = "ok" if b"SovaGrid" in raw else "invalid"
+            else:
+                value = json.loads(raw)
+                result[name] = ("ok" if isinstance(value, dict) and
+                                "SovaGrid" in value.get("name", "") else "invalid")
+        except HTTPError as error:
+            result[name] = f"http_{error.code}"
+            error.close()
+        except (URLError, TimeoutError, OSError):
+            result[name] = "unreachable"
+        except (ValueError, TypeError, UnicodeError, AttributeError):
+            result[name] = "invalid"
+    return result
+
+
+def wait_direct_panel() -> dict[str, str]:
+    deadline = time.monotonic() + 10
+    while True:
+        observed = panel_probe(8766)
+        if set(observed.values()) == {"ok"}:
+            return observed
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Installed panel route is not ready: " + json.dumps(observed, sort_keys=True))
+        time.sleep(0.5)
+
+
+def host_forward_policy() -> dict[str, bool]:
+    """Summarize only the effective root SSH forwarding permissions."""
+    effective = command("/usr/sbin/sshd", "-T", "-C",
+                        f"user=root,addr={COMPOSE_GATEWAY},host=localhost,laddr={COMPOSE_GATEWAY},lport=22").stdout
+    values = dict(line.split(maxsplit=1) for line in effective.splitlines() if " " in line)
+    permit = values.get("permitopen", "").split()
+    return {"tcp_forwarding": values.get("allowtcpforwarding") in ("yes", "local"),
+            "forwarding_enabled": values.get("disableforwarding") == "no",
+            "panel_destination": "any" in permit or "127.0.0.1:8766" in permit}
+
+
 def verify(state_dir: Path) -> None:
     expected = os.environ.get("SOVAGRID_EXPECTED_MANIFEST", "")
     connect_ref = os.environ.get("CONNECT_REF", "")
@@ -257,13 +324,56 @@ def verify(state_dir: Path) -> None:
     from sovagrid_connect.core import ConnectionOptions, Tunnel
     from sovagrid_connect.enrollment_journal import EnrollmentJournal
 
+    class ObservedTunnel(Tunnel):
+        """Keep only boolean SSH evidence before Tunnel.start removes its log."""
+
+        diagnostic: dict | None = None
+
+        def close(self):
+            try:
+                if self.diagnostic is None and self.local_port is not None:
+                    raw = b""
+                    if self._ssh_log is not None:
+                        try:
+                            raw = Path(self._ssh_log).read_bytes()[:131072]
+                        except OSError:
+                            pass
+                    marker = f"Local forwarding listening on 127.0.0.1 port {self.local_port}.".encode()
+                    self.diagnostic = {
+                        "ssh_alive": self.alive,
+                        "authenticated_marker": b"Authenticated to " in raw,
+                        "forward_marker": marker in raw,
+                        "any_forward_marker": b"Local forwarding listening on " in raw,
+                        "forward_denied_marker": b"administratively prohibited" in raw,
+                        "local_bind_failed_marker": b"bind [127.0.0.1]" in raw,
+                        "forward_ready": self._forward_ready(),
+                        "panel_ready": self._panel_ready() if self.alive else False,
+                        "forwarded_http": panel_probe(self.local_port) if self.alive else None,
+                    }
+            except Exception:
+                # A diagnostic must never replace the original TunnelError.
+                self.diagnostic = {"probe_failed": True}
+            finally:
+                super().close()
+
     key = str(state_dir / "ci_ed25519")
     hub = ConnectionOptions(host=COMPOSE_GATEWAY, user="root", identity=key)
     target = ConnectionOptions(host=state["target_ip"], user="root", identity=key)
-    tunnel = Tunnel(hub, batch_mode=True)
+    wait_direct_panel()
+    tunnel = ObservedTunnel(hub, batch_mode=True)
     controller = None
     try:
-        tunnel.start(timeout=40)
+        try:
+            tunnel.start(timeout=40)
+        except Exception:
+            try:
+                policy = host_forward_policy()
+            except Exception:
+                policy = {"unavailable": True}
+            print("INTEGRATED_CONNECT_TUNNEL_PROBE " + json.dumps(
+                {**(tunnel.diagnostic or {"unavailable": True}),
+                 "host_policy": policy}, sort_keys=True), flush=True)
+            raise
         controller = AgentEnrollment(tunnel, journal=EnrollmentJournal(state_dir / "records"))
         password = Path("/etc/sovagrid/admin-password").read_text(encoding="ascii").strip()
         preview = controller.prepare(target_options=target,
