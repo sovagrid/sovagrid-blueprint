@@ -484,14 +484,45 @@ class Recovery:
         return result
 
     def _validate_guards(self, expected: dict) -> None:
-        need(expected == self._guards(expected), "GUARD_CHANGED")
+        current = self._guards(expected)
+        need({name: item for name, item in current.items() if name != TRIAL_DROPIN} ==
+             {name: item for name, item in expected.items() if name != TRIAL_DROPIN},
+             "GUARD_CHANGED")
+        trial = current[TRIAL_DROPIN]
+        if trial is not None:
+            need(trial["gid"] == self.group, "GUARD_CHANGED")
+            if trial != expected[TRIAL_DROPIN]:
+                self._require_trial_dropin()
 
-    def _require_trial_dropin(self, journal: dict) -> None:
+    def _require_trial_dropin(self) -> None:
         expected = Path(__file__).with_name("sovagrid-external-agent-trial.conf").read_bytes()
         item = self._read(TRIAL_DROPIN, 65536, mode=0o644, missing=True)
         need(item is not None and item[0] == expected and
-             journal["guards"].get(TRIAL_DROPIN) == item[1],
+             item[1]["gid"] == self.group,
              "TRIAL_START_GUARD_REQUIRED")
+
+    def _install_trial_dropin(self, journal: dict) -> None:
+        """Publish the temporary guard only after its rollback journal exists."""
+        need(journal["guards"][TRIAL_DROPIN] is None and
+             self._load_journal() == journal, "TRIAL_DROPIN_UNMANAGED")
+        self._tree(AGENT, journal["old_tree"])
+        self._check_meta(journal)
+        self._validate_guards(journal["guards"])
+        need(self._read(TRIAL_DROPIN, 65536, mode=0o644, missing=True) is None,
+             "TRIAL_DROPIN_UNMANAGED")
+        self.files.mkdir(str(Path(TRIAL_DROPIN).parent), 0o755)
+        contents = Path(__file__).with_name("sovagrid-external-agent-trial.conf").read_bytes()
+        need(0 < len(contents) <= 65536, "TRIAL_DROPIN_UNMANAGED")
+        self.files.write(TRIAL_DROPIN, contents, mode=0o644, gid=self.group)
+        self._require_trial_dropin()
+
+    def _remove_trial_dropin(self, guards: dict) -> None:
+        """Drop only a pinned legacy or exact current trial file, idempotently."""
+        self._validate_guards(guards)
+        if self._read(TRIAL_DROPIN, 65536, mode=0o644, missing=True) is None:
+            return
+        self.path(TRIAL_DROPIN).unlink()
+        _fsync_directory(self.path(TRIAL_DROPIN).parent)
 
     def verify_trial_state(self) -> str:
         """Validate exactly the new Agent for a guarded pre-start check."""
@@ -499,7 +530,7 @@ class Recovery:
         need(journal is not None and journal["phase"] == "trial",
              "TRIAL_GATE_REQUEST")
         self._validate_guards(journal["guards"])
-        self._require_trial_dropin(journal)
+        self._require_trial_dropin()
         self._check_meta(journal)
         self._tree(OLD_AGENT, journal["old_tree"])
         self._current_matches_committed(self._committed_marker(journal))
@@ -681,6 +712,7 @@ class Recovery:
             return False
         self._current_matches_committed(marker)
         need(self._load_journal() is None, "COMMITTED_REQUIRES_REVIEW")
+        self._remove_trial_dropin(marker["guards"])
         if self.files.inspect(TXN, directory=True, private=True, missing=True) is not None:
             shutil.rmtree(self.path(TXN))
             _fsync_directory(self.path(ROOT))
@@ -706,8 +738,10 @@ class Recovery:
         preparing = self._load_marker(PREPARING)
         if recovered is not None:
             self._current_matches_marker(recovered)
+            self._remove_trial_dropin(recovered["guards"])
         elif preparing is not None:
             self._current_matches_marker(preparing)
+            self._remove_trial_dropin(preparing["guards"])
         else:
             # A SIGKILL can happen after mkdir or during the atomic marker
             # write. Only an empty directory or Files.write scratch is safe.
@@ -884,11 +918,12 @@ class Recovery:
             metadata[name] = {"old": old[1]["sha256"], "new": _sha(data),
                               "mode": mode, "uid": self.owner, "gid": self.group}
         self._metadata_consistent(old_payloads, new_meta, old_tree, new_tree)
-        guards = self._guards()
         self.files.mkdir(ROOT, 0o700)
         _fsync_directory(self.path(ROOT).parent)
         self._clear_committed_orphan()
         self._clear_orphan()
+        guards = self._guards()
+        need(guards[TRIAL_DROPIN] is None, "TRIAL_DROPIN_UNMANAGED")
         need(not self.path(TXN).exists() and not self.path(TXN).is_symlink(),
              "TRANSACTION_EXISTS")
         self.files.mkdir(TXN, 0o700)
@@ -925,6 +960,9 @@ class Recovery:
         self._write_journal(journal)
         if checkpoint:
             checkpoint("journal")
+        self._install_trial_dropin(journal)
+        if checkpoint:
+            checkpoint("trial-dropin-installed")
         self.path(PREPARING).unlink()
         _fsync_directory(self.path(TXN))
         if checkpoint:
@@ -968,6 +1006,7 @@ class Recovery:
         need(self._load_marker(PREPARING) is None and
              self._load_marker(RECOVERED) is None, "TRANSACTION_NOT_READY")
         self._validate_guards(journal["guards"])
+        self._require_trial_dropin()
         self._check_meta(journal)
         need(self._tree_version(journal) == "old", "TREE_CHANGED")
         self._tree(NEW_AGENT, journal["new_tree"])
@@ -983,6 +1022,7 @@ class Recovery:
         self._tree(AGENT, journal["new_tree"])
         self._check_meta(journal)
         self._validate_guards(journal["guards"])
+        self._require_trial_dropin()
         self._set_phase(journal, "switched")
         if checkpoint:
             checkpoint("switched")
@@ -1001,7 +1041,7 @@ class Recovery:
         need(journal is not None and journal["phase"] == "switched" and
              agent_stopped() and remote_lease_active() and supervisor_active() and
              agent_idle_proven(), "TRIAL_GATE_REQUIRED")
-        self._require_trial_dropin(journal)
+        self._require_trial_dropin()
         self._check_meta(journal)
         self._tree(OLD_AGENT, journal["old_tree"])
         self._current_matches_committed(self._committed_marker(journal))
@@ -1017,6 +1057,7 @@ class Recovery:
         need(journal is not None and journal["phase"] == "trial" and
              agent_running() and agent_healthy() and remote_lease_active() and
              supervisor_active() and agent_idle_proven(), "COMMIT_GATE_REQUIRED")
+        self._require_trial_dropin()
         self._check_meta(journal)
         self._tree(OLD_AGENT, journal["old_tree"])
         self._current_matches_committed(self._committed_marker(journal))
@@ -1042,6 +1083,9 @@ class Recovery:
         self._write_committed_marker(marker)
         if checkpoint:
             checkpoint("committed-marker")
+        self._remove_trial_dropin(marker["guards"])
+        if checkpoint:
+            checkpoint("committed-trial-dropin-removed")
         self.path(JOURNAL).unlink()
         _fsync_directory(self.path(TXN))
         if checkpoint:
@@ -1100,6 +1144,9 @@ class Recovery:
         for name, _mode, limit in META:
             need(self._read(name, limit)[1]["sha256"] == journal["meta"][name]["old"],
                  "META_CHANGED")
+        self._remove_trial_dropin(journal["guards"])
+        if checkpoint:
+            checkpoint("trial-dropin-removed")
         marker = {"protocol": 1, "old_tree": journal["old_tree"],
                   "old_meta": {name: journal["meta"][name]["old"]
                                for name, _mode, _limit in META},

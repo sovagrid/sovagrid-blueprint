@@ -74,8 +74,6 @@ class InterruptedRecoveryTests(unittest.TestCase):
             "/etc/sovagrid-agent-tunnel-public/known_hosts": (b"host pin\n", 0o644),
             "/etc/systemd/system/sovagrid-agent-tunnel.service": (b"tunnel unit\n", 0o644),
             "/etc/systemd/system/sovagrid-fixture-reverse-tunnel.service": (b"fixture reverse tunnel\n", 0o644),
-            recovery.TRIAL_DROPIN: ((DEPLOY / "sovagrid-external-agent-trial.conf").read_bytes(),
-                                    0o644),
         }
         for path, (data, mode) in self.guards.items():
             self._file(path, data, mode)
@@ -176,6 +174,14 @@ class InterruptedRecoveryTests(unittest.TestCase):
             self.assertEqual(self.files.path(name).read_bytes(), data)
             self.assertEqual(self.files.path(name).stat().st_mode & 0o777, mode)
 
+    def assert_trial_dropin(self, installed: bool):
+        path = self.files.path(recovery.TRIAL_DROPIN)
+        self.assertEqual(path.exists(), installed)
+        if installed:
+            self.assertEqual(path.read_bytes(),
+                             (DEPLOY / "sovagrid-external-agent-trial.conf").read_bytes())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+
     def trial(self):
         self.worker.begin_trial(agent_stopped=lambda: True,
                                 remote_lease_active=lambda: True,
@@ -211,7 +217,7 @@ class InterruptedRecoveryTests(unittest.TestCase):
     def test_sigkill_during_prepare_has_safe_cleanup_and_retry(self):
         steps = ("txn-created", "prepare-marker", "old-tree", "new-tree",
                  *("meta-" + str(i) for i in range(len(recovery.META))),
-                 "journal", "marker-removed")
+                 "journal", "trial-dropin-installed", "marker-removed")
         for stop_at in steps:
             with self.subTest(stop_at=stop_at):
                 self._new_fixture()
@@ -222,12 +228,17 @@ class InterruptedRecoveryTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(RuntimeError, "power loss"):
                     self.prepare_with_checkpoint(interrupted)
+                self.assert_trial_dropin(stop_at in
+                                         ("trial-dropin-installed", "marker-removed"))
                 self.assert_old()
                 self.assertTrue(self.worker.recover_pending(agent_stopped=lambda: True))
+                self.assert_trial_dropin(False)
                 self.assertFalse(self.files.path(recovery.TXN).exists())
                 self.assertFalse(self.worker.recover_pending(agent_stopped=lambda: True))
                 self.prepare()
+                self.assert_trial_dropin(True)
                 self.assertTrue(self.worker.recover_pending(agent_stopped=lambda: True))
+                self.assert_trial_dropin(False)
                 self.assert_old()
 
     def test_prepare_retries_after_verified_prejournal_orphan(self):
@@ -243,6 +254,107 @@ class InterruptedRecoveryTests(unittest.TestCase):
         self.assertTrue(self.files.path(recovery.JOURNAL).exists())
         self.assertTrue(self.worker.recover_pending(agent_stopped=lambda: True))
         self.assert_old()
+
+    def test_trial_file_is_absent_until_durable_journal_and_guarded_after(self):
+        self.assert_trial_dropin(False)
+
+        def observed(point):
+            if point == "journal":
+                self.assertTrue(self.files.path(recovery.JOURNAL).exists())
+                self.assert_trial_dropin(False)
+            if point == "trial-dropin-installed":
+                self.assertTrue(self.files.path(recovery.JOURNAL).exists())
+                self.assert_trial_dropin(True)
+
+        self.prepare_with_checkpoint(observed)
+        self.assertIsNone(self.worker._load_journal()["guards"][recovery.TRIAL_DROPIN])
+        self.assertTrue(self.worker.recover_pending(agent_stopped=lambda: True))
+        self.assert_trial_dropin(False)
+
+    def test_changed_guard_after_journal_blocks_trial_file_install(self):
+        token = "/etc/sovagrid/agent.token"
+
+        def changed(point):
+            if point == "journal":
+                self._file(token, b"changed after durable journal\n", 0o640)
+
+        with self.assertRaisesRegex(recovery.RecoveryError, "GUARD_CHANGED"):
+            self.prepare_with_checkpoint(changed)
+        self.assertTrue(self.files.path(recovery.JOURNAL).exists())
+        self.assert_trial_dropin(False)
+        self._file(token, self.guards[token][0], 0o640)
+        self.assertTrue(self.worker.recover_pending(agent_stopped=lambda: True))
+        self.assert_old()
+
+    def test_foreign_or_changed_trial_file_cannot_be_adopted(self):
+        self._file(recovery.TRIAL_DROPIN, b"foreign guard\n", 0o644)
+        with self.assertRaisesRegex(recovery.RecoveryError, "TRIAL_DROPIN_UNMANAGED"):
+            self.prepare()
+        self.assertFalse(self.files.path(recovery.JOURNAL).exists())
+        self.files.path(recovery.TRIAL_DROPIN).unlink()
+        self.prepare()
+        self._file(recovery.TRIAL_DROPIN, b"tampered guard\n", 0o644)
+        with self.assertRaisesRegex(recovery.RecoveryError, "TRIAL_START_GUARD_REQUIRED"):
+            self.switch()
+        with self.assertRaisesRegex(recovery.RecoveryError, "TRIAL_START_GUARD_REQUIRED"):
+            self.worker.recover_pending(agent_stopped=lambda: True)
+        self._file(recovery.TRIAL_DROPIN,
+                   (DEPLOY / "sovagrid-external-agent-trial.conf").read_bytes(), 0o644)
+        self.assertTrue(self.worker.recover_pending(agent_stopped=lambda: True))
+        self.assert_trial_dropin(False)
+
+    def test_rollback_crash_after_trial_file_removal_retries_cleanup(self):
+        self.prepare()
+        self.switch()
+
+        def interrupted(point):
+            if point == "trial-dropin-removed":
+                raise RuntimeError("power loss")
+
+        with self.assertRaisesRegex(RuntimeError, "power loss"):
+            self.worker.recover_pending(agent_stopped=lambda: True,
+                                        checkpoint=interrupted)
+        self.assert_trial_dropin(False)
+        self.assertTrue(self.files.path(recovery.JOURNAL).exists())
+        self.assertTrue(self.worker.recover_pending(agent_stopped=lambda: True))
+        self.assert_old()
+        self.assert_trial_dropin(False)
+
+    def test_legacy_journal_with_preinstalled_trial_guard_can_recover(self):
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                self._new_fixture()
+                self.prepare()
+                legacy = self.worker._load_journal()
+                legacy["guards"][recovery.TRIAL_DROPIN] = self.worker._guards()[
+                    recovery.TRIAL_DROPIN]
+                self.worker._write_journal(legacy)
+                self.switch()
+                if committed:
+                    self.trial()
+                    self.commit_trial()
+                self.assertTrue(self.worker.recover_pending(agent_stopped=
+                                                             lambda: not committed))
+                self.assert_trial_dropin(False)
+                if committed:
+                    self.assert_new()
+                else:
+                    self.assert_old()
+
+    def test_legacy_pinned_trial_guard_from_older_bundle_can_roll_back(self):
+        self.prepare()
+        old_template = b"[Service]\nExecStartPre=/old/recovery/guard\n"
+        self._file(recovery.TRIAL_DROPIN, old_template, 0o644)
+        legacy = self.worker._load_journal()
+        legacy["guards"][recovery.TRIAL_DROPIN] = self.worker._guards()[
+            recovery.TRIAL_DROPIN]
+        self.worker._write_journal(legacy)
+        with self.assertRaisesRegex(recovery.RecoveryError,
+                                    "TRIAL_START_GUARD_REQUIRED"):
+            self.switch()
+        self.assertTrue(self.worker.recover_pending(agent_stopped=lambda: True))
+        self.assert_old()
+        self.assert_trial_dropin(False)
 
     def test_interrupted_recovery_is_idempotent(self):
         for stop_at in ("tree", *("meta-" + str(i) for i in range(len(recovery.META)))):
@@ -309,10 +421,12 @@ class InterruptedRecoveryTests(unittest.TestCase):
         self.assertEqual(self.worker._load_journal()["phase"], "committed")
         self.assertTrue(self.worker.recover_pending(agent_stopped=lambda: False))
         self.assert_new()
+        self.assert_trial_dropin(False)
         self.assertFalse(self.worker.recover_pending(agent_stopped=lambda: True))
 
     def test_committed_cleanup_crashes_preserve_new_source(self):
-        for stop_at in ("committed-marker", "committed-journal-removed"):
+        for stop_at in ("committed-marker", "committed-trial-dropin-removed",
+                        "committed-journal-removed"):
             with self.subTest(stop_at=stop_at):
                 self._new_fixture()
                 self.prepare()
@@ -327,8 +441,10 @@ class InterruptedRecoveryTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "power loss"):
                     self.worker.finalize_committed(checkpoint=interrupted)
                 self.assert_new()
+                self.assert_trial_dropin(stop_at == "committed-marker")
                 self.assertTrue(self.worker.recover_pending(agent_stopped=lambda: True))
                 self.assert_new()
+                self.assert_trial_dropin(False)
                 self.assertFalse(self.files.path(recovery.TXN).exists())
                 self.assertFalse(self.files.path(recovery.COMMITTED).exists())
                 self.assertFalse(self.worker.recover_pending(agent_stopped=lambda: True))
