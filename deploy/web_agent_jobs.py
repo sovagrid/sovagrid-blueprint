@@ -16,6 +16,9 @@ records are removed. Incomplete jobs are never retired. This version caps the
 audit file at 64 MiB, matching host backup; when full, a new preparation fails
 before any remote write with ARCHIVE_FULL. Archived completions remain visible
 through the audit file, while per-request installer status returns NOT_FOUND.
+The list API includes every unfinished job and at most 32 recent completions
+within a 24 KiB payload budget; older live journal entries remain addressable
+by request ID until retired.
 """
 
 from __future__ import annotations
@@ -48,6 +51,8 @@ _COMPLETED_ARCHIVE = "completed-enrollments.jsonl"
 _ARCHIVE_TAIL_BYTES = 128 * 1024
 _ARCHIVE_MAX_BYTES = 64 * 1024 * 1024  # Matches the host-backup inventory limit.
 _ZERO_SHA = "0" * 64
+_MAX_LIST_ACTIVE = 32
+_MAX_LIST_BYTES = 24 * 1024  # Leave room for the service's JSON envelope and newline.
 
 
 class JobError(RuntimeError):
@@ -370,7 +375,7 @@ class WebAgentJobs:
             raise JobError("SSH_UNAVAILABLE") from None
 
     @staticmethod
-    def _canonical(value: dict) -> bytes:
+    def _canonical(value) -> bytes:
         return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False,
                           separators=(",", ":")).encode("utf-8")
 
@@ -690,9 +695,25 @@ class WebAgentJobs:
 
     def list(self) -> list[dict]:
         try:
-            return [_public_record(record) for record in self.journal.list()]
+            records = self.journal.list()
         except self._journal_error:
             raise JobError("JOURNAL_UNAVAILABLE") from None
+        pending = [_public_record(record) for record in records
+                   if record["phase"] != "active" or record["cleanup_required"]]
+        if len(self._canonical(pending)) > _MAX_LIST_BYTES:
+            # Never silently hide a recoverable enrollment.
+            raise JobError("JOURNAL_UNAVAILABLE")
+        completed = sorted((record for record in records
+                            if record["phase"] == "active" and not record["cleanup_required"]),
+                           key=lambda row: (row["updated_at"], row["created_at"],
+                                            row["request_id"]), reverse=True)
+        result = pending
+        for record in completed[:_MAX_LIST_ACTIVE]:
+            candidate = result + [_public_record(record)]
+            if len(self._canonical(candidate)) > _MAX_LIST_BYTES:
+                break
+            result = candidate
+        return result
 
     def close(self):
         """Drop live credentials; durable unfinished records remain recoverable."""

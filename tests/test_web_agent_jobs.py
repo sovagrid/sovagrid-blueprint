@@ -187,10 +187,10 @@ class JobsTests(unittest.TestCase):
     def options(self, alias=None):
         return ConnectionOptions(host="target.example", user="root", host_key_alias=alias)
 
-    def prepare(self, jobs, credential=None):
+    def prepare(self, jobs, credential=None, name="test target"):
         return jobs.prepare(target_options=self.options(), reviewed_fingerprint=FINGERPRINT,
             credential=credential or Credential(), session_token=BEARER,
-            name="test target", hub_host="192.0.2.40", hub_port=22, local_port=18767)
+            name=name, hub_host="192.0.2.40", hub_port=22, local_port=18767)
 
     def assert_secretless(self, jobs):
         status = json.dumps(jobs.list(), sort_keys=True)
@@ -450,6 +450,25 @@ class JobsTests(unittest.TestCase):
             self.assertEqual(len(self.created), controllers)
             self.assertEqual(len(jobs.list()), 3)
             self.assertEqual(archive.read_bytes(), before)
+
+    def test_list_keeps_all_pending_and_bounded_recent_completed_history(self):
+        with patch.object(enrollment_journal, "MAX_RECORDS", 64):
+            jobs = self.jobs()
+            completed = []
+            for _ in range(45):
+                prepared = self.prepare(jobs, name="😀" * 80)
+                completed.append(jobs.apply(prepared["request_id"], prepared["revision"]))
+            self.assertEqual(len(jobs.journal.list()), 45)
+            recent = jobs.list()
+            self.assertEqual(len(recent), 32)
+            self.assertLess(len(json.dumps(recent, ensure_ascii=False).encode()), 24 * 1024)
+            self.assertEqual(jobs.status(completed[0]["request_id"])["phase"], "active")
+            pending = self.prepare(jobs)
+            listed = jobs.list()
+            self.assertEqual(len(listed), 33)
+            self.assertEqual(listed[0]["request_id"], pending["request_id"])
+            self.assertLess(len(json.dumps({"ok": True, "result": listed},
+                                           ensure_ascii=False).encode()), 32 * 1024)
 
     def test_archive_tamper_fails_closed_and_incomplete_append_recovers(self):
         with patch.object(enrollment_journal, "MAX_RECORDS", 4):
