@@ -221,6 +221,59 @@ class RestoreInspectionTest(unittest.TestCase):
         with self.assertRaisesRegex(restore.Refused, "INVALID_ARCHIVE"):
             self.inspect(self.entries + [bad])
 
+    def test_web_agent_recovery_state_is_private_and_content_addressed(self):
+        backup = restore.backup
+        self.sources += tuple(next(source for source in backup.CORE
+                                   if source.path == path)
+                              for path in (backup.WEB_AGENT_MARKER,
+                                           backup.WEB_AGENT_DIR))
+        self.sources += tuple(backup.Source(path, exact_mode=0o644, gid=0)
+                              for path in backup.WEB_AGENT_UNIT_PATHS)
+        raw = b"pinned source bundle\n"
+        digest = hashlib.sha256(raw).hexdigest()
+        prefix = backup.WEB_AGENT_DIR.lstrip("/")
+        entries = [
+            (backup.WEB_AGENT_MARKER.lstrip("/"), "file",
+             backup.WEB_AGENT_MARKER_CONTENT, 0, 0, 0o600),
+            (prefix, "dir", b"", 0, 0, 0o700),
+            (prefix + "/jobs", "dir", b"", 0, 0, 0o700),
+            (prefix + "/.bundle.lock", "file", b"", 0, 0, 0o600),
+            (prefix + "/source-" + digest + ".tar.gz", "file", raw, 0, 0, 0o600),
+            (prefix + "/jobs/" + "a" * 32 + ".json", "file",
+             b'{"phase":"prepared"}\n', 0, 0, 0o600),
+            (prefix + "/completed-enrollments.jsonl", "file",
+             b'{"event":"complete"}\n', 0, 0, 0o600),
+            *((path.lstrip("/"), "file", b"[Unit]\n", 0, 0, 0o644)
+              for path in backup.WEB_AGENT_UNIT_PATHS),
+        ]
+        present = {"/" + item[0] for item in entries}
+        self.assertTrue(backup._web_agent_required(present) <= present)
+        self.assertEqual(self.inspect(self.entries + entries)["entries"],
+                         len(self.entries) + len(entries))
+        for label, needle, replacement in (
+                ("marker", backup.WEB_AGENT_MARKER.lstrip("/"), b"wrong marker\n"),
+                ("bundle", prefix + "/source-" + digest + ".tar.gz", b"wrong bytes")):
+            with self.subTest(label=label):
+                altered = [(name, kind, replacement if name == needle else contents,
+                            uid, gid, mode)
+                           for name, kind, contents, uid, gid, mode in entries]
+                with self.assertRaisesRegex(restore.Refused, "INVALID_ARCHIVE"):
+                    self.inspect(self.entries + altered)
+        for path in (prefix + "/credentials", prefix + "/jobs/foreign.json"):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(restore.Refused, "UNEXPECTED_PATH"):
+                    self.inspect(self.entries + entries +
+                                 [(path, "file", b"secret", 0, 0, 0o600)])
+        bad_mode = [(name, kind, contents, uid, gid,
+                     0o644 if name == prefix + "/completed-enrollments.jsonl" else mode)
+                    for name, kind, contents, uid, gid, mode in entries]
+        with self.assertRaisesRegex(restore.Refused, "INVALID_ARCHIVE"):
+            self.inspect(self.entries + bad_mode)
+        with self.assertRaisesRegex(restore.Refused, "INVALID_ARCHIVE"):
+            self.real_required("full", present - {backup.WEB_AGENT_MARKER})
+        with self.assertRaisesRegex(restore.Refused, "INVALID_ARCHIVE"):
+            self.real_required("full", present - {backup.WEB_AGENT_JOBS})
+
     def test_local_panel_generation_is_in_full_and_hub_only_archives(self):
         source = next(item for item in restore.backup.CORE
                       if item.path == "/etc/sovagrid/local-web")

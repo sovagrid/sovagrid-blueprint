@@ -48,6 +48,23 @@ MAX_ARCHIVES = 100
 COMPOSE_SERVICES = ("hub", "web", "ssh-gateway")
 SSH_GATEWAY_MARKER = "/var/lib/sovagrid/.ssh-gateway-managed-by-run-sh"
 SSH_GATEWAY_MARKER_CONTENT = b"SOVAGRID_SSH_GATEWAY_V1\n"
+WEB_AGENT_MARKER = "/var/lib/sovagrid/.web-agent-installer-managed-by-run-sh"
+WEB_AGENT_MARKER_CONTENT = b"SOVAGRID_WEB_AGENT_INSTALL_V1\n"
+WEB_AGENT_DIR = "/var/lib/sovagrid/web-agent"
+WEB_AGENT_JOBS = WEB_AGENT_DIR + "/jobs"
+WEB_AGENT_MUTATION_LOCK = WEB_AGENT_JOBS + "/.enrollment-web-mutation"
+WEB_AGENT_AUDIT = WEB_AGENT_DIR + "/completed-enrollments.jsonl"
+WEB_AGENT_UNITS = ("sovagrid-web-agent-control.socket",
+                   "sovagrid-web-agent-control.service")
+WEB_AGENT_UNIT_PATHS = tuple("/etc/systemd/system/" + unit
+                             for unit in WEB_AGENT_UNITS)
+WEB_AGENT_BUNDLE = re.compile(r"source-([0-9a-f]{64})\.tar\.gz\Z")
+WEB_AGENT_JOB = re.compile(r"[0-9a-f]{32}\.json\Z")
+WEB_AGENT_SOURCE_TEMP = re.compile(r"\.source-[A-Za-z0-9_]{6,31}\Z")
+WEB_AGENT_JOB_TEMP = re.compile(r"\.enrollment-[A-Za-z0-9_]{6,31}\Z")
+WEB_AGENT_MAX_BUNDLE = 64 * 1024**2
+WEB_AGENT_MAX_JOB = 32 * 1024
+WEB_AGENT_MAX_LOCK = 128
 ID = re.compile(r"[0-9a-f]{32}\Z")
 ROOT_UID = 0
 ROOT_GID = 0
@@ -63,6 +80,7 @@ WRITERS = {
         "sovagrid-release-feed.service", "sovagrid-release-feed.timer",
         "sovagrid-container-inventory.service", "sovagrid-container-inventory.timer",
         "sovagrid-hub-backup-control.service", "sovagrid-hub-backup-control.socket",
+        *WEB_AGENT_UNITS,
     )),
     "hub-only": frozenset((
         "sovagrid-vpn-status.service", "sovagrid-vpn-status.timer",
@@ -71,6 +89,7 @@ WRITERS = {
         "sovagrid-container-inventory-local.service",
         "sovagrid-container-inventory-local.timer",
         "sovagrid-hub-backup-control.service", "sovagrid-hub-backup-control.socket",
+        *WEB_AGENT_UNITS,
     )),
 }
 AMNEZIA_WRITERS = frozenset(("sovagrid-amnezia-control.service",
@@ -144,6 +163,9 @@ CORE = (
     Source("/var/lib/sovagrid/.release-feed-units-managed-by-run-sh", private=True,
            exact_mode=0o600),
     Source(SSH_GATEWAY_MARKER, private=True, exact_mode=0o600, gid=ROOT_GID),
+    Source(WEB_AGENT_MARKER, private=True, exact_mode=0o600, gid=ROOT_GID),
+    Source(WEB_AGENT_DIR, kind="dir", private=True, exact_mode=0o700,
+           gid=ROOT_GID),
     Source("/var/lib/sovagrid/release-feed-state.json", private=True),
     Source("/var/lib/sovagrid/auto-update-status.json", private=True),
     Source("/etc/sovagrid/release-feed.json", private=True),
@@ -326,6 +348,76 @@ def _skip_container_temp(path: str, name: str, info: os.stat_result) -> bool:
     return True
 
 
+def _web_agent_source(path: str) -> Source | None:
+    """Accept only the installer's private bundle and journal inventory."""
+    if path == WEB_AGENT_DIR or path == WEB_AGENT_JOBS:
+        return Source(path, ROOT_UID, kind="dir", private=True, exact_mode=0o700,
+                      gid=ROOT_GID)
+    if path.startswith(WEB_AGENT_DIR + "/"):
+        relative = path[len(WEB_AGENT_DIR) + 1:]
+        if (relative in (".bundle.lock", "completed-enrollments.jsonl") or
+                WEB_AGENT_BUNDLE.fullmatch(relative) or
+                relative in ("jobs/.lock", "jobs/.enrollment-web-mutation") or
+                relative.startswith("jobs/") and
+                WEB_AGENT_JOB.fullmatch(relative[5:])):
+            return Source(path, ROOT_UID, private=True, exact_mode=0o600,
+                          gid=ROOT_GID)
+        raise Refused("UNSAFE_SOURCE")
+    return None
+
+
+def _web_agent_limit(path: str) -> int | None:
+    if path == WEB_AGENT_AUDIT:
+        return WEB_AGENT_MAX_BUNDLE
+    if path.startswith(WEB_AGENT_DIR + "/source-"):
+        return WEB_AGENT_MAX_BUNDLE
+    if path.startswith(WEB_AGENT_JOBS + "/"):
+        return (WEB_AGENT_MAX_JOB if WEB_AGENT_JOB.fullmatch(path.rsplit("/", 1)[1])
+                else WEB_AGENT_MAX_LOCK)
+    if path == WEB_AGENT_DIR + "/.bundle.lock":
+        return WEB_AGENT_MAX_LOCK
+    return None
+
+
+def _web_agent_nonempty(path: str) -> bool:
+    name = path.rsplit("/", 1)[1]
+    return bool((path.startswith(WEB_AGENT_DIR + "/") and
+                 WEB_AGENT_BUNDLE.fullmatch(name)) or
+                (path.startswith(WEB_AGENT_JOBS + "/") and
+                 WEB_AGENT_JOB.fullmatch(name)))
+
+
+def _skip_web_agent_temp(path: str, name: str, info: os.stat_result) -> bool:
+    """Ignore only interrupted atomic writes that can never be journal state."""
+    limit = (WEB_AGENT_MAX_BUNDLE if path == WEB_AGENT_DIR and
+             WEB_AGENT_SOURCE_TEMP.fullmatch(name) else
+             WEB_AGENT_MAX_JOB if path == WEB_AGENT_JOBS and
+             WEB_AGENT_JOB_TEMP.fullmatch(name) else None)
+    if limit is None:
+        return False
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != ROOT_UID or
+            info.st_gid != ROOT_GID or stat.S_IMODE(info.st_mode) != 0o600 or
+            info.st_nlink != 1 or not 0 <= info.st_size <= limit):
+        raise Refused("UNSAFE_SOURCE")
+    return True
+
+
+def _web_agent_required(present: set[str]) -> set[str]:
+    """A marker must carry a usable recovery snapshot, never a partial one."""
+    state = {WEB_AGENT_DIR, WEB_AGENT_JOBS, *WEB_AGENT_UNIT_PATHS}
+    if WEB_AGENT_MARKER not in present:
+        if state & present:
+            raise Refused("UNMANAGED_WEB_AGENT")
+        return set()
+    required = state | {WEB_AGENT_MARKER}
+    if not required <= present or not any(
+            path.startswith(WEB_AGENT_DIR + "/") and
+            WEB_AGENT_BUNDLE.fullmatch(path.rsplit("/", 1)[1])
+            for path in present):
+        raise Refused("MISSING_SOURCE")
+    return required
+
+
 def _scan(sources: tuple[Source, ...], *, deadline: float) -> tuple[list[Entry], int]:
     entries: list[Entry] = []
     total = 0
@@ -349,11 +441,31 @@ def _scan(sources: tuple[Source, ...], *, deadline: float) -> tuple[list[Entry],
                 raise Refused("UNSAFE_SOURCE")
             if source.kind == "file" and directory:
                 raise Refused("UNSAFE_SOURCE")
-            _check(info, source if path == source.path else Source(path, source.owner),
-                   directory=directory)
+            web_agent = _web_agent_source(path)
+            selected = (web_agent if web_agent is not None else
+                        source if path == source.path else Source(path, source.owner))
+            if web_agent is not None and directory != (web_agent.kind == "dir"):
+                raise Refused("UNSAFE_SOURCE")
+            _check(info, selected, directory=directory)
             if not directory:
                 if info.st_size < 0 or info.st_size > MAX_FILE_BYTES:
                     raise Refused("SIZE_LIMIT")
+                web_limit = _web_agent_limit(path)
+                if web_limit is not None and info.st_size > web_limit:
+                    raise Refused("SIZE_LIMIT")
+                if _web_agent_nonempty(path) and info.st_size == 0:
+                    raise Refused("UNSAFE_SOURCE")
+                bundle = (WEB_AGENT_BUNDLE.fullmatch(path.rsplit("/", 1)[1])
+                          if path.startswith(WEB_AGENT_DIR + "/") else None)
+                if bundle is not None:
+                    digest = hashlib.sha256()
+                    while block := os.read(fd, 1024 * 1024):
+                        if time.monotonic() > deadline:
+                            raise Refused("TIME_LIMIT")
+                        digest.update(block)
+                    if (digest.hexdigest() != bundle.group(1) or
+                            _fingerprint(os.fstat(fd)) != _fingerprint(info)):
+                        raise Refused("UNSAFE_SOURCE")
                 total += info.st_size
                 if total > MAX_BYTES:
                     raise Refused("SIZE_LIMIT")
@@ -368,6 +480,11 @@ def _scan(sources: tuple[Source, ...], *, deadline: float) -> tuple[list[Entry],
                                 "/var/lib/sovagrid-containers-local") and name.startswith(".snapshot-"):
                         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
                         if _skip_container_temp(path, name, info):
+                            continue
+                    if path in (WEB_AGENT_DIR, WEB_AGENT_JOBS) and name.startswith(
+                            ".source-" if path == WEB_AGENT_DIR else ".enrollment-"):
+                        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                        if _skip_web_agent_temp(path, name, info):
                             continue
                     allowed = {
                         "/var/lib/sovagrid/hub": {"hub.sqlite", "hub.sqlite-wal",
@@ -449,33 +566,43 @@ def _run(args: list[str]) -> str:
     return result.stdout
 
 
-def _gateway_marker() -> bool:
-    """Only a sealed installer marker makes the optional gateway managed."""
-    if not _present(SSH_GATEWAY_MARKER):
+def _sealed_marker(path: str, contents: bytes, error: str) -> bool:
+    if not _present(path):
         return False
     try:
-        fd = _safe_open(Path(SSH_GATEWAY_MARKER))
+        fd = _safe_open(Path(path))
     except (OSError, Refused) as exc:
-        raise Refused("UNSAFE_GATEWAY_MARKER") from exc
+        raise Refused(error) from exc
     try:
         before = os.fstat(fd)
-        _check(before, Source(SSH_GATEWAY_MARKER, ROOT_UID, private=True, exact_mode=0o600,
+        _check(before, Source(path, ROOT_UID, private=True, exact_mode=0o600,
                               gid=ROOT_GID), directory=False)
-        if (before.st_size != len(SSH_GATEWAY_MARKER_CONTENT) or
-                os.read(fd, len(SSH_GATEWAY_MARKER_CONTENT) + 1) !=
-                SSH_GATEWAY_MARKER_CONTENT or
+        if (before.st_size != len(contents) or
+                os.read(fd, len(contents) + 1) != contents or
                 _fingerprint(os.fstat(fd)) != _fingerprint(before)):
-            raise Refused("UNSAFE_GATEWAY_MARKER")
+            raise Refused(error)
         return True
     except (OSError, Refused) as exc:
-        raise Refused("UNSAFE_GATEWAY_MARKER") from exc
+        raise Refused(error) from exc
     finally:
         os.close(fd)
+
+
+def _gateway_marker() -> bool:
+    """Only a sealed installer marker makes the optional gateway managed."""
+    return _sealed_marker(SSH_GATEWAY_MARKER, SSH_GATEWAY_MARKER_CONTENT,
+                          "UNSAFE_GATEWAY_MARKER")
+
+
+def _web_agent_marker() -> bool:
+    return _sealed_marker(WEB_AGENT_MARKER, WEB_AGENT_MARKER_CONTENT,
+                          "UNSAFE_WEB_AGENT_MARKER")
 
 
 def _active_writers(layout: str) -> tuple[list[str], list[str]]:
     expected = WRITERS[layout]
     gateway_managed = _gateway_marker()
+    web_agent_managed = _web_agent_marker()
     if (layout == "full" and
             (_present("/etc/sovagrid-vpn/amnezia-control.enabled") or
              _present("/etc/sovagrid-vpn/amnezia-wireguard-control.enabled"))):
@@ -491,6 +618,8 @@ def _active_writers(layout: str) -> tuple[list[str], list[str]]:
         if fields[0] not in expected and fields[0] not in NON_WRITERS[layout]:
             raise Refused("UNKNOWN_ACTIVE_UNIT")
         if fields[0] in expected:
+            if fields[0] in WEB_AGENT_UNITS and not web_agent_managed:
+                raise Refused("UNMANAGED_WEB_AGENT")
             unit_path = Path("/etc/systemd/system") / fields[0]
             try:
                 fd = _safe_open(unit_path)
@@ -733,6 +862,12 @@ def _write_archive(path: Path, entries: list[Entry], deadline: float) -> tuple[i
                         if (_fingerprint(after) != _fingerprint(before) or
                                 (reader is not None and reader.remaining != 0)):
                             raise Refused("SOURCE_CHANGED")
+                        bundle = (WEB_AGENT_BUNDLE.fullmatch(name.rsplit("/", 1)[1])
+                                  if entry.path.startswith(WEB_AGENT_DIR + "/") else None)
+                        if bundle is not None and (reader is None or
+                                                   reader.digest.hexdigest() !=
+                                                   bundle.group(1)):
+                            raise Refused("SOURCE_CHANGED")
                     finally:
                         os.close(source_fd)
             output.flush()
@@ -804,6 +939,7 @@ def _create_locked(identity: str | None = None) -> dict:
             ))
     if len(entries) < 3 or not required <= present:
         raise Refused("MISSING_SOURCE")
+    _web_agent_required(present)
     output = _output(create=True)
     if len(_inventory(output)) >= MAX_ARCHIVES:
         raise Refused("ARCHIVE_LIMIT")

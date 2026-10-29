@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import fcntl
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
@@ -90,6 +91,46 @@ class HostBackupTest(unittest.TestCase):
              patch.object(backup.grp, "getgrnam", return_value=SimpleNamespace(gr_gid=self.gid)):
             return backup.create()["archive"]
 
+    def web_agent_fixture(self) -> None:
+        root = self.root / backup.WEB_AGENT_DIR.lstrip("/")
+        root.mkdir(mode=0o700)
+        root.chmod(0o700)
+        jobs = root / "jobs"
+        jobs.mkdir(mode=0o700)
+        jobs.chmod(0o700)
+        for path, contents in ((root / ".bundle.lock", b""),
+                               (jobs / ".lock", b"\0"),
+                               (jobs / ".enrollment-web-mutation", b""),
+                               (jobs / ("a" * 32 + ".json"), b"{\"phase\":\"prepared\"}\n")):
+            path.write_bytes(contents)
+            path.chmod(0o600)
+        raw = b"a pinned installer bundle\n"
+        bundle = root / ("source-" + hashlib.sha256(raw).hexdigest() + ".tar.gz")
+        bundle.write_bytes(raw)
+        bundle.chmod(0o600)
+        audit = root / "completed-enrollments.jsonl"
+        audit.write_bytes(b'{"event":"complete"}\n')
+        audit.chmod(0o600)
+        marker = self.root / backup.WEB_AGENT_MARKER.lstrip("/")
+        marker.write_bytes(backup.WEB_AGENT_MARKER_CONTENT)
+        marker.chmod(0o600)
+        units = []
+        for path in backup.WEB_AGENT_UNIT_PATHS:
+            target = self.root / path.lstrip("/")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("[Unit]\nDescription=fixture\n")
+            target.chmod(0o644)
+            units.append(backup.Source(path, self.uid, exact_mode=0o644, gid=self.gid))
+        self.sources += (
+            backup.Source(backup.WEB_AGENT_MARKER, self.uid, private=True,
+                          exact_mode=0o600, gid=self.gid),
+            backup.Source(backup.WEB_AGENT_DIR, self.uid, "dir", private=True,
+                          exact_mode=0o700, gid=self.gid),
+            *units,
+        )
+        self.web_agent_root = root
+        self.web_agent_bundle = bundle
+
     def test_direct_hub_backup_refuses_collector_lock_contention(self) -> None:
         lock = self.root / "run/sovagrid-promotion.lock"
         fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
@@ -116,6 +157,90 @@ class HostBackupTest(unittest.TestCase):
                              0o600)
         self.assertEqual(backup.verify(result["id"])["verified"], True)
         self.assertEqual(backup.list_archives()["archives"], [result])
+
+    def test_web_agent_bundle_journal_and_units_are_in_private_archive(self) -> None:
+        self.web_agent_fixture()
+        result = self.archive()
+        archive = self.root / "var/lib/sovagrid-host-backups" / (result["id"] + ".tar.gz")
+        with tarfile.open(archive, "r:gz") as stream:
+            names = set(stream.getnames())
+        self.assertIn(backup.WEB_AGENT_MARKER.lstrip("/"), names)
+        self.assertIn(backup.WEB_AGENT_DIR.lstrip("/") + "/jobs/" + "a" * 32 + ".json",
+                      names)
+        self.assertIn(str(self.web_agent_bundle.relative_to(self.root)), names)
+        self.assertIn(backup.WEB_AGENT_AUDIT.lstrip("/"), names)
+        for path in backup.WEB_AGENT_UNIT_PATHS:
+            self.assertIn(path.lstrip("/"), names)
+        self.assertTrue(backup.verify(result["id"])["verified"])
+
+    def test_web_agent_inventory_refuses_foreign_or_damaged_state(self) -> None:
+        self.web_agent_fixture()
+        foreign = self.web_agent_root / "ssh-password.txt"
+        foreign.write_bytes(b"unexpected credential")
+        foreign.chmod(0o600)
+        with self.assertRaisesRegex(backup.Refused, "UNSAFE_SOURCE"):
+            self.archive()
+        foreign.unlink()
+        self.web_agent_bundle.write_bytes(b"wrong package")
+        with self.assertRaisesRegex(backup.Refused, "UNSAFE_SOURCE"):
+            self.archive()
+        self.web_agent_bundle.unlink()
+        self.web_agent_root.joinpath("jobs", "a" * 32 + ".json").chmod(0o644)
+        with self.assertRaisesRegex(backup.Refused, "UNSAFE_SOURCE"):
+            self.archive()
+        self.assertFalse((self.root / "var/lib/sovagrid-host-backups").exists())
+
+    def test_web_agent_interrupted_temps_are_skipped_only_when_private(self) -> None:
+        self.web_agent_fixture()
+        temporary = self.web_agent_root / ".source-Abc123"
+        temporary.write_bytes(b"abandoned")
+        temporary.chmod(0o600)
+        job_temporary = self.web_agent_root / "jobs/.enrollment-Abc123"
+        job_temporary.write_bytes(b"partial")
+        job_temporary.chmod(0o600)
+        with patch.object(backup.grp, "getgrnam", return_value=SimpleNamespace(
+                gr_gid=self.gid)):
+            entries, _ = backup._scan(self.sources, deadline=time.monotonic() + 5)
+        self.assertNotIn(str(temporary.relative_to(self.root)),
+                         {item.path.lstrip("/") for item in entries})
+        self.assertNotIn(str(job_temporary.relative_to(self.root)),
+                         {item.path.lstrip("/") for item in entries})
+        temporary.chmod(0o644)
+        with patch.object(backup.grp, "getgrnam", return_value=SimpleNamespace(
+                gr_gid=self.gid)):
+            with self.assertRaisesRegex(backup.Refused, "UNSAFE_SOURCE"):
+                backup._scan(self.sources, deadline=time.monotonic() + 5)
+
+    def test_web_agent_marker_requires_complete_state_and_active_unit(self) -> None:
+        self.web_agent_fixture()
+        with patch.object(backup.grp, "getgrnam", return_value=SimpleNamespace(
+                gr_gid=self.gid)):
+            present = {item.path for item in backup._scan(
+                self.sources, deadline=time.monotonic() + 5)[0]}
+        self.assertEqual(backup._web_agent_required(present),
+                         {backup.WEB_AGENT_MARKER, backup.WEB_AGENT_DIR,
+                          backup.WEB_AGENT_JOBS, *backup.WEB_AGENT_UNIT_PATHS})
+        with self.assertRaisesRegex(backup.Refused, "MISSING_SOURCE"):
+            backup._web_agent_required(present - {backup.WEB_AGENT_JOBS})
+        with self.assertRaisesRegex(backup.Refused, "UNMANAGED_WEB_AGENT"):
+            backup._web_agent_required(present - {backup.WEB_AGENT_MARKER})
+
+        def run(args):
+            return ("sovagrid-web-agent-control.socket loaded active listening\n"
+                    "sovagrid-web-agent-control.service loaded active running\n"
+                    if args[0] == "systemctl" else "")
+
+        with patch.object(backup, "_layout", return_value="full"), \
+             patch.object(backup, "_run", side_effect=run):
+            self.assertEqual(backup.plan()["active_units"],
+                             sorted(backup.WEB_AGENT_UNITS))
+            marker = self.root / backup.WEB_AGENT_MARKER.lstrip("/")
+            marker.write_bytes(b"bad marker\n")
+            with self.assertRaisesRegex(backup.Refused, "UNSAFE_WEB_AGENT_MARKER"):
+                backup.plan()
+            marker.unlink()
+            with self.assertRaisesRegex(backup.Refused, "UNMANAGED_WEB_AGENT"):
+                backup.plan()
 
     def test_hub_only_archive_does_not_adopt_external_agent(self) -> None:
         local_sources = self.sources[:3]

@@ -245,7 +245,18 @@ def _check_member(path: str, member: tarfile.TarInfo, directory: bool,
         fixed = DIRECT_FILES.get(source.path)
         if fixed is not None and (child not in fixed or "/" in remainder or directory):
             raise Refused("UNEXPECTED_PATH")
-        selected = backup.Source(path, source.owner)
+        try:
+            selected = backup._web_agent_source(path) or backup.Source(path, source.owner)
+        except backup.Refused as exc:
+            raise Refused("UNEXPECTED_PATH") from exc
+        if (path.startswith(backup.WEB_AGENT_DIR + "/") and
+                directory != (selected.kind == "dir")):
+            raise Refused("INVALID_ARCHIVE")
+        limit = backup._web_agent_limit(path)
+        if limit is not None and member.size > limit:
+            raise Refused("INVALID_ARCHIVE")
+        if backup._web_agent_nonempty(path) and member.size == 0:
+            raise Refused("INVALID_ARCHIVE")
     info = SimpleNamespace(st_mode=(stat.S_IFDIR if directory else stat.S_IFREG) |
                           member.mode, st_uid=member.uid, st_gid=member.gid, st_nlink=1)
     if path in DYNAMIC_GROUP_PATHS:
@@ -332,6 +343,10 @@ def _required(layout: str, present: set[str]) -> set[str]:
                 "/etc/systemd/system/sovagrid-container-inventory-local.service",
                 "/etc/systemd/system/sovagrid-container-inventory-local.timer",
             ))
+    try:
+        required.update(backup._web_agent_required(present))
+    except backup.Refused as exc:
+        raise Refused("INVALID_ARCHIVE") from exc
     return required
 
 
@@ -375,11 +390,16 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
                     remaining = member.size
                     bundle_path = "/opt/sovagrid-src/sovagrid-bundle.json"
                     marker_path = backup.SSH_GATEWAY_MARKER
-                    capture = bytearray() if path in (bundle_path, marker_path) else None
+                    web_marker_path = backup.WEB_AGENT_MARKER
+                    capture = (bytearray() if path in
+                               (bundle_path, marker_path, web_marker_path) else None)
                     if path == bundle_path and member.size > MAX_BUNDLE_MANIFEST:
                         raise Refused("INVALID_BUNDLE")
                     if path == marker_path and member.size != len(
                             backup.SSH_GATEWAY_MARKER_CONTENT):
+                        raise Refused("INVALID_ARCHIVE")
+                    if path == web_marker_path and member.size != len(
+                            backup.WEB_AGENT_MARKER_CONTENT):
                         raise Refused("INVALID_ARCHIVE")
                     while remaining:
                         if time.monotonic() > deadline:
@@ -395,8 +415,15 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
                         if path == marker_path:
                             if bytes(capture) != backup.SSH_GATEWAY_MARKER_CONTENT:
                                 raise Refused("INVALID_ARCHIVE")
+                        elif path == web_marker_path:
+                            if bytes(capture) != backup.WEB_AGENT_MARKER_CONTENT:
+                                raise Refused("INVALID_ARCHIVE")
                         else:
                             bundle_raw = bytes(capture)
+                    elif path.startswith(backup.WEB_AGENT_DIR + "/"):
+                        bundle = backup.WEB_AGENT_BUNDLE.fullmatch(path.rsplit("/", 1)[1])
+                        if bundle is not None and digest.hexdigest() != bundle.group(1):
+                            raise Refused("INVALID_ARCHIVE")
                     elif path.startswith("/opt/sovagrid-src/"):
                         relative = path[len("/opt/sovagrid-src/"):]
                         if GENERATED.fullmatch(relative):
