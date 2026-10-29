@@ -3,7 +3,7 @@
 # Additional author attribution terms: see ATTRIBUTION.md.
 """Rootless journal and interruption tests for managed host snapshots."""
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import json
 from pathlib import Path
 import tempfile
@@ -89,6 +89,44 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(operation.status(REQUEST)["phase"], "complete")
         self.assertEqual(operation.status(REQUEST)["archive"], archive)
         self.assertIsNone(operation._active())
+
+    def test_worker_holds_enrollment_lock_while_stopping_and_archiving(self):
+        self._start()
+        held = []
+
+        @contextmanager
+        def enrollment_lock():
+            held.append(True)
+            try:
+                yield
+            finally:
+                held.pop()
+
+        def check_stop(_value):
+            self.assertEqual(held, [True])
+
+        def check_archive(*, identity):
+            self.assertEqual(held, [True])
+            return {"archive": {"id": identity, "created_at": "2026-10-27T00:00:00+00:00",
+                                "layout": "full", "bytes": 512, "files": 3}}
+
+        with patch.object(operation.update, "web_agent_snapshot_lock", side_effect=enrollment_lock), patch.object(
+                operation, "_stop", side_effect=check_stop), patch.object(
+                operation, "_restart", side_effect=check_stop), patch.object(
+                operation.backup, "_create_locked", side_effect=check_archive):
+            operation._worker(REQUEST, recovery=False)
+        self.assertEqual(held, [])
+        self.assertEqual(operation.status(REQUEST)["phase"], "complete")
+
+    def test_busy_enrollment_lock_refuses_backup_before_stop(self):
+        self._start()
+        with patch.object(operation.update, "web_agent_snapshot_lock",
+                          side_effect=operation.update.UpdateFailure("BUSY")), patch.object(
+                operation, "_stop") as stop:
+            operation._worker(REQUEST, recovery=False)
+        stop.assert_not_called()
+        self.assertEqual(operation.status(REQUEST)["phase"], "failed")
+        self.assertEqual(operation.status(REQUEST)["error"], "BUSY")
 
     def test_detached_worker_waits_for_start_to_release_operation_lock(self):
         worker = None

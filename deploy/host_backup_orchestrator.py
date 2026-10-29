@@ -11,7 +11,7 @@ recovered explicitly, and recovery only restarts the previously active stack.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -516,10 +516,14 @@ def _worker(identity: str, *, recovery: bool) -> None:
         if _active() != identity or (recovery and value["phase"] != "recovery_requested") or (
                 not recovery and value["phase"] != "accepted"):
             raise Refused("INVALID_STATE")
+        locks = ExitStack()
         try:
-            locks = backup._locks()
-            locks.__enter__()
-        except backup.Refused:
+            # Enrollment and the host snapshot share one durable mutation
+            # lock. Acquire it before the first plan that could lead to stop.
+            locks.enter_context(update.web_agent_snapshot_lock())
+            locks.enter_context(backup._locks())
+        except (backup.Refused, update.UpdateFailure, OSError):
+            locks.close()
             _phase(value, "recovery_required" if recovery else "failed", error="BUSY")
             if not recovery:
                 _clear_active(identity)
@@ -588,7 +592,7 @@ def _worker(identity: str, *, recovery: bool) -> None:
                    archive=value["archive"])
             _clear_active(identity)
         finally:
-            locks.__exit__(None, None, None)
+            locks.close()
 
 
 def _spawn(action: str, identity: str) -> None:

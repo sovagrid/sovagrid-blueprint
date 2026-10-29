@@ -1,0 +1,15 @@
+[Unit]
+Description=SovaGrid reviewed Web Agent enrollment socket
+
+[Socket]
+ListenStream=/run/sovagrid-web-agent/control.sock
+SocketUser=root
+SocketGroup=sovagrid-web-agent
+SocketMode=0660
+DirectoryMode=0755
+Backlog=16
+RemoveOnStop=true
+Service=sovagrid-web-agent-control.service
+
+[Install]
+WantedBy=sockets.target

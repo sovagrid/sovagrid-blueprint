@@ -10,6 +10,7 @@
 # SOVAGRID_RELEASE_FEED_UNITS_V1
 # SOVAGRID_HUB_BACKUP_BROKER_V1
 # SOVAGRID_SSH_GATEWAY_INSTALL_V1
+# SOVAGRID_WEB_AGENT_INSTALL_V1
 set -euo pipefail
 umask 077
 # Keep the verified source tree free of generated Python bytecode on fresh installs.
@@ -77,6 +78,28 @@ if [[ -e $ssh_gateway_marker || -L $ssh_gateway_marker ]]; then
     die 'SSH gateway marker is unsafe'
   cmp -s -- "$ssh_gateway_marker" <(printf '%s\n' "$ssh_gateway_marker_content") ||
     die 'SSH gateway marker is unsafe'
+fi
+
+# A previous updater cannot restore the new root service, socket, or its
+# private enrollment journal. Its first upgrade leaves this feature absent.
+web_agent_marker=/var/lib/sovagrid/.web-agent-installer-managed-by-run-sh
+web_agent_deferred=0
+if [[ ${SOVAGRID_PUBLIC_WEB_LOCK_HELD:-0} == 1 && -f /var/lib/sovagrid/.managed-by-run-sh &&
+      ${SOVAGRID_WEB_AGENT_SNAPSHOT:-0} != 1 ]]; then
+  web_agent_deferred=1
+  for web_agent_path in "$web_agent_marker" /var/lib/sovagrid/web-agent \
+                        /etc/systemd/system/sovagrid-web-agent-control.socket \
+                        /etc/systemd/system/sovagrid-web-agent-control.service; do
+    [[ ! -e $web_agent_path && ! -L $web_agent_path ]] ||
+      die 'the supervising updater cannot snapshot the Web Agent installer'
+  done
+fi
+if [[ -e $web_agent_marker || -L $web_agent_marker ]]; then
+  [[ -f $web_agent_marker && ! -L $web_agent_marker &&
+     $(stat -c '%u:%g:%a:%h' "$web_agent_marker") == 0:0:600:1 ]] ||
+    die 'Web Agent installer marker is unsafe'
+  cmp -s -- "$web_agent_marker" <(printf '%s\n' 'SOVAGRID_WEB_AGENT_INSTALL_V1') ||
+    die 'Web Agent installer marker is unsafe'
 fi
 
 hub_only=0
@@ -183,6 +206,14 @@ for backup_unit in sovagrid-hub-backup-control.service sovagrid-hub-backup-contr
   if [[ -e $backup_destination || -L $backup_destination ]]; then
     [[ -f $backup_broker_marker && -f $backup_destination && ! -L $backup_destination &&
        $(stat -c '%U:%G:%a:%h' "$backup_destination") == root:root:644:1 ]] || die "unmanaged or unsafe Hub backup unit: $backup_unit"
+  fi
+done
+for web_agent_unit in sovagrid-web-agent-control.service sovagrid-web-agent-control.socket; do
+  destination=/etc/systemd/system/$web_agent_unit
+  if [[ -e $destination || -L $destination ]]; then
+    [[ -f $web_agent_marker && -f $destination && ! -L $destination &&
+       $(stat -c '%U:%G:%a:%h' "$destination") == root:root:644:1 ]] ||
+      die "unmanaged or unsafe Web Agent unit: $web_agent_unit"
   fi
 done
 if (( with_wireguard )); then
@@ -321,6 +352,22 @@ for auto_file in auto_update.py remote_update_worker.py sovagrid-auto-update.ser
                  sovagrid-hub-backup-control.socket sovagrid-hub-backup-control.service compose.backup.yaml; do
   [[ -f $source_root/sovagrid-blueprint/deploy/$auto_file && ! -L $source_root/sovagrid-blueprint/deploy/$auto_file ]] || die "auto-update source $auto_file is missing or a symlink"
 done
+for web_agent_file in web_agent_bundle.py web_agent_jobs.py web_agent_local_rpc.py web_agent_target_ssh.py \
+                      web_agent_service.py sovagrid-web-agent-control.socket \
+                      sovagrid-web-agent-control.service compose.web-agent.yaml; do
+  [[ -f $source_root/sovagrid-blueprint/deploy/$web_agent_file &&
+     ! -L $source_root/sovagrid-blueprint/deploy/$web_agent_file ]] ||
+    die "Web Agent source $web_agent_file is missing or a symlink"
+done
+if [[ $source_root != /opt/sovagrid-src ]]; then
+  [[ ! -e $web_agent_marker && ! -L $web_agent_marker ]] ||
+    die 'managed Web Agent installer requires /opt/sovagrid-src'
+  web_agent_deferred=1
+elif [[ ! -f $source_root/sovagrid-bundle.json || -L $source_root/sovagrid-bundle.json ]]; then
+  [[ ! -e $web_agent_marker && ! -L $web_agent_marker ]] ||
+    die 'managed Web Agent installer lost its source manifest'
+  web_agent_deferred=1
+fi
 if (( ! backup_broker_deferred )) && [[ $source_root != /opt/sovagrid-src ]]; then
   [[ ! -e $backup_broker_marker && ! -L $backup_broker_marker ]] || die 'managed Hub backup broker requires /opt/sovagrid-src'
   backup_broker_deferred=1
@@ -454,6 +501,62 @@ install_backup_broker() {
   say 'restricted Hub backup broker is ready'
 }
 
+install_web_agent_service() {
+  if (( web_agent_deferred )); then
+    say 'Web Agent installation waits for a managed source and rollback snapshot'
+    return
+  fi
+  local unit source destination temporary
+  [[ $source_root == /opt/sovagrid-src && -f $source_root/sovagrid-bundle.json &&
+     ! -L $source_root/sovagrid-bundle.json ]] ||
+    die 'Web Agent installation requires the verified managed source bundle'
+  for source in /opt /opt/sovagrid-src "$blueprint_dir" "$blueprint_dir/deploy"; do
+    [[ -d $source && ! -L $source && $(stat -c '%u' "$source") == 0 &&
+       -z $(find "$source" -maxdepth 0 -perm /022 -print -quit) ]] ||
+      die "Web Agent source ancestor is writable or untrusted: $source"
+  done
+  if [[ -e /var/lib/sovagrid/web-agent || -L /var/lib/sovagrid/web-agent ]]; then
+    [[ -d /var/lib/sovagrid/web-agent && ! -L /var/lib/sovagrid/web-agent &&
+       $(stat -c '%U:%G:%a' /var/lib/sovagrid/web-agent) == root:root:700 ]] ||
+      die 'Web Agent private directory is unsafe'
+  else
+    install -d -o root -g root -m 0700 /var/lib/sovagrid/web-agent
+  fi
+  if [[ ! -f $web_agent_marker ]]; then
+    temporary=$(mktemp "$web_agent_marker.XXXXXXXX")
+    printf 'SOVAGRID_WEB_AGENT_INSTALL_V1\n' > "$temporary"
+    chown root:root "$temporary"
+    chmod 0600 "$temporary"
+    mv -Tf -- "$temporary" "$web_agent_marker"
+  fi
+  systemd-analyze verify "$blueprint_dir/deploy/sovagrid-web-agent-control.socket" \
+                         "$blueprint_dir/deploy/sovagrid-web-agent-control.service" ||
+    die 'Web Agent systemd units are invalid'
+  for unit in sovagrid-web-agent-control.socket sovagrid-web-agent-control.service; do
+    source="$blueprint_dir/deploy/$unit"
+    destination="/etc/systemd/system/$unit"
+    temporary=$(mktemp "$destination.XXXXXXXX")
+    if ! install -o root -g root -m 0644 "$source" "$temporary" ||
+       ! mv -Tf -- "$temporary" "$destination"; then
+      rm -f -- "$temporary"
+      die "Web Agent unit $unit could not be installed"
+    fi
+  done
+  systemctl daemon-reload
+  systemctl enable --now sovagrid-web-agent-control.socket ||
+    die 'Web Agent socket could not start'
+  systemctl restart sovagrid-web-agent-control.service ||
+    die 'Web Agent service could not start'
+  systemctl is-active --quiet sovagrid-web-agent-control.socket ||
+    die 'Web Agent socket is inactive'
+  systemctl is-active --quiet sovagrid-web-agent-control.service ||
+    die 'Web Agent service is inactive'
+  [[ -S /run/sovagrid-web-agent/control.sock && ! -L /run/sovagrid-web-agent/control.sock &&
+     $(stat -c '%U:%G:%a' /run/sovagrid-web-agent/control.sock) == root:sovagrid-web-agent:660 ]] ||
+    die 'Web Agent socket has unsafe permissions'
+  say 'Web Agent installer is ready for reviewed SSH enrollment'
+}
+
 reserve_identity() {
   local name=$1 uid=$2
   local existing
@@ -475,6 +578,17 @@ reserve_identity() {
 }
 reserve_identity sovagrid-hub 10001
 reserve_identity sovagrid-web 10002
+if (( ! web_agent_deferred )); then
+  existing_web_agent_group=$(getent group 10005 | cut -d: -f1 || true)
+  [[ -z $existing_web_agent_group || $existing_web_agent_group == sovagrid-web-agent ]] ||
+    die 'GID 10005 is already assigned; cannot grant the SSH gateway Web Agent access'
+  if getent group sovagrid-web-agent >/dev/null; then
+    [[ $(getent group sovagrid-web-agent | cut -d: -f3) == 10005 ]] ||
+      die 'sovagrid-web-agent group has a different GID'
+  else
+    groupadd --system --gid 10005 sovagrid-web-agent
+  fi
+fi
 if (( with_terminal )); then
   reserve_identity sovagrid-shell 10003
   [[ $(id -nG sovagrid-shell) == sovagrid-shell ]] || die 'sovagrid-shell must not have supplementary groups'
@@ -662,6 +776,9 @@ install_backup_broker
 if (( ! backup_broker_deferred )); then
   compose+=(-f "$blueprint_dir/deploy/compose.backup.yaml")
 fi
+if (( ! web_agent_deferred )); then
+  compose+=(-f "$blueprint_dir/deploy/compose.web-agent.yaml")
+fi
 if [[ -f $bot_token ]]; then
   [[ ! -L $bot_token && -s $bot_token ]] || die 'Telegram token file must be nonempty and not a symlink'
   chown root:sovagrid-hub "$bot_token"
@@ -719,6 +836,7 @@ fi
 
 touch /var/lib/sovagrid/.managed-by-run-sh
 chmod 0600 /var/lib/sovagrid/.managed-by-run-sh
+install_web_agent_service
 [[ -f $blueprint_dir/deploy/refresh_build_contexts.py && ! -L $blueprint_dir/deploy/refresh_build_contexts.py ]] || die 'build context metadata helper is missing or a symlink'
 python3 "$blueprint_dir/deploy/refresh_build_contexts.py" "$source_root" || die 'build context metadata could not be refreshed'
 if (( ssh_gateway_deferred )); then
@@ -791,6 +909,26 @@ if (( ! ssh_gateway_deferred )); then
   if (( ! gateway_ready )); then
     "${compose[@]}" stop ssh-gateway || true
     die 'SSH gateway health check did not become ready'
+  fi
+  if (( ! web_agent_deferred )); then
+    # Check the actual unprivileged container can reach the restricted host
+    # socket. An invalid bearer must be rejected by the host worker itself.
+    if ! docker exec "$gateway_ids" node -e '
+const net = require("node:net");
+const socket = net.createConnection("/run/sovagrid-web-agent/control.sock");
+let text = "";
+const timer = setTimeout(() => process.exit(1), 5000);
+socket.on("error", () => process.exit(1));
+socket.on("connect", () => socket.end(JSON.stringify({action:"list",session_token:"invalid",payload:{}})+"\n"));
+socket.on("data", part => { text += part; if (text.length > 256) process.exit(1); });
+socket.on("end", () => { clearTimeout(timer); try {
+  const value = JSON.parse(text);
+  process.exit(value.ok === false && value.error === "AUTH_REQUIRED" ? 0 : 1);
+} catch { process.exit(1); } });
+'; then
+      "${compose[@]}" stop ssh-gateway || true
+      die 'SSH gateway cannot reach the restricted Web Agent installer socket'
+    fi
   fi
   # Container liveness is insufficient: the gateway must reach this host's
   # sshd through the fixed Docker bridge and the Web route must forward it.

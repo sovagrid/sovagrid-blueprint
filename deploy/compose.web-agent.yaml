@@ -1,0 +1,10 @@
+services:
+  ssh-gateway:
+    group_add:
+      - "10005"
+    volumes:
+      - type: bind
+        source: /run/sovagrid-web-agent
+        target: /run/sovagrid-web-agent
+        read_only: true
+name: sovagrid

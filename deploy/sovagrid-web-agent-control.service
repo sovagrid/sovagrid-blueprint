@@ -1,0 +1,26 @@
+[Unit]
+Description=SovaGrid reviewed Web Agent enrollment controller
+Requires=sovagrid-web-agent-control.socket
+After=sovagrid-web-agent-control.socket
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/sovagrid-src/sovagrid-blueprint
+ExecStart=/usr/bin/python3 -B -I /opt/sovagrid-src/sovagrid-blueprint/deploy/web_agent_service.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+Environment=PYTHONDONTWRITEBYTECODE=1
+TasksMax=128
+MemoryMax=512M
+KillMode=control-group
+TimeoutStopSec=30
