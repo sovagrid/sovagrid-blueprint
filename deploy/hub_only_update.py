@@ -45,10 +45,14 @@ SYSTEMD = Path("/etc/systemd/system")
 MAX_BACKUP = 4 * 1024**3
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 TRANSACTION_NAME = re.compile(r"[0-9]{17,25}-[0-9a-f]{12}\Z")
+WEB_AGENT_MARKER = "/var/lib/sovagrid/.web-agent-installer-managed-by-run-sh"
+WEB_AGENT_DIR = "/var/lib/sovagrid/web-agent"
+WEB_AGENT_UNITS = ("sovagrid-web-agent-control.socket",
+                   "sovagrid-web-agent-control.service")
 
-# These paths belong to the local Hub. No external Agent, enrollment or SSH
-# transport path may be added here. New run.sh features must get a reviewed
-# snapshot expansion before this updater accepts them.
+# These paths belong to the local Hub, including its private Web Agent job
+# journal. External Agent data and SSH transport remain outside this snapshot.
+# New run.sh features need reviewed snapshot expansion before acceptance.
 LEGACY_SNAPSHOT = (
     "/opt/sovagrid-agent-local",
     "/opt/sovagrid-vpn",
@@ -104,12 +108,17 @@ SSH_GATEWAY_SNAPSHOT = HUB_BACKUP_SNAPSHOT + (
     "/var/lib/sovagrid/.ssh-gateway-managed-by-run-sh",
 )
 LOCAL_WEB_SNAPSHOT = SSH_GATEWAY_SNAPSHOT + ("/etc/sovagrid/local-web",)
-SNAPSHOT = LOCAL_WEB_SNAPSHOT + (
+LOCAL_CONTAINERS_SNAPSHOT = LOCAL_WEB_SNAPSHOT + (
     "/var/lib/sovagrid-promotion/local-container-inventory.json",
     "/var/lib/sovagrid-promotion/local-container-inventory-pending.json",
     "/var/lib/sovagrid-containers-local",
     "/etc/systemd/system/sovagrid-container-inventory-local.service",
     "/etc/systemd/system/sovagrid-container-inventory-local.timer",
+)
+SNAPSHOT = LOCAL_CONTAINERS_SNAPSHOT + (
+    WEB_AGENT_MARKER,
+    WEB_AGENT_DIR,
+    *(f"/etc/systemd/system/{unit}" for unit in WEB_AGENT_UNITS),
 )
 LEGACY_UNITS = ("sovagrid-agent-local.service", "sovagrid-terminal-local-control.socket",
          "sovagrid-terminal-local-control.service", "sovagrid-vpn-status.service",
@@ -125,7 +134,8 @@ BACKUP_BROKER_UNITS = ("sovagrid-hub-backup-control.socket",
 LOCAL_WEB_UNITS = ROUTING_ALL_UNITS + BACKUP_BROKER_UNITS
 LOCAL_CONTAINER_UNITS = ("sovagrid-container-inventory-local.service",
                          "sovagrid-container-inventory-local.timer")
-UNITS = LOCAL_WEB_UNITS + LOCAL_CONTAINER_UNITS
+LOCAL_CONTAINERS_ALL_UNITS = LOCAL_WEB_UNITS + LOCAL_CONTAINER_UNITS
+UNITS = LOCAL_CONTAINERS_ALL_UNITS + WEB_AGENT_UNITS
 LOCAL_SERVICE_UNITS = ("sovagrid-service-local-control.socket",
                        "sovagrid-service-local-control.service")
 REQUIRED_CANDIDATE = (
@@ -302,6 +312,9 @@ def inspect() -> tuple[str, dict, dict[str, str], str]:
     if common.backup_broker_enabled():
         need(_unit_state(BACKUP_BROKER_UNITS[0])["active"], "BACKUP_BROKER")
         common.backup_broker_socket_ready()
+    if common.web_agent_managed():
+        need(all(_unit_state(unit)["active"] for unit in WEB_AGENT_UNITS), "WEB_AGENT")
+        common.web_agent_socket_ready()
     state = promotion.inspect()
     need(state.get("phase") == "activated" and state.get("external_agent_preserved") is True,
          "PROMOTION_STATE")
@@ -344,6 +357,13 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
                      "sovagrid-blueprint/deploy/sovagrid-hub-backup-control.service",
                      "sovagrid-hub/sovagrid_hub/backup_broker.py"):
             need((source / name).is_file(), "CANDIDATE_INCOMPATIBLE")
+    if common.web_agent_managed():
+        need(b"# SOVAGRID_WEB_AGENT_INSTALL_V1" in script,
+             "CANDIDATE_INCOMPATIBLE")
+        for name in ("compose.web-agent.yaml", "web_agent_bundle.py",
+                     "web_agent_jobs.py", "web_agent_service.py", *WEB_AGENT_UNITS):
+            need((source / "sovagrid-blueprint/deploy" / name).is_file(),
+                 "CANDIDATE_INCOMPATIBLE")
     if common.ssh_gateway_managed():
         need(b"# SOVAGRID_SSH_GATEWAY_INSTALL_V1" in script,
              "CANDIDATE_INCOMPATIBLE")
@@ -456,20 +476,22 @@ def _restore(folder: Path, state: dict) -> bool:
     layout = state.get("snapshot_layout", "legacy")
     need(layout in ("legacy", "release_feed_v1", "service_control_v1", "routing_v1",
                     "hub_backup_broker_v1", "ssh_gateway_v1", "local_web_v1",
-                    "local_containers_v1"), "TRANSACTION_STATE")
+                    "local_containers_v1", "web_agent_v1"), "TRANSACTION_STATE")
     snapshot = (LEGACY_SNAPSHOT if layout == "legacy" else
                 RELEASE_FEED_SNAPSHOT if layout == "release_feed_v1" else
                 SERVICE_SNAPSHOT if layout == "service_control_v1" else
                 ROUTING_SNAPSHOT if layout == "routing_v1" else
                 HUB_BACKUP_SNAPSHOT if layout == "hub_backup_broker_v1" else
                 SSH_GATEWAY_SNAPSHOT if layout == "ssh_gateway_v1" else
-                LOCAL_WEB_SNAPSHOT if layout == "local_web_v1" else SNAPSHOT)
+                LOCAL_WEB_SNAPSHOT if layout == "local_web_v1" else
+                LOCAL_CONTAINERS_SNAPSHOT if layout == "local_containers_v1" else SNAPSHOT)
     units = (LEGACY_UNITS if layout == "legacy" else
              RELEASE_FEED_UNITS if layout == "release_feed_v1" else
              SERVICE_ALL_UNITS if layout == "service_control_v1" else
              ROUTING_ALL_UNITS if layout == "routing_v1" else
              LOCAL_WEB_UNITS if layout in ("hub_backup_broker_v1", "ssh_gateway_v1",
-                                           "local_web_v1") else UNITS)
+                                           "local_web_v1") else
+             LOCAL_CONTAINERS_ALL_UNITS if layout == "local_containers_v1" else UNITS)
     old_source = folder / "source-before"
     try:
         if old_source.exists():
@@ -481,13 +503,16 @@ def _restore(folder: Path, state: dict) -> bool:
     except Exception as exc:
         errors.append("source: " + str(exc))
     try:
-        if layout == "local_containers_v1":
+        if layout == "web_agent_v1":
+            common.command(["systemctl", "stop", *reversed(WEB_AGENT_UNITS)], timeout=40,
+                           check=False)
+        if layout in ("local_containers_v1", "web_agent_v1"):
             common.command(["systemctl", "stop", *LOCAL_CONTAINER_UNITS], timeout=40, check=False)
         if layout in ("hub_backup_broker_v1", "ssh_gateway_v1", "local_web_v1",
-                      "local_containers_v1"):
+                      "local_containers_v1", "web_agent_v1"):
             common.command(["systemctl", "stop", *BACKUP_BROKER_UNITS], timeout=40, check=False)
         if layout in ("service_control_v1", "routing_v1", "hub_backup_broker_v1",
-                      "ssh_gateway_v1", "local_web_v1", "local_containers_v1"):
+                      "ssh_gateway_v1", "local_web_v1", "local_containers_v1", "web_agent_v1"):
             common.command(["systemctl", "stop", *reversed(LOCAL_SERVICE_UNITS)],
                            timeout=40, check=False)
         common.command(["systemctl", "stop", "sovagrid-terminal-local-control.service",
@@ -497,7 +522,7 @@ def _restore(folder: Path, state: dict) -> bool:
         common.command(["systemctl", "stop", "sovagrid-agent-local.service"], timeout=40, check=False)
         args, env = common.rollback_stop_compose_args(SOURCE, folder, snapshot, state["phase"])
         common.command(args + ["stop"], timeout=120, check=False, env=env)
-        if (layout in ("ssh_gateway_v1", "local_web_v1", "local_containers_v1") and state["phase"] != "preparing" and
+        if (layout in ("ssh_gateway_v1", "local_web_v1", "local_containers_v1", "web_agent_v1") and state["phase"] != "preparing" and
                 common.SSH_GATEWAY_SERVICE not in state["images"] and
                 "gateway_before" in state):
             common.remove_new_gateway_on_rollback(state["gateway_before"]["container_ids"])
@@ -517,7 +542,7 @@ def _restore(folder: Path, state: dict) -> bool:
         for service in state["images"]:
             common.command(["docker", "image", "tag", state["images"][service],
                             "sovagrid-" + service + ":local"])
-        if (layout in ("ssh_gateway_v1", "local_web_v1", "local_containers_v1") and state["phase"] != "preparing" and
+        if (layout in ("ssh_gateway_v1", "local_web_v1", "local_containers_v1", "web_agent_v1") and state["phase"] != "preparing" and
                 common.SSH_GATEWAY_SERVICE not in state["images"] and
                 "gateway_before" in state):
             old_gateway_image = state["gateway_before"]["image"]
@@ -534,20 +559,24 @@ def _restore(folder: Path, state: dict) -> bool:
             common.command(["systemctl", "enable" if old["enabled"] else "disable", unit],
                            timeout=30, check=bool(old["enabled"]))
         if layout in ("hub_backup_broker_v1", "ssh_gateway_v1", "local_web_v1",
-                      "local_containers_v1") and common.backup_broker_enabled() and \
+                      "local_containers_v1", "web_agent_v1") and common.backup_broker_enabled() and \
                 state["units"][BACKUP_BROKER_UNITS[0]]["active"]:
             common.command(["systemctl", "start", BACKUP_BROKER_UNITS[0]], timeout=30)
         if layout in ("hub_backup_broker_v1", "ssh_gateway_v1", "local_web_v1",
-                      "local_containers_v1"):
+                      "local_containers_v1", "web_agent_v1"):
             common.backup_broker_socket_ready()
+        if (layout == "web_agent_v1" and common.web_agent_managed() and
+                state["units"][WEB_AGENT_UNITS[0]]["active"]):
+            common.command(["systemctl", "start", WEB_AGENT_UNITS[0]], timeout=30)
+            common.web_agent_socket_ready()
         args, env = common.compose_args(SOURCE)
         common.command(args + ["up", "-d", "--no-build", "--force-recreate",
                               *state["images"]], timeout=240, env=env)
         common.wait_recreated_container_health(state["images"])
         for unit in units:
             old = state["units"][unit]
-            if unit == BACKUP_BROKER_UNITS[0]:
-                continue  # Hub's socket mount required it before Compose up.
+            if unit in (BACKUP_BROKER_UNITS[0], WEB_AGENT_UNITS[0]):
+                continue  # Container socket mounts required them before Compose up.
             if unit == ROUTING_UNIT:
                 # Routing sync takes the VPN locks held by this update. Keep
                 # its oneshot running and verify it rather than restarting.
@@ -560,7 +589,7 @@ def _restore(folder: Path, state: dict) -> bool:
                 common.command(["systemctl", "reset-failed", unit], timeout=10)
             common.command(["systemctl", "restart" if old["active"] else "stop", unit],
                            timeout=60, check=bool(old["active"]))
-        if layout == "local_containers_v1" and state["units"][LOCAL_CONTAINER_UNITS[1]]["active"]:
+        if layout in ("local_containers_v1", "web_agent_v1") and state["units"][LOCAL_CONTAINER_UNITS[1]]["active"]:
             common.command(["systemctl", "start", LOCAL_CONTAINER_UNITS[0]], timeout=40)
         manifest, _promotion, _commits, baseline_sha = inspect()
         need(manifest == state["old_manifest"] and baseline_sha == state["baseline_sha256"],
@@ -713,6 +742,7 @@ def apply(archive_sha: str, current_manifest: str, *, automatic: bool = False) -
         # order so an interrupted promotion cannot race an update.
         locks.callback(os.close, _lock(PROMOTION_LOCK))
         locks.callback(os.close, _lock(CANDIDATES / ".lock"))
+        locks.enter_context(common.web_agent_snapshot_lock())
         locks.enter_context(common.public_web_lock())
         locks.callback(os.close, promotion._service_setup_lock())
         locks.enter_context(common.managed_vpn_locks())
@@ -749,7 +779,7 @@ def apply(archive_sha: str, current_manifest: str, *, automatic: bool = False) -
             folder.mkdir(mode=0o700)
             created = True
             state = {"phase": "preparing", "old_manifest": manifest, "candidate": archive_sha,
-                     "snapshot_layout": "local_containers_v1",
+                     "snapshot_layout": "web_agent_v1",
                      "images": images, "gateway_before": gateway_before,
                      "units": units, "baseline_sha256": baseline_sha,
                      "local_server_id": state_before["local_server_id"],
@@ -782,6 +812,8 @@ def apply(archive_sha: str, current_manifest: str, *, automatic: bool = False) -
                             "sovagrid-vpn-status.service"], timeout=40)
             common.command(["systemctl", "stop", "sovagrid-terminal-local-control.service",
                             "sovagrid-terminal-local-control.socket"], timeout=40, check=False)
+            common.command(["systemctl", "stop", *reversed(WEB_AGENT_UNITS)], timeout=40,
+                           check=False)
             common.command(["systemctl", "stop", *LOCAL_CONTAINER_UNITS], timeout=40,
                            check=False)
             common.command(["systemctl", "stop", *BACKUP_BROKER_UNITS], timeout=40, check=False)
@@ -821,7 +853,8 @@ def apply(archive_sha: str, current_manifest: str, *, automatic: bool = False) -
                 install_env.update(SOVAGRID_PUBLIC_WEB_LOCK_HELD="1", SOVAGRID_UPDATER_TIMER_SNAPSHOT="1",
                                    SOVAGRID_RELEASE_FEED_SNAPSHOT="1",
                                    SOVAGRID_HUB_BACKUP_BROKER_SNAPSHOT="1",
-                                   SOVAGRID_SSH_GATEWAY_SNAPSHOT="1")
+                                   SOVAGRID_SSH_GATEWAY_SNAPSHOT="1",
+                                   SOVAGRID_WEB_AGENT_SNAPSHOT="1")
                 common.command(["bash", str(SOURCE / "sovagrid-blueprint/run.sh"), "--hub-only"],
                                timeout=2700, stdout=output, env=install_env)
             _refresh_local_agent(new_manifest)
