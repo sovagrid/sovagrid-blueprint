@@ -130,6 +130,18 @@ class WebVpnSourceTests(unittest.TestCase):
         self.assertFalse((self.directory / "vpn-source-stage.json").exists())
         self.assertEqual(FakeTransport.instances[0].rpc.cleaned, ["e" * 32])
 
+    def test_transport_errors_distinguish_changed_host_key_from_unavailable_ssh(self):
+        for failure, expected in ((module.HostKeyChanged("changed"), "HOST_KEY_CHANGED"),
+                                  (OSError("offline"), "SSH_UNAVAILABLE")):
+            with self.subTest(expected=expected):
+                def fail_transport(**_kwargs):
+                    raise failure
+
+                self.bridge.transport_factory = fail_transport
+                with self.assertRaises(module.VpnSourceError) as raised:
+                    self._preview()
+                self.assertEqual(raised.exception.code, expected)
+
     def test_failed_stage_cleanup_is_recovered_by_next_same_target_request(self):
         FakeRPC.fail_cleanup_once = True
         with self.assertRaises(module.VpnSourceError) as error:
@@ -197,6 +209,10 @@ class WebVpnSourceTests(unittest.TestCase):
         with self.assertRaises(module.VpnSourceError) as error:
             self.bridge._response(raw, 1, "apply")
         self.assertEqual(error.exception.code, "CONTROL_ACTIVE")
+        changed = module._canonical({"protocol": 1, "ok": False, "error": "HOST_KEY_CHANGED"})
+        with self.assertRaises(module.VpnSourceError) as error:
+            self.bridge._response(changed, 1, "preview")
+        self.assertEqual(error.exception.code, "OPERATION_FAILED")
         for action, code in (("apply", "APPLY_UNCERTAIN"),
                              ("recover", "RECOVERY_UNCERTAIN")):
             for status in (0, 255):

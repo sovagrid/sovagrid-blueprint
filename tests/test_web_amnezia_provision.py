@@ -132,6 +132,19 @@ class ProvisionBridgeTests(unittest.TestCase):
         self.assertIn('argv=["/bin/sh","' + module.CLI + '"', rpc.calls[1][1])
         compile(rpc.calls[1][1], "<remote-amnezia-provision>", "exec")
 
+    def test_transport_errors_distinguish_changed_host_key_from_unavailable_ssh(self):
+        bridge, _rpc, _transports, _jobs = self.bridge(preview())
+        for failure, expected in ((module.HostKeyChanged("changed"), "HOST_KEY_CHANGED"),
+                                  (OSError("offline"), "SSH_UNAVAILABLE")):
+            with self.subTest(expected=expected):
+                def fail_transport(**_kwargs):
+                    raise failure
+
+                bridge.transport_factory = fail_transport
+                with self.assertRaises(module.AmneziaProvisionError) as raised:
+                    self.execute(bridge, "preview", **PARAMS)
+                self.assertEqual(raised.exception.code, expected)
+
     def test_preview_through_jump_uses_separate_credentials(self):
         bridge, _rpc, transports, _jobs = self.bridge(preview())
         options = SimpleNamespace(host="target.example", port=2222, user="root",

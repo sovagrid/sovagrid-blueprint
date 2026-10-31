@@ -17,7 +17,7 @@ import re
 
 from sovagrid_connect.agent_rpc import RPCError
 from sovagrid_connect.core import ConnectionOptions
-from web_agent_target_ssh import PinnedTargetSSH, TargetSSHError
+from web_agent_target_ssh import HostKeyChanged, PinnedTargetSSH, TargetSSHError
 
 
 CLI = "/opt/sovagrid-src/sovagrid-vpn/deploy/sovagrid-amnezia-provision"
@@ -40,7 +40,7 @@ _CLI_ERRORS = _PREVIEW_REASONS | {
     "CONFIRMATION_REQUIRED", "INVALID_REVISION",
 }
 _ERRORS = _CLI_ERRORS | {
-    "INVALID_REQUEST", "SSH_UNAVAILABLE", "BUSY", "APPLY_UNCERTAIN",
+    "INVALID_REQUEST", "SSH_UNAVAILABLE", "HOST_KEY_CHANGED", "BUSY", "APPLY_UNCERTAIN",
     "RECOVERY_UNCERTAIN", "OPERATION_FAILED", "STALE_PREVIEW",
 }
 _FULL_PREVIEW = frozenset({
@@ -303,5 +303,7 @@ class AmneziaProvisionJobs:
                 raise AmneziaProvisionError(
                     "ROOT_REQUIRED" if error.code == "ROOT_REQUIRED" else
                     "BUSY" if error.code == "BUSY" else "SSH_UNAVAILABLE") from None
+            except HostKeyChanged:
+                raise AmneziaProvisionError("HOST_KEY_CHANGED") from None
             except (TargetSSHError, OSError, ValueError, TypeError):
                 raise AmneziaProvisionError("SSH_UNAVAILABLE") from None

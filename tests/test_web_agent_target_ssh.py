@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "vendor/connect"))
 sys.path.insert(0, str(ROOT / "deploy"))
 
-from web_agent_target_ssh import (AskpassBroker, PinnedTargetSSH, TargetSSHError,
+from web_agent_target_ssh import (AskpassBroker, HostKeyChanged, PinnedTargetSSH, TargetSSHError,
                                   _jump_proxy_client, host_key_alias, reviewed_key_blob,
                                   reviewed_public_key)
 
@@ -68,6 +68,17 @@ class ReviewedKeyTests(unittest.TestCase):
             reviewed_public_key(b"x" * 32769, fingerprint)
         with self.assertRaises(TargetSSHError):
             reviewed_public_key(b"not a key\n", fingerprint)
+
+    def test_only_live_valid_mismatch_is_host_key_changed(self):
+        reviewed_blob, reviewed_fp = fixture_key()
+        changed_blob, _ = fixture_key(1)
+        with self.assertRaises(HostKeyChanged):
+            reviewed_public_key(f"server.example ssh-ed25519 {changed_blob}\n".encode(), reviewed_fp)
+        for scan in (b"", b"not a key\n", b"server.example ssh-rsa " +
+                     reviewed_blob.encode() + b"\n"):
+            with self.subTest(scan=scan), self.assertRaises(TargetSSHError) as error:
+                reviewed_public_key(scan, reviewed_fp)
+            self.assertNotIsInstance(error.exception, HostKeyChanged)
 
     def test_host_key_alias_binds_the_reviewed_fingerprint(self):
         _, fingerprint = fixture_key()
@@ -287,7 +298,7 @@ class TransportTests(unittest.TestCase):
                 jump=jump, target_host_key_blob=jump_blob, require_root=False)
         with tempfile.TemporaryDirectory() as directory:
             wrong = f"jump.example ssh-ed25519 {target_blob}\n".encode()
-            with self.assertRaises(TargetSSHError):
+            with self.assertRaises(HostKeyChanged):
                 with PinnedTargetSSH(host="target.example", port=22, username="root",
                     fingerprint=target_fp, method="password", password="target-secret",
                     jump=jump, target_host_key_blob=target_blob,

@@ -125,6 +125,19 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(transports[0].closed)
         self.assertEqual(jobs.entered, 1)
 
+    def test_transport_errors_distinguish_changed_host_key_from_unavailable_ssh(self):
+        bridge, _rpc, _transports, _jobs = self.bridge(preview())
+        for failure, expected in ((control.HostKeyChanged("changed"), "HOST_KEY_CHANGED"),
+                                  (OSError("offline"), "SSH_UNAVAILABLE")):
+            with self.subTest(expected=expected):
+                def fail_transport(**_kwargs):
+                    raise failure
+
+                bridge.transport_factory = fail_transport
+                with self.assertRaises(control.WireguardControlError) as raised:
+                    self.run_action(bridge, "preview")
+                self.assertEqual(raised.exception.code, expected)
+
     def test_preview_through_jump_passes_both_pins_to_transport(self):
         bridge, _rpc, transports, _jobs = self.bridge(preview())
         options = SimpleNamespace(host="example.test", port=22, user="operator",

@@ -21,7 +21,7 @@ import uuid
 
 from sovagrid_connect.agent_rpc import RPCError, Stage
 from sovagrid_connect.core import ConnectionOptions
-from web_agent_target_ssh import PinnedTargetSSH, TargetSSHError
+from web_agent_target_ssh import HostKeyChanged, PinnedTargetSSH, TargetSSHError
 
 
 SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -31,11 +31,12 @@ ERRORS = frozenset({"ROOT_REQUIRED", "INVALID_REQUEST", "SOURCE_UNTRUSTED",
     "STALE_PREVIEW", "CONTROL_ACTIVE", "BUSY", "OPERATION_FAILED",
     "INTERNAL_ERROR", "SSH_UNAVAILABLE", "STAGE_CLEANUP_REQUIRED",
     "APPLY_UNCERTAIN", "RECOVERY_UNCERTAIN"})
+PUBLIC_ERRORS = ERRORS | {"HOST_KEY_CHANGED"}
 
 
 class VpnSourceError(RuntimeError):
     def __init__(self, code: str):
-        self.code = code if code in ERRORS else "OPERATION_FAILED"
+        self.code = code if code in PUBLIC_ERRORS else "OPERATION_FAILED"
         super().__init__(self.code)
 
 
@@ -308,5 +309,7 @@ class VpnSourceJobs:
                 if error.code in ("CLEANUP_REQUIRED", "STAGE_INCOMPLETE"):
                     raise VpnSourceError("STAGE_CLEANUP_REQUIRED") from None
                 raise VpnSourceError("SSH_UNAVAILABLE") from None
+            except HostKeyChanged:
+                raise VpnSourceError("HOST_KEY_CHANGED") from None
             except (TargetSSHError, OSError, ValueError, TypeError):
                 raise VpnSourceError("SSH_UNAVAILABLE") from None

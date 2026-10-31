@@ -350,6 +350,16 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self._socket_reply(b"{" + b"x" * (service._MAX_REQUEST + 1) + b"\n")["error"],
                          "INVALID_INPUT")
 
+    def test_socket_preserves_host_key_changed_error_code(self):
+        def changed(**_kwargs):
+            raise service.JobError("HOST_KEY_CHANGED")
+
+        self.jobs.prepare = changed
+        payload = {**login_payload(), "name": "Remote", "hub_host": "192.0.2.1",
+                   "hub_port": 22, "local_port": 18767}
+        reply = self._socket_reply((json.dumps(request("prepare", payload)) + "\n").encode())
+        self.assertEqual(reply, {"ok": False, "error": "HOST_KEY_CHANGED"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,7 @@ from sovagrid_connect.core import ConnectionOptions
 from sovagrid_connect import enrollment_journal
 from sovagrid_connect.enrollment_protocol import public_key_fingerprint
 from web_agent_jobs import ControllerBinding, JobError, WebAgentJobs
+from web_agent_target_ssh import HostKeyChanged
 import web_agent_jobs
 
 
@@ -197,6 +198,21 @@ class JobsTests(unittest.TestCase):
         raw = "".join(path.read_text() for path in (self.root / "journal").glob("*.json"))
         for secret in (BEARER, "test-only-ssh-secret", "borrowed-bearer-should-not-appear-in-status"):
             self.assertNotIn(secret, status + raw)
+
+    def test_prepare_reports_live_changed_key_and_keeps_network_failure_generic(self):
+        jobs = self.jobs()
+        for failure, expected in ((HostKeyChanged("changed"), "HOST_KEY_CHANGED"),
+                                  (OSError("offline"), "SSH_UNAVAILABLE")):
+            with self.subTest(expected=expected):
+                def fail_factory(**_kwargs):
+                    raise failure
+
+                jobs._factory = fail_factory
+                credential = Credential()
+                with self.assertRaises(JobError) as raised:
+                    self.prepare(jobs, credential=credential)
+                self.assertEqual(raised.exception.code, expected)
+                self.assertTrue(credential.wiped)
 
     def test_prepare_review_apply_and_secretless_checkpoint(self):
         jobs = self.jobs()

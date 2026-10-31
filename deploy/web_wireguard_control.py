@@ -15,7 +15,7 @@ import re
 
 from sovagrid_connect.agent_rpc import RPCError
 from sovagrid_connect.core import ConnectionOptions
-from web_agent_target_ssh import PinnedTargetSSH, TargetSSHError
+from web_agent_target_ssh import HostKeyChanged, PinnedTargetSSH, TargetSSHError
 
 
 SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -41,7 +41,7 @@ _EXACT_ERRORS = {
     "Required WireGuard dependencies remain unavailable": "DEPENDENCIES_UNAVAILABLE",
 }
 _ERRORS = frozenset({
-    "INVALID_REQUEST", "ROOT_REQUIRED", "SSH_UNAVAILABLE", "SOURCE_NOT_PREPARED",
+    "INVALID_REQUEST", "ROOT_REQUIRED", "SSH_UNAVAILABLE", "HOST_KEY_CHANGED", "SOURCE_NOT_PREPARED",
     "SOURCE_CHANGED", "AGENT_UNAVAILABLE", "DEPENDENCIES_UNAVAILABLE",
     "STALE_PREVIEW", "RECOVERY_REQUIRED", "CONTROL_ACTIVE", "BUSY",
     "OPERATION_FAILED", "APPLY_UNCERTAIN", "RECOVERY_UNCERTAIN",
@@ -238,5 +238,7 @@ class WireguardControlJobs:
                 raise WireguardControlError(
                     "ROOT_REQUIRED" if error.code == "ROOT_REQUIRED" else
                     "BUSY" if error.code == "BUSY" else "SSH_UNAVAILABLE") from None
+            except HostKeyChanged:
+                raise WireguardControlError("HOST_KEY_CHANGED") from None
             except (TargetSSHError, OSError, ValueError, TypeError):
                 raise WireguardControlError("SSH_UNAVAILABLE") from None

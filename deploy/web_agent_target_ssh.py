@@ -49,6 +49,10 @@ class TargetSSHError(RuntimeError):
     """Fixed, safe-to-display failure without hostnames or secrets."""
 
 
+class HostKeyChanged(TargetSSHError):
+    """A live, valid SSH host key differs from the reviewed fingerprint."""
+
+
 def host_key_alias(fingerprint: str) -> str:
     """Stable journal-safe binding to the exact reviewed public key digest."""
     if not isinstance(fingerprint, str) or FINGERPRINT.fullmatch(fingerprint) is None:
@@ -100,6 +104,7 @@ def reviewed_public_key(scan_output: bytes, fingerprint: str) -> tuple[str, str]
     if not isinstance(scan_output, bytes) or len(scan_output) > MAX_SCAN:
         raise TargetSSHError("Неверный ответ SSH-сервера.")
     matches: set[tuple[str, str]] = set()
+    other_valid_key = False
     for line in scan_output.splitlines():
         if not line or line.startswith(b"#") or len(line) > 8192:
             continue
@@ -112,6 +117,8 @@ def reviewed_public_key(scan_output: bytes, fingerprint: str) -> tuple[str, str]
             raw = base64.b64decode(blob, validate=True)
             if kind not in KEY_TYPES or len(raw) < 8 or len(raw) > 8192:
                 continue
+            if base64.b64encode(raw).decode("ascii") != blob:
+                continue
             inner_length = struct.unpack(">I", raw[:4])[0]
             if inner_length != len(kind) or raw[4:4 + inner_length] != kind.encode():
                 continue
@@ -120,8 +127,12 @@ def reviewed_public_key(scan_output: bytes, fingerprint: str) -> tuple[str, str]
         actual = "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode("ascii").rstrip("=")
         if actual == fingerprint:
             matches.add((kind, blob))
+        else:
+            other_valid_key = True
     if len(matches) != 1:
-        raise TargetSSHError("SSH-ключ изменился или не совпал с подтверждённым отпечатком.")
+        if not matches and other_valid_key:
+            raise HostKeyChanged("SSH-ключ изменился или не совпал с подтверждённым отпечатком.")
+        raise TargetSSHError("SSH-ключ сервера не удалось подтвердить.")
     return next(iter(matches))
 
 
@@ -471,7 +482,7 @@ class PinnedTargetSSH:
                     self._scanner(self.options.jump_host, self.options.jump_port),
                     self._jump["fingerprint"])
                 if (jump_kind, jump_blob) != (scanned_kind, scanned_blob):
-                    raise TargetSSHError("SSH-ключ промежуточного хоста изменился.")
+                    raise HostKeyChanged("SSH-ключ промежуточного хоста изменился.")
                 jump_known_hosts = folder / "known_hosts_jump"
                 _write_private(jump_known_hosts,
                                f"{self.jump_alias} {jump_kind} {jump_blob}\n".encode("ascii"))

@@ -39,6 +39,8 @@ import time
 import uuid
 from typing import Callable
 
+from web_agent_target_ssh import HostKeyChanged
+
 
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _BUNDLE_NAME = re.compile(r"source-([0-9a-f]{64})\.tar\.gz\Z")
@@ -366,6 +368,13 @@ class WebAgentJobs:
                 except JobError:
                     pass
             raise
+        except HostKeyChanged:
+            if isinstance(binding, ControllerBinding):
+                try:
+                    self._close(binding)
+                except JobError:
+                    pass
+            raise JobError("HOST_KEY_CHANGED") from None
         except Exception:
             if isinstance(binding, ControllerBinding):
                 try:
