@@ -201,7 +201,8 @@ def _apply(request_id: str) -> int:
         result = subprocess.run(command, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 timeout=APPLY_TIMEOUT, check=False,
-                                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+                                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                                     "SOVAGRID_EXTERNAL_APPLY_REQUEST_ID": request_id})
     except (OSError, subprocess.TimeoutExpired):
         _transition(path, request_id, frozenset(("running",)), "uncertain", "APPLY_UNCERTAIN")
         return 40

@@ -331,6 +331,50 @@ class OriginalHubCompatibilityTests(unittest.TestCase):
                          "SG_EXTERNAL_AGENT_UPDATE_REFUSE:UNSAFE_STATE\n")
         self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
 
+    def test_fixed_writer_id_is_canonical_and_passed_only_to_inspection(self):
+        request_id = "9c941101-2acb-4e59-877c-136d3f43f1d8"
+        with mock.patch.dict(previewer.os.environ,
+                             {"SOVAGRID_EXTERNAL_APPLY_REQUEST_ID": request_id}):
+            self.assertEqual(previewer._writer_request_id(), request_id)
+        with mock.patch.object(previewer.update, "inspect", return_value=(1, 2, 3, 4)) as inspect:
+            self.assertEqual(previewer._inspect_for_writer(request_id), (1, 2, 3, 4))
+            inspect.assert_called_once_with(external_apply_request_id=request_id)
+        with mock.patch.dict(previewer.os.environ,
+                             {"SOVAGRID_EXTERNAL_APPLY_REQUEST_ID": "../bad"}), \
+             self.assertRaisesRegex(previewer.Refused, "EXTERNAL_OPERATION_ID"):
+            previewer._writer_request_id()
+        with mock.patch.object(previewer.os, "geteuid", return_value=0), \
+             mock.patch.object(previewer.os, "getegid", return_value=0), \
+             mock.patch.object(previewer.sys, "platform", "linux"), \
+             mock.patch.object(previewer, "_writer_request_id", return_value=request_id), \
+             mock.patch.object(previewer, "preflight",
+                               side_effect=previewer.Refused("REVIEW_CHANGED")) as preflight, \
+             self.assertRaisesRegex(previewer.Refused, "REVIEW_CHANGED"):
+            previewer.apply(ARCHIVE, CURRENT, EXTERNAL, BASELINE)
+        preflight.assert_called_once_with(ARCHIVE, CURRENT,
+                                          external_apply_request_id=request_id)
+        with mock.patch.object(previewer, "preview",
+                               return_value={"current_hub_manifest_sha256": CURRENT}) as preview, \
+             mock.patch.object(previewer, "_promotion_lock",
+                               return_value=contextlib.nullcontext()), \
+             mock.patch.object(previewer, "_inspect_for_writer",
+                               return_value=("different", {}, {}, BASELINE)) as inspect, \
+             self.assertRaisesRegex(previewer.Refused, "PROMOTION_CHANGED"):
+            previewer.preflight(ARCHIVE, CURRENT,
+                                external_apply_request_id=request_id)
+        preview.assert_called_once_with(ARCHIVE, CURRENT,
+                                        external_apply_request_id=request_id)
+        inspect.assert_called_once_with(request_id)
+        with mock.patch.object(previewer.os, "geteuid", return_value=0), \
+             mock.patch.object(previewer, "_promotion_lock",
+                               return_value=contextlib.nullcontext()), \
+             mock.patch.object(previewer, "_inspect_for_writer",
+                               return_value=("different", {}, {}, BASELINE)) as inspect, \
+             self.assertRaisesRegex(previewer.Refused, "PROMOTION_CHANGED"):
+            previewer.preview(ARCHIVE, CURRENT,
+                              external_apply_request_id=request_id)
+        inspect.assert_called_once_with(request_id)
+
 
 if __name__ == "__main__":
     unittest.main()

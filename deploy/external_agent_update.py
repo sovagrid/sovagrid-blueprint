@@ -37,6 +37,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 
 sys.dont_write_bytecode = True
 
@@ -873,15 +874,41 @@ def _new_metadata(candidate_root: Path, manifest: dict, state: dict,
     return old_tree, new_tree, raw
 
 
-def preflight(archive_sha256: str, current_manifest_sha256: str) -> dict:
+def _writer_request_id() -> str | None:
+    value = os.environ.get("SOVAGRID_EXTERNAL_APPLY_REQUEST_ID")
+    if value is None:
+        return None
+    try:
+        need(str(uuid.UUID(value)) == value, "EXTERNAL_OPERATION_ID")
+    except (ValueError, AttributeError):
+        raise Refused("EXTERNAL_OPERATION_ID") from None
+    return value
+
+
+def _inspect_for_writer(request_id: str | None):
+    if request_id is None:
+        return update.inspect()
+    try:
+        need(type(request_id) is str and str(uuid.UUID(request_id)) == request_id,
+             "EXTERNAL_OPERATION_ID")
+    except (ValueError, AttributeError):
+        raise Refused("EXTERNAL_OPERATION_ID") from None
+    return update.inspect(external_apply_request_id=request_id)
+
+
+def preflight(archive_sha256: str, current_manifest_sha256: str, *,
+              external_apply_request_id: str | None = None) -> dict:
     """Validate the exact local source/state transition without writing it.
 
     The returned digest is only an exact review token. Apply rechecks all
     locks, bytes, enrollment state and original-Hub gates before a write.
     """
-    earlier = preview(archive_sha256, current_manifest_sha256)
+    earlier = (preview(archive_sha256, current_manifest_sha256)
+               if external_apply_request_id is None else
+               preview(archive_sha256, current_manifest_sha256,
+                       external_apply_request_id=external_apply_request_id))
     with _promotion_lock():
-        current, promoted, _commits, baseline = update.inspect()
+        current, promoted, _commits, baseline = _inspect_for_writer(external_apply_request_id)
         need(current == earlier["current_hub_manifest_sha256"] and
              promoted.get("phase") == "activated" and
              promoted.get("baseline_sha256") == baseline,
@@ -1931,13 +1958,14 @@ class AgentIdleProof:
         self.close()
 
 
-def preview(archive_sha256: str, current_manifest_sha256: str) -> dict:
+def preview(archive_sha256: str, current_manifest_sha256: str, *,
+            external_apply_request_id: str | None = None) -> dict:
     need(os.geteuid() == 0, "ROOT")
     need(isinstance(archive_sha256, str) and SHA.fullmatch(archive_sha256) is not None and
          isinstance(current_manifest_sha256, str) and SHA.fullmatch(current_manifest_sha256) is not None,
          "HASH")
     with _promotion_lock():
-        current, promoted, _commits, baseline = update.inspect()
+        current, promoted, _commits, baseline = _inspect_for_writer(external_apply_request_id)
         need(current == current_manifest_sha256 and
              promoted.get("phase") == "activated" and
              promoted.get("external_agent_preserved") is True and
@@ -2115,7 +2143,11 @@ def apply(archive_sha256: str, current_manifest_sha256: str,
     need(all(isinstance(item, str) and SHA.fullmatch(item) is not None
              for item in (archive_sha256, current_manifest_sha256,
                           external_manifest_sha256, review_sha256)), "HASH")
-    review = preflight(archive_sha256, current_manifest_sha256)
+    own_request_id = _writer_request_id()
+    review = (preflight(archive_sha256, current_manifest_sha256)
+              if own_request_id is None else
+              preflight(archive_sha256, current_manifest_sha256,
+                        external_apply_request_id=own_request_id))
     need(review["external_agent_manifest_sha256"] == external_manifest_sha256 and
          review["review_sha256"] == review_sha256, "REVIEW_CHANGED")
     failure: Exception | None = None
@@ -2128,7 +2160,7 @@ def apply(archive_sha256: str, current_manifest_sha256: str,
         enrollment = remote.Enrollment(executable=remote.TARGET_HELPER)
         stack.enter_context(enrollment.locked("target"))
         transaction = recovery.Recovery(enrollment.files)
-        current, promoted, _commits, baseline_sha256 = update.inspect()
+        current, promoted, _commits, baseline_sha256 = _inspect_for_writer(own_request_id)
         need(current == current_manifest_sha256 and
              promoted.get("phase") == "activated" and
              promoted.get("external_agent_preserved") is True and

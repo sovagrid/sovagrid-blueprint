@@ -242,6 +242,38 @@ class HubOnlyUpdatePolicy(unittest.TestCase):
                  mock.patch.object(update.subprocess, "run", side_effect=systemctl_show):
                 with self.assertRaisesRegex(update.Refused, "EXTERNAL_APPLY_BUSY"):
                     update._external_apply_idle()
+                update._external_apply_idle(request_id)
+                with self.assertRaisesRegex(update.Refused, "EXTERNAL_APPLY_BUSY"):
+                    update._external_apply_idle("f3a1a600-fca8-491c-a978-51d5628726fa")
+                apply_state[0] = "inactive"
+                with self.assertRaisesRegex(update.Refused, "EXTERNAL_APPLY_BUSY"):
+                    update._external_apply_idle(request_id)
+                apply_state[0] = "activating"
+                status["phase"] = "accepted"
+                (operation / "status.json").write_text(
+                    json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n")
+                with self.assertRaisesRegex(update.Refused, "EXTERNAL_APPLY_BUSY"):
+                    update._external_apply_idle(request_id)
+                status["phase"] = "uncertain"
+                status["error"] = "RECOVERY_REQUIRED"
+                (operation / "status.json").write_text(
+                    json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n")
+                with self.assertRaisesRegex(update.Refused, "EXTERNAL_APPLY_BUSY"):
+                    update._external_apply_idle(request_id)
+                status["phase"] = "running"
+                status["error"] = None
+                (operation / "status.json").write_text(
+                    json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n")
+                other_id = "f3a1a600-fca8-491c-a978-51d5628726fa"
+                other = ledger / other_id
+                other.mkdir()
+                other_status = {**status, "request_id": other_id}
+                (other / "status.json").write_text(
+                    json.dumps(other_status, sort_keys=True, separators=(",", ":")) + "\n")
+                with self.assertRaisesRegex(update.Refused, "EXTERNAL_APPLY_BUSY"):
+                    update._external_apply_idle(request_id)
+                (other / "status.json").unlink()
+                other.rmdir()
                 status["phase"] = "complete"
                 (operation / "status.json").write_text(
                     json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n")

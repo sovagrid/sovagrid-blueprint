@@ -234,8 +234,14 @@ def _external_runtime() -> dict[str, dict]:
     return result
 
 
-def _external_apply_idle() -> None:
+def _external_apply_idle(own_request_id: str | None = None) -> None:
     """An independent Agent writer cannot overlap a local Hub source swap."""
+    if own_request_id is not None:
+        try:
+            need(type(own_request_id) is str and str(uuid.UUID(own_request_id)) == own_request_id,
+                 "EXTERNAL_APPLY_BUSY")
+        except (ValueError, AttributeError):
+            raise Refused("EXTERNAL_APPLY_BUSY") from None
     def active_state(name: str) -> str:
         try:
             result = subprocess.run(
@@ -251,6 +257,7 @@ def _external_apply_idle() -> None:
     marker, unit, ledger = (Path(EXTERNAL_APPLY_MARKER), Path(EXTERNAL_APPLY_UNIT),
                             Path(EXTERNAL_APPLY_LEDGER))
     if not marker.exists() and not marker.is_symlink():
+        need(own_request_id is None, "EXTERNAL_APPLY_BUSY")
         need(not any(item.exists() or item.is_symlink() for item in (unit, ledger)),
              "EXTERNAL_APPLY_STATE")
         return
@@ -262,6 +269,7 @@ def _external_apply_idle() -> None:
          "EXTERNAL_APPLY_BUSY")
     entries = list(ledger.iterdir())
     need(len(entries) <= 129, "EXTERNAL_APPLY_STATE")
+    own_running_seen = False
     for item in entries:
         if item.name == ".lock":
             info = item.lstat()
@@ -280,21 +288,25 @@ def _external_apply_idle() -> None:
             status = json.loads(raw)
         except (OSError, ValueError):
             raise Refused("EXTERNAL_APPLY_STATE") from None
+        own_running = (request_id == own_request_id and status.get("phase") == "running") if isinstance(status, dict) else False
         need(isinstance(status, dict) and set(status) == {
              "format", "request_id", "phase", "created_at", "updated_at", "error"} and
              raw == (json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n").encode() and
              type(status["format"]) is int and status["format"] == 1 and
              status["request_id"] == request_id and
-             status["phase"] in ("complete", "failed") and
+             (status["phase"] in ("complete", "failed") or own_running) and
              type(status["created_at"]) is int and
              type(status["updated_at"]) is int and
              1 <= status["created_at"] <= status["updated_at"] <= 253402300799 and
-             (status["error"] is None if status["phase"] == "complete" else
+             (status["error"] is None if status["phase"] in ("complete", "running") else
               isinstance(status["error"], str) and
               re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", status["error"]) is not None),
              "EXTERNAL_APPLY_BUSY")
-        need(active_state("sovagrid-external-agent-apply@" + request_id + ".service")
-             in ("inactive", "failed"), "EXTERNAL_APPLY_BUSY")
+        state = active_state("sovagrid-external-agent-apply@" + request_id + ".service")
+        need(state in (("active", "activating") if own_running else ("inactive", "failed")),
+             "EXTERNAL_APPLY_BUSY")
+        own_running_seen |= own_running
+    need(own_request_id is None or own_running_seen, "EXTERNAL_APPLY_BUSY")
 
 
 def _check_external_runtime(expected: dict[str, dict]) -> None:
@@ -354,7 +366,7 @@ def _container_health() -> None:
     need(inventory.is_file() and not inventory.is_symlink(), "VPN_INVENTORY")
 
 
-def inspect() -> tuple[str, dict, dict[str, str], str]:
+def inspect(*, external_apply_request_id: str | None = None) -> tuple[str, dict, dict[str, str], str]:
     need(os.geteuid() == 0, "ROOT")
     release = Path("/etc/os-release").read_text()
     need(re.search(r"(?m)^ID=ubuntu$", release) is not None, "UBUNTU")
@@ -393,7 +405,7 @@ def inspect() -> tuple[str, dict, dict[str, str], str]:
     if common.web_agent_managed():
         need(all(_unit_state(unit)["active"] for unit in WEB_AGENT_UNITS), "WEB_AGENT")
         common.web_agent_socket_ready()
-    _external_apply_idle()
+    _external_apply_idle(external_apply_request_id)
     state = promotion.inspect()
     need(state.get("phase") == "activated" and state.get("external_agent_preserved") is True,
          "PROMOTION_STATE")

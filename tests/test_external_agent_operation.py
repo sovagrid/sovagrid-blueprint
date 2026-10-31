@@ -76,6 +76,8 @@ class ExternalOperationTests(TestCase):
         command = runner.call_args.args[0]
         self.assertEqual(command, ["/usr/bin/python3", "-B", "-I", str(operation.UPDATE),
                                    "apply", SHA, SHA, SHA, SHA])
+        self.assertEqual(runner.call_args.kwargs["env"]["SOVAGRID_EXTERNAL_APPLY_REQUEST_ID"],
+                         REQUEST_ID)
         self.assertEqual([item[0][3] for item in transitions], ["running", "complete"])
 
     def test_refusal_never_exposes_stderr_and_does_not_retry(self):
