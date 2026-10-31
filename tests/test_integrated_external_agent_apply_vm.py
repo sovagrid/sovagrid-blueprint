@@ -12,7 +12,10 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from . import integrated_external_agent_apply_vm as fixture
+if __package__:
+    from . import integrated_external_agent_apply_vm as fixture
+else:
+    import integrated_external_agent_apply_vm as fixture
 
 
 class FixtureContractTests(unittest.TestCase):
