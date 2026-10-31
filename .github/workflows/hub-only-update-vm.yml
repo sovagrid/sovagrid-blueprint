@@ -164,7 +164,7 @@ jobs:
             preflight "$candidate_sha" "$old_manifest"
           sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_RELEASE_FEED_VM_FIXTURE=1 \
             python3 tests/release_feed_vm.py legacy-guard \
-            "/opt/sovagrid-candidates/$candidate_sha/source/sovagrid-blueprint/run.sh" deferred
+            "/opt/sovagrid-candidates/$candidate_sha/source/sovagrid-blueprint/run.sh" refused
           sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 \
             python3 tests/promotion_vm.py external
       - name: Update local Hub and second Agent, retaining enabled commands
@@ -198,7 +198,7 @@ jobs:
           from pathlib import Path
           state = Path('/var/lib/sovagrid/release-feed-state.json')
           state.write_text(json.dumps({'format': 1, 'highest_sequence': 3,
-                                       'highest_version': '0.3.10', 'highest_issued_at': 1,
+                                       'highest_version': '0.11.1', 'highest_issued_at': 1,
                                        'last_seen_at': 1}, sort_keys=True) + '\n')
           state.chmod(0o600)
           PY

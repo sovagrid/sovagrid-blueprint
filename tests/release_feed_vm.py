@@ -113,7 +113,7 @@ def check(mode: str) -> None:
 
 
 def legacy_guard(source: Path, outcome: str) -> None:
-    """Run only run.sh's read-only preflight with the previous worker's env."""
+    """Run only run.sh's read-only updater preflight without a feed snapshot."""
     require(outcome in ("deferred", "refused") and source.is_file() and not source.is_symlink() and
             str(source).startswith(("/opt/sovagrid-candidates/", "/opt/sovagrid-src/")),
             "unsafe legacy guard fixture")
@@ -123,7 +123,7 @@ def legacy_guard(source: Path, outcome: str) -> None:
     preflight = script.split(boundary, 1)[0] + "\n"
     preflight += "if (( release_feed_deferred )); then printf 'SG_VM_FEED_DEFERRED\\n'; fi\n"
     env = os.environ.copy()
-    # Exercise the feed guard itself. Older-worker protections for the backup
+    # Exercise the feed guard itself. Updater protections for the backup
     # broker and SSH gateway precede it or follow it in run.sh; after those
     # features are installed they must not mask this specific refusal.
     env.update(SOVAGRID_PUBLIC_WEB_LOCK_HELD="1", SOVAGRID_UPDATER_TIMER_SNAPSHOT="1",
@@ -133,12 +133,12 @@ def legacy_guard(source: Path, outcome: str) -> None:
                             text=True, check=False, timeout=20)
     if outcome == "deferred":
         require(result.returncode == 0 and "SG_VM_FEED_DEFERRED" in result.stdout,
-                "previous worker did not defer the first feed-unit install")
+                "updater did not defer the first feed-unit install")
     else:
         require(result.returncode != 0 and
                 "supervising updater cannot snapshot existing release-feed state" in result.stderr,
-                "previous worker accepted unsnapshotted installed feed state")
-    print("Previous-worker release-feed preflight", outcome, "verified")
+                "updater accepted unsnapshotted installed feed state")
+    print("Updater release-feed preflight", outcome, "verified")
 
 
 def main(argv: list[str]) -> None:
