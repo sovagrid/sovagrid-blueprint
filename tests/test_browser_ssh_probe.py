@@ -16,6 +16,7 @@ from unittest.mock import patch
 import unittest
 
 from deploy import browser_ssh_probe as probe
+from deploy import remote_update_worker as update
 
 
 def gateway_reply() -> dict:
@@ -60,6 +61,8 @@ process.stdout.write(JSON.stringify({ protocol: 1, port: 22, ...hostKey(key),
         reply = subprocess.check_output(
             ["node", "--input-type=module", "-e", script], cwd=source, timeout=10)
         probe.verify_host_key_response(reply)
+        with patch.object(update.urllib.request, "urlopen", return_value=_Response(reply, "application/json")):
+            update.browser_ssh_route_health()
 
     def test_gateway_public_key_reply_and_ssh_first_panel(self):
         reply = json.dumps(gateway_reply()).encode("ascii")
@@ -93,6 +96,28 @@ process.stdout.write(JSON.stringify({ protocol: 1, port: 22, ...hostKey(key),
                 _Response(b"<html>Old panel</html>", "text/html"))):
             with self.assertRaisesRegex(ValueError, "SSH-first panel"):
                 probe.probe_once()
+
+    def test_updater_accepts_gateway_reply_and_rejects_bad_host_key(self):
+        reply = gateway_reply()
+        with patch.object(update.urllib.request, "urlopen", return_value=_Response(
+                json.dumps(reply).encode("ascii"), "application/json")) as open_url:
+            update.browser_ssh_route_health()
+        self.assertEqual(open_url.call_args.args[0].full_url, probe.HOST_KEY_URL)
+
+        invalid = []
+        missing_blob = dict(reply)
+        del missing_blob["host_key_blob"]
+        invalid.append(missing_blob)
+        for changed in ({"fingerprint": "SHA256:" + "A" * 43},
+                        {"host_key_blob": "AAAA"}, {"key_type": "ssh-rsa"},
+                        {"unexpected": True}):
+            invalid.append({**reply, **changed})
+        for value in invalid:
+            with self.subTest(value=value):
+                with patch.object(update.urllib.request, "urlopen", return_value=_Response(
+                        json.dumps(value).encode("ascii"), "application/json")):
+                    with self.assertRaisesRegex(update.UpdateFailure, "browser SSH route reply invalid"):
+                        update.browser_ssh_route_health()
 
 
 if __name__ == "__main__":
