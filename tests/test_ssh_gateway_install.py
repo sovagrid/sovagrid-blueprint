@@ -11,11 +11,14 @@ ROOT = Path(__file__).resolve().parents[1]
 class SSHGatewayInstall(unittest.TestCase):
     def test_installer_probes_real_ssh_route_before_claiming_success(self):
         source = (ROOT / "run.sh").read_text(encoding="utf-8")
-        probe = source.index("http://127.0.0.1:8766/api/v1/browser-ssh/host-key")
+        helper = (ROOT / "deploy/browser_ssh_probe.py").read_text(encoding="utf-8")
+        probe = source.index('python3 -B -I "$blueprint_dir/deploy/browser_ssh_probe.py"')
         marker = source.index("if [[ ! -e $ssh_gateway_marker ]]; then", probe)
         self.assertLess(probe, marker)
-        self.assertIn("'Origin': 'http://127.0.0.1:8766'", source[probe:marker])
-        self.assertIn("re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}'", source[probe:marker])
+        self.assertIn("http://127.0.0.1:8766/api/v1/browser-ssh/host-key", helper)
+        self.assertIn('"Origin": "http://127.0.0.1:8766"', helper)
+        self.assertIn('"host_key_blob"', helper)
+        self.assertIn("hashlib.sha256(key).digest()", helper)
         self.assertIn('"${compose[@]}" stop ssh-gateway', source[probe:marker])
         self.assertIn("SOVAGRID_SSH_GATEWAY_SNAPSHOT:-0", source)
         self.assertIn("managed SSH gateway requires /opt/sovagrid-src", source)

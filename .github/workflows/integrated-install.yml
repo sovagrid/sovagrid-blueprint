@@ -114,6 +114,13 @@ jobs:
           path = Path("/opt/sovagrid-src/sovagrid-bundle.json")
           print("SOVAGRID_EXPECTED_MANIFEST=" + hashlib.sha256(path.read_bytes()).hexdigest())
           PY
+      - name: Verify the pinned Web Gateway and installer SSH key reply contract
+        env:
+          SOVAGRID_CURRENT_WEB_SOURCE: ${{ github.workspace }}/sovagrid-web
+        run: |
+          npm --prefix sovagrid-web/gateway ci --omit=dev --omit=optional --ignore-scripts --no-audit --no-fund
+          cd sovagrid-blueprint
+          python3 -m unittest tests.test_browser_ssh_probe -v
       - name: Prepare a private SSH and systemd Ubuntu target
         run: |
           sudo -n apt-get update -qq

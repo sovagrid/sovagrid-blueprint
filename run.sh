@@ -971,45 +971,7 @@ socket.on("end", () => { clearTimeout(timer); try {
   fi
   # Container liveness is insufficient: the gateway must reach this host's
   # sshd through the fixed Docker bridge and the Web route must forward it.
-  if ! python3 - <<'PY'
-import json
-import re
-import time
-import urllib.request
-
-url = 'http://127.0.0.1:8766/api/v1/browser-ssh/host-key'
-request = urllib.request.Request(
-    url, data=b'{}', method='POST',
-    headers={'Content-Type': 'application/json', 'Origin': 'http://127.0.0.1:8766'})
-for attempt in range(5):
-    try:
-        with urllib.request.urlopen(request, timeout=12) as response:
-            if response.status != 200:
-                raise ValueError('unexpected response')
-            raw = response.read(513)
-        if len(raw) > 512:
-            raise ValueError('oversized response')
-        data = json.loads(raw)
-        if (not isinstance(data, dict) or set(data) != {'protocol', 'port', 'key_type', 'fingerprint'} or
-                data['protocol'] != 1 or type(data['port']) is not int or
-                not 1 <= data['port'] <= 65535 or
-                not isinstance(data['key_type'], str) or not data['key_type'] or
-                not isinstance(data['fingerprint'], str) or
-                re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', data['fingerprint']) is None):
-            raise ValueError('invalid host key response')
-        with urllib.request.urlopen('http://127.0.0.1:8766/sovagrid/monitoring/', timeout=5) as response:
-            if response.status != 200 or not response.headers.get('Content-Type', '').startswith('text/html'):
-                raise ValueError('panel route unavailable')
-            page = response.read(262145)
-        if len(page) > 262144 or b'id="sshLoginMode"' not in page or b'id="browserSshView"' not in page:
-            raise ValueError('SSH-first panel missing')
-        break
-    except (OSError, ValueError, UnicodeError):
-        if attempt == 4:
-            raise SystemExit('browser SSH route cannot reach the host SSH service')
-        time.sleep(1)
-PY
-  then
+  if ! python3 -B -I "$blueprint_dir/deploy/browser_ssh_probe.py"; then
     "${compose[@]}" stop ssh-gateway || true
     die 'SSH gateway cannot verify this host SSH service; check sshd ListenAddress and SOVAGRID_HOST_SSH_PORT'
   fi
