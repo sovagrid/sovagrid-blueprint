@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -178,30 +179,82 @@ def save_status(state: str, *, policy: dict | None = None, detail: str = "") -> 
     atomic_private(STATUS, json_bytes(record))
 
 
-def arm(archive: str, current: str) -> None:
+def _signed_layout_module():
+    helper = Path(__file__).with_name("release_feed.py")
+    try:
+        info = helper.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != ROOT_UID or
+                info.st_nlink != 1 or info.st_mode & 0o022):
+            raise Refused("UNSAFE_WORKER")
+        sys.dont_write_bytecode = True
+        spec = importlib.util.spec_from_file_location("sovagrid_signed_arm_layout", helper)
+        if spec is None or spec.loader is None:
+            raise Refused("UNSAFE_WORKER")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except OSError as error:
+        raise Refused("UNSAFE_WORKER") from error
+
+
+@contextlib.contextmanager
+def signed_layout_guard(layout: str | None):
+    """Optional feed admission under the already-held policy lock.
+
+    Legacy SSH arm keeps its existing contract. Feed arm additionally pins the
+    backend and serializes its final preflight/write with host installation.
+    """
+    if layout is None:
+        yield
+        return
+    if layout != "full":
+        raise Refused("STATE_CHANGED")
+    module = _signed_layout_module()
+    try:
+        with module.layout_guard(layout):
+            yield
+    except Exception as error:
+        if type(error).__name__ == "Refused" and not isinstance(error, Refused):
+            raise Refused(str(error)) from error
+        raise
+
+
+def arm(archive: str, current: str, *, layout: str | None = None) -> None:
     archive, current = digest(archive), digest(current)
     with exclusive():
-        previous = load_policy()
-        # A timer may not have run since a policy expired. In particular,
-        # reporting ALREADY_ARMED for an expired identical pin would promise
-        # the GUI a live approval that no longer exists.
-        if previous is not None and previous["expires_at"] <= int(time.time()):
-            remove_policy()
-            save_status("expired", policy=previous)
-            previous = None
-        if previous is not None:
-            if (previous["archive_sha256"], previous["expected_current_manifest"]) == (archive, current):
-                print("SG_AUTO_UPDATE:ALREADY_ARMED")
-                return
-            raise Refused("ALREADY_ARMED")
-        result = worker("preflight", archive, current)
-        if result.returncode != 0 or "SG_UPDATE_PREFLIGHT:OK" not in result.stdout.splitlines():
-            raise Refused("PREFLIGHT_FAILED")
-        now = int(time.time())
-        policy = {"format": 1, "archive_sha256": archive,
-                  "expected_current_manifest": current,
-                  "created_at": now, "expires_at": now + POLICY_LIFETIME}
-        atomic_private(POLICY, json_bytes(policy))
+        created_policy = None
+        try:
+            with signed_layout_guard(layout):
+                previous = load_policy()
+                # A timer may not have run since a policy expired. In particular,
+                # reporting ALREADY_ARMED for an expired identical pin would promise
+                # the GUI a live approval that no longer exists.
+                if previous is not None and previous["expires_at"] <= int(time.time()):
+                    remove_policy()
+                    save_status("expired", policy=previous)
+                    previous = None
+                if previous is not None:
+                    if (previous["archive_sha256"], previous["expected_current_manifest"]) == (archive, current):
+                        print("SG_AUTO_UPDATE:ALREADY_ARMED")
+                        return
+                    raise Refused("ALREADY_ARMED")
+                result = worker("preflight", archive, current)
+                if result.returncode != 0 or "SG_UPDATE_PREFLIGHT:OK" not in result.stdout.splitlines():
+                    raise Refused("PREFLIGHT_FAILED")
+                now = int(time.time())
+                policy = {"format": 1, "archive_sha256": archive,
+                          "expected_current_manifest": current,
+                          "created_at": now, "expires_at": now + POLICY_LIFETIME}
+                created_policy = policy
+                atomic_private(POLICY, json_bytes(policy))
+        except Exception:
+            # A final layout recheck can fail while leaving admission. Revoke
+            # only the exact new approval, preserving any external replacement.
+            if created_policy is not None:
+                with contextlib.suppress(Refused):
+                    if load_policy() == created_policy:
+                        remove_policy()
+            raise
         try:
             subprocess.run(["systemctl", "enable", "--now", TIMER],
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -272,6 +325,8 @@ def main(args: list[str]) -> int:
     try:
         if len(args) == 3 and args[0] == "arm":
             arm(args[1], args[2])
+        elif len(args) == 5 and args[0] == "arm" and args[3] == "--layout":
+            arm(args[1], args[2], layout=args[4])
         elif args == ["disarm"]:
             disarm()
         elif args == ["run"]:

@@ -3,15 +3,8 @@
 # Additional author attribution terms: see ATTRIBUTION.md.
 name: Promoted local operations and CAS on disposable Ubuntu VM
 
+# Expensive disposable-VM checks are selected explicitly for a combined release.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'deploy/promote_agent_only.py'
-      - 'deploy/local_operations.py'
-      - 'deploy/hub_only_update.py'
-      - 'tests/local_operations_vm.py'
-      - '.github/workflows/local-operations-vm.yml'
   workflow_dispatch:
 
 permissions:

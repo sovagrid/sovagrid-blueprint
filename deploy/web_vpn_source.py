@@ -28,7 +28,7 @@ SHA = re.compile(r"[0-9a-f]{64}\Z")
 STAGE_PATH = re.compile(r"/var/tmp/sovagrid-agent-enroll\.[A-Za-z0-9_-]{8,32}\Z")
 ERRORS = frozenset({"ROOT_REQUIRED", "INVALID_REQUEST", "SOURCE_UNTRUSTED",
     "SOURCE_CHANGED", "STATE_CONFLICT", "OWNERSHIP_CONFLICT", "RECOVERY_REQUIRED",
-    "STALE_PREVIEW", "CONTROL_ACTIVE", "BUSY", "OPERATION_FAILED",
+    "STALE_PREVIEW", "CONTROL_ACTIVE", "BUSY", "OPERATION_FAILED", "INSUFFICIENT_SPACE", "RESTORE_RECOVERY",
     "INTERNAL_ERROR", "SSH_UNAVAILABLE", "STAGE_CLEANUP_REQUIRED",
     "APPLY_UNCERTAIN", "RECOVERY_UNCERTAIN"})
 PUBLIC_ERRORS = ERRORS | {"HOST_KEY_CHANGED"}
@@ -191,6 +191,10 @@ class VpnSourceJobs:
             if action == "preview":
                 keys = {"protocol", "change", "source_manifest_sha256", "candidate_sha256",
                         "installed_sha256", "state_sha256", "cleanup_required", "expected"}
+                if "maintenance_required" in result:
+                    if result["maintenance_required"] is not True or result["change"] != "update":
+                        raise ValueError
+                    keys.add("maintenance_required")
                 if (set(result) != keys or result["change"] not in ("install", "update", "current") or
                         type(result["cleanup_required"]) is not bool or
                         type(result["expected"]) is not dict or
@@ -221,8 +225,10 @@ class VpnSourceJobs:
             raise VpnSourceError(_uncertain(action)) from None
 
     def execute(self, action: str, *, options, fingerprint: str, credential,
-                expected: dict | None = None) -> dict:
-        if action not in ("preview", "apply", "recover"):
+                expected: dict | None = None, maintenance: bool = False,
+                recheck_admin=lambda: None) -> dict:
+        if (action not in ("preview", "apply", "recover") or type(maintenance) is not bool or
+                maintenance and action != "apply"):
             raise VpnSourceError("INVALID_REQUEST")
         if action == "apply" and (type(expected) is not dict or
                 set(expected) != {"source_manifest_sha256", "candidate_sha256",
@@ -274,10 +280,15 @@ class VpnSourceJobs:
                                      ",run_name='__main__')")
                         payload = {"protocol": 1, "action": action,
                                    "source_manifest_sha256": stage.source_manifest_sha256}
+                        if action in ("apply", "recover"):
+                            recheck_admin()
                         if action == "apply":
                             payload["expected"] = expected
+                            if maintenance:
+                                payload["maintenance"] = True
                         try:
-                            raw, status = rpc._exchange(bootstrap, (_canonical(payload),), 180)
+                            raw, status = rpc._exchange(bootstrap, (_canonical(payload),),
+                                420 if action in ("apply", "recover") else 180)
                         except RPCError:
                             raise VpnSourceError(_uncertain(action)) from None
                         result = self._response(raw, status, action)

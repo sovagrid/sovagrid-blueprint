@@ -37,6 +37,12 @@ LOCK = Path("/var/lib/sovagrid/.release-feed.lock")
 CANDIDATES = Path("/opt/sovagrid-candidates")
 WORKER = Path(__file__).with_name("remote_update_worker.py")
 AUTO_UPDATE = Path(__file__).with_name("auto_update.py")
+HUB_ONLY_WORKER = Path(__file__).with_name("hub_only_update.py")
+HUB_ONLY_AUTO_UPDATE = Path(__file__).with_name("hub_only_auto_update.py")
+INSTALLATION_LOCK = Path("/run/sovagrid-installation.lock")
+PROMOTION_LOCK = Path("/run/sovagrid-promotion.lock")
+RESTORE_FENCE = Path("/var/lib/.sovagrid-host-restore-in-progress")
+LAYOUTS = frozenset({"full", "hub_only"})
 
 # The corresponding signing key is kept off servers, outside Git and CI.
 # A server still requires an explicit opt-in and a valid signed stable feed.
@@ -201,10 +207,15 @@ def configuration(raw: bytes | None = None, *, require_trust: bool = True) -> di
     if raw is None:
         raw = _private_file(CONFIG, limit=4096)
     value = _json(raw or b"")
-    if (not isinstance(value, dict) or set(value) != {"format", "channel", "enabled", "key_id"} or
+    if (not isinstance(value, dict) or set(value) not in (
+            {"format", "channel", "enabled", "key_id"},
+            {"format", "channel", "enabled", "key_id", "layout"}) or
             type(value["format"]) is not int or value["format"] != 1 or
             value["channel"] != "stable" or value["enabled"] is not True or
             not isinstance(value["key_id"], str) or KEY_ID.fullmatch(value["key_id"]) is None):
+        raise Refused("INVALID_CONFIG")
+    value = {**value, "layout": value.get("layout", "full")}
+    if not isinstance(value["layout"], str) or value["layout"] not in LAYOUTS:
         raise Refused("INVALID_CONFIG")
     if require_trust:
         if value["key_id"] not in TRUST_ANCHORS:
@@ -487,27 +498,130 @@ def unpack_archive(archive: Path, source: Path, target_manifest_sha256: str) -> 
         raise Refused("UNSAFE_ARCHIVE") from exc
 
 
-def _worker(*args: str) -> subprocess.CompletedProcess[str]:
+def _layout_observation() -> dict:
+    """Bound layout identity into CAS without changing the closed status wire format.
+
+    A promotion footprint is never treated as a full server. The existing
+    Hub-only worker independently verifies activation, source, local identity,
+    external Agent and transports before any network fetch or candidate use.
+    """
+    records = {}
+    present = False
+    unsafe = False
+    for path in (PROMOTION_STATE_DIR, *HUB_ONLY_ARTIFACTS, HUB_ONLY_MANUAL_POLICY):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            records[str(path)] = None
+            continue
+        except OSError:
+            records[str(path)] = "unreadable"
+            unsafe = True
+            present = True
+            continue
+        present = True
+        records[str(path)] = {"mode": info.st_mode, "uid": info.st_uid, "gid": info.st_gid,
+                              "inode": info.st_ino, "device": info.st_dev, "mtime_ns": info.st_mtime_ns}
+        if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            unsafe = True
+    chosen = "full" if not present else "hub_only"
+    if present:
+        try:
+            _directory(PROMOTION_STATE_DIR, exact_mode=0o700)
+            for name in ("baseline.json", "bundle-pin.json", "local-agent.json"):
+                raw = _private_file(PROMOTION_STATE_DIR / name, limit=32768)
+                value = _json(raw or b"")
+                if not isinstance(value, dict):
+                    raise Refused("HUB_ONLY_UNSUPPORTED")
+                records[name] = _digest(raw)
+        except Refused:
+            unsafe = True
+    fence = RESTORE_FENCE.exists() or RESTORE_FENCE.is_symlink()
+    return {"layout": "unsupported" if unsafe or fence else chosen,
+            "footprints": records, "restore_pending": fence}
+
+
+def _require_layout(expected: str | None = None) -> str:
+    observed = _layout_observation()["layout"]
+    if observed not in LAYOUTS:
+        raise Refused("HUB_ONLY_UNSUPPORTED")
+    if expected is not None and (expected not in LAYOUTS or observed != expected):
+        raise Refused("STATE_CHANGED")
+    return observed
+
+
+@contextlib.contextmanager
+def layout_guard(expected: str, *, candidate: bool = False):
+    """Never acquire a policy lock here; callers arm only after releasing this.
+
+    One-candidate timers enter this after their policy lock, yielding the common
+    policy -> installation -> promotion -> candidate order without a cycle.
+    """
+    if expected not in LAYOUTS:
+        raise Refused("STATE_CHANGED")
+    with contextlib.ExitStack() as resources:
+        paths = [INSTALLATION_LOCK, PROMOTION_LOCK]
+        if candidate:
+            _directory(CANDIDATES, exact_mode=0o700)
+            paths.append(CANDIDATES / ".lock")
+        for path in paths:
+            _directory(path.parent)
+            try:
+                descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            except OSError as error:
+                raise Refused("UNSAFE_LOCK") from error
+            resources.callback(os.close, descriptor)
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != ROOT_UID or
+                    stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+                raise Refused("UNSAFE_LOCK")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Refused("BUSY") from None
+            try:
+                current = path.lstat()
+            except OSError as error:
+                raise Refused("UNSAFE_LOCK") from error
+            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                raise Refused("UNSAFE_LOCK")
+        _require_layout(expected)
+        yield
+        _require_layout(expected)
+
+
+def _worker(*args: str, layout: str = "full") -> subprocess.CompletedProcess[str]:
+    if layout not in LAYOUTS:
+        raise Refused("STATE_CHANGED")
+    worker_path = HUB_ONLY_WORKER if layout == "hub_only" else WORKER
     try:
-        info = WORKER.lstat()
+        info = worker_path.lstat()
     except OSError as exc:
         raise Refused("UNSAFE_WORKER") from exc
     if not stat.S_ISREG(info.st_mode) or info.st_uid != ROOT_UID or info.st_mode & 0o022:
         raise Refused("UNSAFE_WORKER")
     try:
-        return subprocess.run([sys.executable, "-I", str(WORKER), *args],
+        return subprocess.run([sys.executable, "-I", str(worker_path), *args],
                               stdin=subprocess.DEVNULL, capture_output=True, text=True,
                               errors="replace", timeout=120, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         raise Refused("WORKER_UNAVAILABLE") from exc
 
 
-def current_manifest() -> str:
-    result = _worker("preview")
-    matches = [line.removeprefix("SG_CURRENT_MANIFEST:") for line in result.stdout.splitlines()
-               if line.startswith("SG_CURRENT_MANIFEST:")]
-    if result.returncode != 0 or len(matches) != 1 or "SG_VERSION_PREFLIGHT:OK" not in result.stdout.splitlines():
-        raise Refused("CURRENT_VERSION_UNAVAILABLE")
+def _layout_worker(layout: str, *args: str):
+    # Preserve the original full-worker call shape for installed integrations.
+    return _worker(*args) if layout == "full" else _worker(*args, layout=layout)
+
+
+def current_manifest(layout: str | None = None) -> str:
+    selected = _require_layout(layout)
+    result = _layout_worker(selected, "preview")
+    prefix = "SG_HUB_ONLY_CURRENT_MANIFEST:" if selected == "hub_only" else "SG_CURRENT_MANIFEST:"
+    success = "SG_HUB_ONLY_PREFLIGHT:OK" if selected == "hub_only" else "SG_VERSION_PREFLIGHT:OK"
+    matches = [line.removeprefix(prefix) for line in result.stdout.splitlines() if line.startswith(prefix)]
+    if result.returncode != 0 or len(matches) != 1 or success not in result.stdout.splitlines():
+        raise Refused("HUB_ONLY_UNSUPPORTED" if selected == "hub_only" else "CURRENT_VERSION_UNAVAILABLE")
+    _require_layout(selected)
     return sha(matches[0])
 
 
@@ -517,17 +631,28 @@ def existing_policy() -> bool:
                for policy in (MANUAL_POLICY, HUB_ONLY_MANUAL_POLICY))
 
 
-def stage_candidate(release: dict, current: str) -> None:
+def stage_candidate(release: dict, current: str, *, layout: str | None = None) -> None:
+    selected = _require_layout(layout)
+    with layout_guard(selected, candidate=True):
+        _stage_candidate(release, current, selected)
+
+
+def _stage_candidate(release: dict, current: str, layout: str) -> None:
     _directory(CANDIDATES, exact_mode=0o700)
+    success = "SG_HUB_ONLY_CANDIDATE:OK" if layout == "hub_only" else "SG_UPDATE_PREFLIGHT:OK"
+    if existing_policy():
+        raise Refused("ONE_CANDIDATE_ACTIVE")
     target = CANDIDATES / release["archive_sha256"]
     if target.exists() or target.is_symlink():
-        result = _worker("preflight", release["archive_sha256"], current)
-        if result.returncode != 0 or "SG_UPDATE_PREFLIGHT:OK" not in result.stdout.splitlines():
+        result = _layout_worker(layout, "preflight", release["archive_sha256"], current)
+        if result.returncode != 0 or success not in result.stdout.splitlines():
             raise Refused("EXISTING_CANDIDATE_INVALID")
         _directory(target, exact_mode=0o700)
         if hashlib.sha256((target / "source/sovagrid-bundle.json").read_bytes()).hexdigest() != release["to_manifest_sha256"]:
             raise Refused("TARGET_MANIFEST_MISMATCH")
         return
+    if current_manifest(layout) != current:
+        raise Refused("STATE_CHANGED")
     temporary = Path(tempfile.mkdtemp(prefix=".feed-stage-", dir=CANDIDATES))
     try:
         os.chmod(temporary, 0o700)
@@ -541,31 +666,37 @@ def stage_candidate(release: dict, current: str) -> None:
             output.flush()
             os.fsync(output.fileno())
         _fsync_dir(temporary)
+        _require_layout(layout)
         os.rename(temporary, target)
         _fsync_dir(CANDIDATES)
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
-    result = _worker("preflight", release["archive_sha256"], current)
-    if result.returncode != 0 or "SG_UPDATE_PREFLIGHT:OK" not in result.stdout.splitlines():
+    result = _layout_worker(layout, "preflight", release["archive_sha256"], current)
+    if result.returncode != 0 or success not in result.stdout.splitlines():
         raise Refused("PREFLIGHT_FAILED")
 
 
-def arm_candidate(release: dict, current: str) -> None:
+def arm_candidate(release: dict, current: str, *, layout: str | None = None) -> None:
+    selected = _require_layout(layout)
+    automatic = HUB_ONLY_AUTO_UPDATE if selected == "hub_only" else AUTO_UPDATE
+    marker = "SG_HUB_ONLY_AUTO_UPDATE:ARMED" if selected == "hub_only" else "SG_AUTO_UPDATE:ARMED"
     try:
-        info = AUTO_UPDATE.lstat()
+        info = automatic.lstat()
     except OSError as exc:
         raise Refused("UNSAFE_AUTO_UPDATE") from exc
     if not stat.S_ISREG(info.st_mode) or info.st_uid != ROOT_UID or info.st_mode & 0o022:
         raise Refused("UNSAFE_AUTO_UPDATE")
+    # No installation/promotion lock is held across this subprocess. The arm
+    # helper acquires policy first, then rechecks --layout under those locks.
     try:
-        result = subprocess.run([sys.executable, "-I", str(AUTO_UPDATE), "arm",
-                                 release["archive_sha256"], current],
+        result = subprocess.run([sys.executable, "-I", str(automatic), "arm",
+                                 release["archive_sha256"], current, "--layout", selected],
                                 stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                 errors="replace", timeout=180, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         raise Refused("AUTO_UPDATE_UNAVAILABLE") from exc
-    if result.returncode != 0 or "SG_AUTO_UPDATE:ARMED" not in result.stdout.splitlines():
+    if result.returncode != 0 or marker not in result.stdout.splitlines():
         raise Refused("AUTO_UPDATE_REFUSED")
 
 
@@ -654,15 +785,18 @@ def _snapshot() -> dict:
     manual_bytes = {str(path): _private_file(path, optional=True, limit=4096)
                     for path in (MANUAL_POLICY, HUB_ONLY_MANUAL_POLICY)}
     manifest_bytes = _root_owned_file(INSTALLED_MANIFEST, limit=512 * 1024)
+    layout = _layout_observation()
     anchors = {key_id: hashlib.sha256(ED25519_SPKI_PREFIX + key).hexdigest()
                for key_id, key in sorted(TRUST_ANCHORS.items()) if isinstance(key, bytes) and len(key) == 32}
+    if layout["layout"] not in LAYOUTS or (config and config["layout"] != layout["layout"]):
+        anchors = {}
     report = {"format": 1, "channel": "stable", "enabled": config is not None,
               "key_id": config["key_id"] if config else None,
               "available_keys": anchors, "timer_installed": timer_installed,
               "timer_enabled": timer_enabled, "timer_active": timer_active,
               "manual_candidate_active": any(raw is not None for raw in manual_bytes.values()),
               "installed_manifest_sha256": _digest(manifest_bytes), "ledger": ledger}
-    revision_input = {**report, "config_sha256": _digest(config_bytes),
+    revision_input = {**report, "layout_state": layout, "config_sha256": _digest(config_bytes),
                       "ledger_sha256": _digest(ledger_bytes),
                       "marker_sha256": _digest(marker_bytes),
                       "manual_policy_sha256": {name: _digest(raw) for name, raw in manual_bytes.items()},
@@ -687,25 +821,15 @@ def _check_expected_state(expected_state: str | None) -> None:
 
 
 def _require_full_server() -> None:
-    """The signed feed currently arms only the full-server update worker.
-
-    A Hub-only installation keeps an independent external Agent and reverse tunnel.
-    Even a partial or unsafe promotion footprint must block full updates.
-    """
-    for path in (PROMOTION_STATE_DIR, *HUB_ONLY_ARTIFACTS, HUB_ONLY_MANUAL_POLICY):
-        try:
-            path.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise Refused("HUB_ONLY_UNSUPPORTED") from exc
+    # Kept for older internal callers; never reinterpret promotion as full.
+    if _require_layout() != "full":
         raise Refused("HUB_ONLY_UNSUPPORTED")
 
 
 def enable(key_id: str | None = None, *, expected_state: str | None = None) -> None:
     """Verify the live feed before creating an opt-in config or starting a timer."""
     with exclusive():
-        _require_full_server()
+        selected = _require_layout()
         _check_expected_state(expected_state)
         available = {key for key, public in TRUST_ANCHORS.items()
                      if isinstance(public, bytes) and len(public) == 32}
@@ -713,21 +837,29 @@ def enable(key_id: str | None = None, *, expected_state: str | None = None) -> N
             key_id = next(iter(available))
         if key_id not in available or not isinstance(key_id, str) or KEY_ID.fullmatch(key_id) is None:
             raise Refused("UNCONFIGURED_TRUST")
-        if not _managed_units_installed():
-            raise Refused("TIMER_NOT_INSTALLED")
         existing = _private_file(CONFIG, optional=True, limit=4096)
         if existing is not None and configuration()["key_id"] != key_id:
             raise Refused("ALREADY_ENABLED_WITH_OTHER_KEY")
+        if existing is not None and configuration()["layout"] != selected:
+            raise Refused("STATE_CHANGED")
+        if not _managed_units_installed():
+            raise Refused("TIMER_NOT_INSTALLED")
+        with layout_guard(selected):
+            current = current_manifest(selected)
         ledger = state()
         raw = fetch_small(FEED_URL, FEED_HOSTS, MAX_FEED)
         signature = fetch_small(FEED_URL + ".sig", FEED_HOSTS, 64)
         manifest = validate_manifest(raw, signature, key_id, ledger)
-        select_release(manifest, current_manifest(), ledger)
-        _require_full_server()
-        _atomic_private(STATE, {**ledger, "highest_issued_at": manifest["issued_at"],
-                                "last_seen_at": int(time.time())})
-        config = {"format": 1, "channel": "stable", "enabled": True, "key_id": key_id}
-        _atomic_private(CONFIG, config)
+        select_release(manifest, current, ledger)
+        with layout_guard(selected):
+            _check_expected_state(expected_state)
+            if current_manifest(selected) != current:
+                raise Refused("STATE_CHANGED")
+            _atomic_private(STATE, {**ledger, "highest_issued_at": manifest["issued_at"],
+                                    "last_seen_at": int(time.time())})
+            config = {"format": 1, "channel": "stable", "enabled": True,
+                      "key_id": key_id, "layout": selected}
+            _atomic_private(CONFIG, config)
         try:
             result = _systemctl("enable", "--now", TIMER)
             if result.returncode != 0 or _systemctl("is-active", "--quiet", TIMER).returncode != 0:
@@ -759,25 +891,30 @@ def disable(*, expected_state: str | None = None) -> None:
 
 def poll() -> None:
     with exclusive():
-        _require_full_server()
+        selected = _require_layout()
         config = configuration()
+        _require_layout(config["layout"])
         if existing_policy():
             print("SG_RELEASE_FEED:ONE_CANDIDATE_ACTIVE")
             return
+        with layout_guard(selected):
+            current = current_manifest(selected)
         ledger = state()
         raw = fetch_small(FEED_URL, FEED_HOSTS, MAX_FEED)
         signature = fetch_small(FEED_URL + ".sig", FEED_HOSTS, 64)
         manifest = validate_manifest(raw, signature, config["key_id"], ledger)
-        current = current_manifest()
         release = select_release(manifest, current, ledger)
-        _require_full_server()
+        _require_layout(selected)
         if release is None:
             _atomic_private(STATE, {**ledger, "highest_issued_at": manifest["issued_at"],
                                     "last_seen_at": int(time.time())})
             print("SG_RELEASE_FEED:CURRENT")
             return
-        stage_candidate(release, current)
-        _require_full_server()
+        if selected == "full":
+            stage_candidate(release, current)
+        else:
+            stage_candidate(release, current, layout=selected)
+        _require_layout(selected)
         # Consume the sequence durably before allowing the existing timer to
         # act. A crash or failed arm can require operator review, but cannot
         # leave an armed unattended update without its anti-replay record.
@@ -785,7 +922,10 @@ def poll() -> None:
                                 "highest_version": release["version"],
                                 "highest_issued_at": manifest["issued_at"],
                                 "last_seen_at": int(time.time())})
-        arm_candidate(release, current)
+        if selected == "full":
+            arm_candidate(release, current)
+        else:
+            arm_candidate(release, current, layout=selected)
         print("SG_RELEASE_FEED:ARMED:" + release["version"])
 
 

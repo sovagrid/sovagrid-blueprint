@@ -785,6 +785,16 @@ def clean_plan(identity: str) -> dict:
         conflicts += int(present)
         unsafe += int(unsafe_path)
     identity_conflicts = _identity_conflicts(result["identities"])
+    # Top-level namespace scans cannot see type-wide/dash-prefix overrides or
+    # another target's wants/requires links. Inspect every standard unit path.
+    services = _sibling("portable_restore_apply.py", "_sovagrid_restore_unit_preflight")
+    try:
+        for source in sources:
+            if source.path.startswith("/etc/systemd/system/"):
+                services.Services(backup.ROOT, {}, uid=backup.ROOT_UID,
+                                  gid=backup.ROOT_GID).audit(Path(source.path).name)
+    except services.Refused:
+        unsafe += 1
     blockers = ["APPLY_NOT_IMPLEMENTED", "DOCKER_IMAGES_NOT_INCLUDED"]
     if conflicts:
         blockers.append("TARGET_STATE_PRESENT")
@@ -1298,7 +1308,7 @@ def _stage_tree_digest(path: Path, *, deadline: float) -> str:
     return digest.hexdigest()
 
 
-def stage_status(identity: str) -> dict:
+def stage_status(identity: str, *, _root_fd: int | None = None) -> dict:
     """Recheck the private tree and the original archive without changing it."""
     _require_root()
     identity = _id(identity)
@@ -1306,7 +1316,8 @@ def stage_status(identity: str) -> dict:
     if not present or unsafe:
         raise Refused("UNSAFE_STAGE")
     try:
-        root_fd = backup._safe_open(STAGING, directory=True)
+        root_fd = (backup._safe_open(STAGING, directory=True) if _root_fd is None
+                   else os.dup(_root_fd))
     except FileNotFoundError as exc:
         raise Refused("STAGE_NOT_FOUND") from exc
     try:
@@ -1314,10 +1325,11 @@ def stage_status(identity: str) -> dict:
         if (root_info.st_uid, root_info.st_gid, stat.S_IMODE(root_info.st_mode)) != (
                 backup.ROOT_UID, backup.ROOT_GID, 0o700):
             raise Refused("UNSAFE_STAGE")
-        try:
-            fcntl.flock(root_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise Refused("BUSY") from exc
+        if _root_fd is None:
+            try:
+                fcntl.flock(root_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise Refused("BUSY") from exc
         try:
             stage_fd = os.open(identity, os.O_RDONLY | os.O_DIRECTORY |
                                os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
@@ -1607,20 +1619,23 @@ def _verify_staged_units(identity: str, receipt: dict) -> list[str]:
     return sorted(units)
 
 
-def portable_stage_status(identity: str) -> dict:
+def portable_stage_status(identity: str, *, _root_fd: int | None = None) -> dict:
     """Recheck the sealed host tree and exact image pair without applying it."""
     _require_root()
     identity = _id(identity)
-    stage_result = stage_status(identity)
+    stage_result = (stage_status(identity) if _root_fd is None else
+                    stage_status(identity, _root_fd=_root_fd))
     try:
-        root_fd = backup._safe_open(STAGING, directory=True)
+        root_fd = (backup._safe_open(STAGING, directory=True) if _root_fd is None
+                   else os.dup(_root_fd))
     except FileNotFoundError as exc:
         raise Refused("PORTABLE_STAGE_NOT_FOUND") from exc
     try:
-        try:
-            fcntl.flock(root_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise Refused("BUSY") from exc
+        if _root_fd is None:
+            try:
+                fcntl.flock(root_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise Refused("BUSY") from exc
         marker = _read_portable_marker(root_fd, identity)
     finally:
         os.close(root_fd)
@@ -1750,7 +1765,7 @@ def portable_stage(identity: str, expected_review_sha256: str) -> dict:
     return portable_stage_status(identity)
 
 
-def portable_apply_preview(identity: str) -> dict:
+def portable_apply_preview(identity: str, *, _root_fd: int | None = None) -> dict:
     """Recheck a sealed pair and fresh target state; issue an apply-phase CAS.
 
     There is deliberately no command that consumes this digest yet. It gives
@@ -1759,7 +1774,8 @@ def portable_apply_preview(identity: str) -> dict:
     """
     _require_root()
     identity = _id(identity)
-    staged = portable_stage_status(identity)
+    staged = (portable_stage_status(identity) if _root_fd is None else
+              portable_stage_status(identity, _root_fd=_root_fd))
     target = portable_clean_plan(identity)
     blockers = [code for code in target["blockers"]
                 if code != "APPLY_NOT_IMPLEMENTED"]
@@ -1803,18 +1819,38 @@ def portable_apply_preview(identity: str) -> dict:
             "blockers": ["APPLY_NOT_IMPLEMENTED", *bounded]}
 
 
+def _portable_transaction(command: str, identity: str, review: str | None = None) -> dict:
+    transaction = _sibling("portable_restore_apply.py", "_sovagrid_portable_restore_apply")
+    try:
+        if command == "portable-apply":
+            return transaction.apply_host(sys.modules[__name__], identity, review)
+        if command == "portable-apply-recover":
+            return transaction.recover_host(sys.modules[__name__], identity)
+        return transaction.host_status(sys.modules[__name__], identity)
+    except transaction.Refused as exc:
+        raise Refused(str(exc)) from None
+    except RuntimeError as exc:
+        # Sibling validators have distinct Refused classes. Preserve only
+        # their bounded machine codes, never a traceback/private path.
+        code = str(exc)
+        raise Refused(code if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) else
+                      "RESTORE_FAILED") from None
+
+
 def main(argv: list[str]) -> int:
     try:
         if ((len(argv) != 2 or argv[0] not in
              ("verify", "plan", "clean-plan", "portable-clean-plan",
               "stage", "stage-status", "portable-stage-status",
-              "portable-apply-preview")) and
-            (len(argv) != 3 or argv[0] != "portable-stage")):
+              "portable-apply-preview", "portable-apply-status", "portable-apply-recover")) and
+            (len(argv) != 3 or argv[0] not in ("portable-stage", "portable-apply"))):
             raise Refused("USAGE")
         result = (verify(argv[1]) if argv[0] == "verify" else
                   clean_plan(argv[1]) if argv[0] == "clean-plan" else
                   portable_clean_plan(argv[1]) if argv[0] == "portable-clean-plan" else
                   portable_stage(argv[1], argv[2]) if argv[0] == "portable-stage" else
+                  _portable_transaction(argv[0], argv[1], argv[2] if len(argv) == 3 else None)
+                  if argv[0] in ("portable-apply", "portable-apply-status", "portable-apply-recover") else
                   portable_apply_preview(argv[1]) if argv[0] == "portable-apply-preview" else
                   portable_stage_status(argv[1]) if argv[0] == "portable-stage-status" else
                   stage(argv[1]) if argv[0] == "stage" else

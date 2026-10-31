@@ -254,13 +254,15 @@ def dispatch(jobs: WebAgentJobs, request: object, *, authorize=_authorize,
     with _stable_public_web():
         return _dispatch_authorized(jobs, action, token, payload,
                                     vpn_source=vpn_source, wg_control=wg_control,
-                                    amnezia_provision=amnezia_provision)
+                                    amnezia_provision=amnezia_provision,
+                                    recheck_admin=lambda: authorize(token))
 
 
 def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: object,
                          *, vpn_source: VpnSourceJobs | None = None,
                          wg_control: WireguardControlJobs | None = None,
-                         amnezia_provision: AmneziaProvisionJobs | None = None) -> dict:
+                         amnezia_provision: AmneziaProvisionJobs | None = None,
+                         recheck_admin=lambda: None) -> dict:
     if action.startswith("amnezia-provision-"):
         try:
             if amnezia_provision is None:
@@ -304,13 +306,20 @@ def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: o
         try:
             if vpn_source is None:
                 raise RequestError("RUNTIME_UNAVAILABLE")
+            optional_maintenance = action == "vpn-source-apply" and "maintenance" in payload
+            if optional_maintenance and payload["maintenance"] is not True:
+                raise RequestError("INVALID_REQUEST")
             credential = _vpn_route_credential(payload, _LOGIN | (
-                {"expected"} if action == "vpn-source-apply" else set()))
+                {"expected"} | ({"maintenance"} if optional_maintenance else set())
+                if action == "vpn-source-apply" else set()))
             try:
                 options = _options(payload)
                 return vpn_source.execute(action.removeprefix("vpn-source-"), options=options,
                     fingerprint=payload["fingerprint"], credential=credential,
-                    expected=payload.get("expected"))
+                    expected=payload.get("expected"),
+                    **({"maintenance": True} if optional_maintenance else {}),
+                    **({"recheck_admin": recheck_admin} if action in
+                       ("vpn-source-apply", "vpn-source-recover") else {}))
             finally:
                 credential.wipe()
         finally:

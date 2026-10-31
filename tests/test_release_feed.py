@@ -33,6 +33,52 @@ FINAL = "c" * 64
 
 
 class SignedFeed(unittest.TestCase):
+    def test_incomplete_or_unsafe_hub_only_foundation_refuses_before_network(self) -> None:
+        cases = ("missing-baseline", "missing-pin", "missing-local", "world-readable", "symlink",
+                 "duplicate-json", "list-json", "restore-fence")
+        for case in cases:
+            with self.subTest(case=case):
+                self.hub_only_fixture()
+                feed.CONFIG.unlink(missing_ok=True)
+                selected = feed.PROMOTION_STATE_DIR / "baseline.json"
+                if case.startswith("missing-"):
+                    names = {"missing-baseline": "baseline.json", "missing-pin": "bundle-pin.json",
+                             "missing-local": "local-agent.json"}
+                    (feed.PROMOTION_STATE_DIR / names[case]).unlink()
+                elif case == "world-readable": selected.chmod(0o644)
+                elif case == "symlink":
+                    selected.unlink(); selected.symlink_to("bundle-pin.json")
+                elif case == "duplicate-json": selected.write_text('{"phase":1,"phase":2}')
+                elif case == "list-json": selected.write_text('[]')
+                elif case == "restore-fence": feed.RESTORE_FENCE.touch()
+                with mock.patch.object(feed, "fetch_small") as fetch, \
+                     mock.patch.object(feed, "stage_candidate") as stage, \
+                     mock.patch.object(feed, "_worker") as worker:
+                    with self.assertRaisesRegex(feed.Refused, "HUB_ONLY_UNSUPPORTED"):
+                        feed.enable("fixture-key")
+                fetch.assert_not_called(); stage.assert_not_called(); worker.assert_not_called()
+                shutil.rmtree(feed.PROMOTION_STATE_DIR)
+                feed.RESTORE_FENCE.unlink(missing_ok=True)
+
+    def test_hub_only_disappearing_during_signed_fetch_cannot_stage_or_arm(self) -> None:
+        self.hub_only_fixture()
+        config = {**feed.configuration(), "layout": "hub_only"}
+        feed.CONFIG.write_text(json.dumps(config)); feed.CONFIG.chmod(0o600)
+        raw, signature = self.sign()
+        def fetch(url, *_args):
+            if not url.endswith(".sig"):
+                shutil.rmtree(feed.PROMOTION_STATE_DIR)
+                return raw
+            return signature
+        with mock.patch.object(feed, "current_manifest", return_value=FROM), \
+             mock.patch.object(feed, "fetch_small", side_effect=fetch), \
+             mock.patch.object(feed, "stage_candidate") as stage, \
+             mock.patch.object(feed, "arm_candidate") as arm:
+            with self.assertRaisesRegex(feed.Refused, "STATE_CHANGED"):
+                feed.poll()
+        stage.assert_not_called(); arm.assert_not_called()
+        self.assertFalse(feed.STATE.exists())
+
     def test_archive_member_allows_systemd_template_but_rejects_traversal(self) -> None:
         template = tarfile.TarInfo("sovagrid-blueprint/deploy/sovagrid-external-agent-apply@.service")
         self.assertEqual(feed._member_name(template), template.name)
@@ -77,6 +123,9 @@ class SignedFeed(unittest.TestCase):
             mock.patch.object(feed, "MANUAL_POLICY", root / "auto-update.json"),
             mock.patch.object(feed, "HUB_ONLY_MANUAL_POLICY", root / "hub-only-auto-update.json"),
             mock.patch.object(feed, "PROMOTION_STATE_DIR", root / "promotion"),
+            mock.patch.object(feed, "INSTALLATION_LOCK", root / "installation.lock"),
+            mock.patch.object(feed, "PROMOTION_LOCK", root / "promotion.lock"),
+            mock.patch.object(feed, "RESTORE_FENCE", root / "restore-fence"),
             mock.patch.object(feed, "HUB_ONLY_ARTIFACTS", (root / "agent-local", root / "hub-only.service")),
         ]
         for patcher in patchers:
@@ -315,6 +364,127 @@ class SignedFeed(unittest.TestCase):
                 finally:
                     feed.PROMOTION_STATE_DIR.rmdir()
 
+    def hub_only_fixture(self):
+        feed.PROMOTION_STATE_DIR.mkdir(mode=0o700)
+        values = {"baseline.json": {"external": "fixture"},
+                  "bundle-pin.json": {"protocol": 1, "manifest_sha256": FROM},
+                  "local-agent.json": {"protocol": 1, "server_id": "11111111-1111-4111-8111-111111111111",
+                                       "token_sha256": "e" * 64, "commands": True}}
+        for name, value in values.items():
+            path = feed.PROMOTION_STATE_DIR / name
+            path.write_text(json.dumps(value)); path.chmod(0o600)
+
+    @staticmethod
+    def hub_preview():
+        return subprocess.CompletedProcess([], 0,
+            "SG_HUB_ONLY_CURRENT_MANIFEST:" + FROM + "\nSG_HUB_ONLY_PREFLIGHT:OK\n", "")
+
+    def test_supported_hub_only_feed_uses_its_backend_and_preserves_closed_status(self):
+        feed.CONFIG.unlink()
+        self.hub_only_fixture()
+        raw, signature = self.sign()
+        active = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(feed, "_systemctl", return_value=active), \
+             mock.patch.object(feed, "_managed_units_installed", return_value=True), \
+             mock.patch.object(feed, "fetch_small", side_effect=[raw, signature]), \
+             mock.patch.object(feed, "_worker", return_value=self.hub_preview()) as worker:
+            reviewed = feed._snapshot()
+            feed.enable("fixture-key", expected_state=reviewed["state_revision"])
+        self.assertEqual(feed.configuration()["layout"], "hub_only")
+        self.assertEqual(worker.call_args_list, [mock.call("preview", layout="hub_only")] * 2)
+        with mock.patch.object(feed, "_systemctl", return_value=active):
+            report = feed._snapshot()
+        self.assertEqual(set(report), {"format", "channel", "enabled", "key_id", "available_keys",
+            "timer_installed", "timer_enabled", "timer_active", "manual_candidate_active",
+            "installed_manifest_sha256", "ledger", "state_revision"})
+        with mock.patch.object(feed, "fetch_small", side_effect=[raw, signature]), \
+             mock.patch.object(feed, "_worker", return_value=self.hub_preview()), \
+             mock.patch.object(feed, "stage_candidate") as stage, \
+             mock.patch.object(feed, "arm_candidate") as arm:
+            feed.poll()
+        stage.assert_called_once_with(self.release, FROM, layout="hub_only")
+        arm.assert_called_once_with(self.release, FROM, layout="hub_only")
+        self.assertEqual(feed.state()["highest_sequence"], 1)
+        with mock.patch.object(feed, "fetch_small", side_effect=[raw, signature]), \
+             mock.patch.object(feed, "_worker", return_value=self.hub_preview()), \
+             mock.patch.object(feed, "arm_candidate") as arm:
+            with self.assertRaisesRegex(feed.Refused, "REPLAY_OR_DOWNGRADE"):
+                feed.poll()
+        arm.assert_not_called()
+
+    def test_legacy_full_config_never_opts_in_a_promoted_hub(self):
+        self.assertEqual(feed.configuration()["layout"], "full")
+        self.hub_only_fixture()
+        with mock.patch.object(feed, "fetch_small") as fetch, \
+             mock.patch.object(feed, "_worker") as worker:
+            with self.assertRaisesRegex(feed.Refused, "STATE_CHANGED"):
+                feed.poll()
+            with self.assertRaisesRegex(feed.Refused, "STATE_CHANGED"):
+                feed.enable("fixture-key")
+        fetch.assert_not_called(); worker.assert_not_called()
+        self.assertEqual(feed.configuration()["layout"], "full")
+        inactive = subprocess.CompletedProcess([], 1, "", "")
+        with mock.patch.object(feed, "_systemctl", return_value=inactive):
+            report = feed._snapshot()
+            self.assertEqual(report["available_keys"], {})
+            feed.disable(expected_state=report["state_revision"])
+        self.assertFalse(feed.CONFIG.exists())
+
+    def test_hub_only_worker_rejects_partial_runtime_before_any_fetch(self):
+        self.hub_only_fixture()
+        feed._atomic_private(feed.CONFIG, {"format": 1, "enabled": True, "channel": "stable",
+                                          "key_id": "fixture-key", "layout": "hub_only"})
+        with mock.patch.object(feed, "fetch_small") as fetch, \
+             mock.patch.object(feed, "_worker", return_value=subprocess.CompletedProcess(
+                 [], 40, "SG_HUB_ONLY_REFUSE:LOCAL_SERVICE\n", "")) as worker:
+            with self.assertRaisesRegex(feed.Refused, "HUB_ONLY_UNSUPPORTED"):
+                feed.poll()
+        fetch.assert_not_called()
+        worker.assert_called_once_with("preview", layout="hub_only")
+
+    def test_layout_and_promotion_identity_change_the_review_cas(self):
+        inactive = subprocess.CompletedProcess([], 1, "", "")
+        with mock.patch.object(feed, "_systemctl", return_value=inactive):
+            before = feed._snapshot()["state_revision"]
+            self.hub_only_fixture()
+            hub = feed._snapshot()["state_revision"]
+            self.assertNotEqual(before, hub)
+            baseline = feed.PROMOTION_STATE_DIR / "baseline.json"
+            baseline.write_text('{"external":"another-reviewed-agent"}')
+            after = feed._snapshot()["state_revision"]
+            self.assertNotEqual(hub, after)
+            with self.assertRaisesRegex(feed.Refused, "STATE_CHANGED"):
+                feed._check_expected_state(hub)
+
+    def test_hub_only_config_does_not_follow_a_layout_replacement(self):
+        self.hub_only_fixture()
+        feed._atomic_private(feed.CONFIG, {"format": 1, "enabled": True, "channel": "stable",
+                                          "key_id": "fixture-key", "layout": "hub_only"})
+        for path in feed.PROMOTION_STATE_DIR.iterdir(): path.unlink()
+        feed.PROMOTION_STATE_DIR.rmdir()
+        with mock.patch.object(feed, "fetch_small") as fetch:
+            with self.assertRaisesRegex(feed.Refused, "STATE_CHANGED"): feed.poll()
+        fetch.assert_not_called()
+
+    def test_hub_only_staging_and_arm_use_only_fixed_hub_helpers(self):
+        self.hub_only_fixture()
+        archive, target_sha = self.archive()
+        release = {**self.release, "archive_size": len(archive),
+                   "archive_sha256": hashlib.sha256(archive).hexdigest(), "to_manifest_sha256": target_sha}
+        feed.CANDIDATES.mkdir(mode=0o700)
+        with mock.patch.object(feed, "_open", side_effect=lambda *_: contextlib.nullcontext(io.BytesIO(archive))), \
+             mock.patch.object(feed, "_worker", side_effect=[self.hub_preview(),
+                 subprocess.CompletedProcess([], 0, "SG_HUB_ONLY_CANDIDATE:OK\n", "")]) as worker:
+            feed.stage_candidate(release, FROM, layout="hub_only")
+        self.assertEqual(worker.call_args_list, [mock.call("preview", layout="hub_only"),
+            mock.call("preflight", release["archive_sha256"], FROM, layout="hub_only")])
+        with mock.patch.object(feed.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, "SG_HUB_ONLY_AUTO_UPDATE:ARMED\n", "")) as run:
+            feed.arm_candidate(release, FROM, layout="hub_only")
+        args = run.call_args.args[0]
+        self.assertEqual(args[-4:], [release["archive_sha256"], FROM, "--layout", "hub_only"])
+        self.assertEqual(args[2], str(feed.HUB_ONLY_AUTO_UPDATE))
+
     def test_reviewed_cas_rejects_stale_and_malformed_state_before_mutation(self) -> None:
         feed.CONFIG.unlink()
         feed.SYSTEMD_UNITS.mkdir(mode=0o755)
@@ -540,6 +710,7 @@ class SignedFeed(unittest.TestCase):
             pass
 
         with mock.patch.object(feed, "_open", side_effect=lambda *_: contextlib.nullcontext(Response(archive))), \
+             mock.patch.object(feed, "current_manifest", return_value=FROM), \
              mock.patch.object(feed, "_worker", return_value=subprocess.CompletedProcess([], 0,
                               "SG_UPDATE_PREFLIGHT:OK\n", "")) as worker:
             old_umask = os.umask(0o077)

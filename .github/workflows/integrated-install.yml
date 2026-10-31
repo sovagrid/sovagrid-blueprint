@@ -6,6 +6,10 @@ name: Integrated server install
 on:
   workflow_dispatch:
     inputs:
+      blueprint_ref:
+        description: Exact Blueprint commit SHA (empty uses the selected workflow revision)
+        required: false
+        type: string
       hub_ref:
         description: Exact Hub commit SHA
         required: true
@@ -26,6 +30,11 @@ on:
         description: Exact Connect commit SHA for remote Agent enrollment
         required: true
         type: string
+      release_validation:
+        description: Also verify clean restore dependencies, full features and a signed idle update
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -33,7 +42,7 @@ permissions:
 jobs:
   install:
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 60
     steps:
       - name: Require a disposable GitHub-hosted Ubuntu runner
         run: |
@@ -46,6 +55,7 @@ jobs:
           sudo -n docker info >/dev/null
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.blueprint_ref || github.sha }}
           path: sovagrid-blueprint
           persist-credentials: false
       - uses: actions/checkout@v6
@@ -76,10 +86,14 @@ jobs:
         with:
           repository: sovagrid/sovagrid-connect
           ref: ${{ inputs.connect_ref }}
+          # The server runtime closure can pin an earlier Connect commit
+          # than the client-only archive URL/version update.
+          fetch-depth: 0
           path: sovagrid-connect
           persist-credentials: false
       - name: Verify exact component revisions and package one bundle
         env:
+          BLUEPRINT_REF: ${{ inputs.blueprint_ref || github.sha }}
           HUB_REF: ${{ inputs.hub_ref }}
           WEB_REF: ${{ inputs.web_ref }}
           AGENT_REF: ${{ inputs.agent_ref }}
@@ -91,7 +105,8 @@ jobs:
           from pathlib import Path
           import re
           import subprocess
-          for name, key in (("sovagrid-hub", "HUB_REF"),
+          for name, key in (("sovagrid-blueprint", "BLUEPRINT_REF"),
+                            ("sovagrid-hub", "HUB_REF"),
                             ("sovagrid-web", "WEB_REF"),
                             ("sovagrid-agent", "AGENT_REF"),
                             ("sovagrid-vpn", "VPN_REF"),
@@ -106,14 +121,35 @@ jobs:
           PY
           python3 sovagrid-blueprint/tools/sync_connect_vendor.py check --source sovagrid-connect
           python3 sovagrid-blueprint/package_server.py "$RUNNER_TEMP/SovaGrid-server-source.tar.gz"
-          sudo -n install -d -o root -g root -m 0755 /opt/sovagrid-src
-          sudo -n tar -xzf "$RUNNER_TEMP/SovaGrid-server-source.tar.gz" -C /opt/sovagrid-src
           python3 - <<'PY' >> "$GITHUB_ENV"
           import hashlib
+          import os
           from pathlib import Path
-          path = Path("/opt/sovagrid-src/sovagrid-bundle.json")
-          print("SOVAGRID_EXPECTED_MANIFEST=" + hashlib.sha256(path.read_bytes()).hexdigest())
+          import tarfile
+          path = Path(os.environ['RUNNER_TEMP']) / 'SovaGrid-server-source.tar.gz'
+          with tarfile.open(path, 'r:gz') as archive:
+              with archive.extractfile('sovagrid-bundle.json') as source:
+                  print("SOVAGRID_EXPECTED_MANIFEST=" + hashlib.sha256(source.read()).hexdigest())
           PY
+      - name: Verify restore dependencies without creating a SovaGrid installation
+        if: inputs.release_validation
+        run: |
+          sudo -n install -d -o root -g root -m 0700 /root/sovagrid-reviewed-dependencies
+          sudo -n tar -xzf "$RUNNER_TEMP/SovaGrid-server-source.tar.gz" \
+            -C /root/sovagrid-reviewed-dependencies --no-same-owner --same-permissions
+          sudo -n bash /root/sovagrid-reviewed-dependencies/sovagrid-blueprint/tests/restore_dependencies_vm.sh \
+            "$SOVAGRID_EXPECTED_MANIFEST"
+      - name: Verify VPN source maintenance and restart recovery with real systemd
+        if: inputs.release_validation
+        run: >-
+          sudo -n env SOVAGRID_DISPOSABLE_VM=1
+          python3 /root/sovagrid-reviewed-dependencies/sovagrid-blueprint/tests/vpn_source_maintenance_vm.py
+          /root/sovagrid-reviewed-dependencies
+      - name: Place the reviewed initial source on the disposable host
+        run: |
+          sudo -n install -d -o root -g root -m 0755 /opt/sovagrid-src
+          sudo -n tar -xzf "$RUNNER_TEMP/SovaGrid-server-source.tar.gz" \
+            -C /opt/sovagrid-src --no-same-owner --same-permissions
       - name: Verify the pinned Web Gateway and installer SSH key reply contract
         env:
           SOVAGRID_CURRENT_WEB_SOURCE: ${{ github.workspace }}/sovagrid-web
@@ -131,7 +167,23 @@ jobs:
             python3 sovagrid-blueprint/tests/integrated_remote_agent_vm.py \
             prepare "$RUNNER_TEMP/sovagrid-remote-ci"
       - name: Install the complete pinned source on the disposable Ubuntu host
-        run: sudo -n bash /opt/sovagrid-src/sovagrid-blueprint/run.sh
+        env:
+          RELEASE_VALIDATION: ${{ inputs.release_validation }}
+        run: |
+          options=()
+          if [[ $RELEASE_VALIDATION == true ]]; then
+            options+=(--with-terminal --with-files --with-wireguard --with-containers)
+          fi
+          sudo -n bash /opt/sovagrid-src/sovagrid-blueprint/run.sh "${options[@]}"
+      - name: Record the exact disposable installation before any verification writes
+        if: inputs.release_validation
+        run: >-
+          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
+          RUNNER_TEMP="$RUNNER_TEMP" GITHUB_RUN_ID="$GITHUB_RUN_ID"
+          SOVAGRID_PORTABLE_RESTORE_DISPOSABLE=1
+          SOVAGRID_RESTORE_EXPECTED_MANIFEST="$SOVAGRID_EXPECTED_MANIFEST"
+          python3 sovagrid-blueprint/tests/portable_restore_apply_vm.py record-fixture
       - name: Verify live Hub image pin, Agent and Web
         run: >-
           sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
@@ -147,14 +199,60 @@ jobs:
       - name: Enroll the second server through pinned Connect and verify continuing metrics
         env:
           CONNECT_REF: ${{ inputs.connect_ref }}
+          RESTORE_FIXTURE: ${{ inputs.release_validation && '1' || '0' }}
         run: >-
           sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
           RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
           RUNNER_TEMP="$RUNNER_TEMP" GITHUB_WORKSPACE="$GITHUB_WORKSPACE"
+          GITHUB_RUN_ID="$GITHUB_RUN_ID"
+          SOVAGRID_PORTABLE_RESTORE_DISPOSABLE="$RESTORE_FIXTURE"
           SOVAGRID_EXPECTED_MANIFEST="$SOVAGRID_EXPECTED_MANIFEST"
           CONNECT_REF="$CONNECT_REF"
           python3 sovagrid-blueprint/tests/integrated_remote_agent_vm.py
           verify "$RUNNER_TEMP/sovagrid-remote-ci"
+      - name: Prepare a committed next-source fixture without publishing a release
+        if: inputs.release_validation
+        run: |
+          next_root="$RUNNER_TEMP/sovagrid-signed-next"
+          mkdir -p "$next_root"
+          for name in sovagrid-blueprint sovagrid-hub sovagrid-web sovagrid-agent sovagrid-vpn; do
+            git clone --quiet --no-hardlinks "$GITHUB_WORKSPACE/$name" "$next_root/$name"
+          done
+          printf '\nDisposable signed-transition fixture.\n' >> "$next_root/sovagrid-blueprint/README.md"
+          git -C "$next_root/sovagrid-blueprint" add README.md
+          git -C "$next_root/sovagrid-blueprint" \
+            -c user.name='SovaGrid VM Fixture' -c user.email='vm-fixture@example.invalid' \
+            commit -m 'VM fixture: next source for signed idle update'
+          python3 "$next_root/sovagrid-blueprint/package_server.py" "$RUNNER_TEMP/sovagrid-signed-next.tar.gz"
+          python3 - "$RUNNER_TEMP/sovagrid-signed-next.tar.gz" <<'PY' >> "$GITHUB_ENV"
+          import hashlib, sys, tarfile
+          with tarfile.open(sys.argv[1], 'r:gz') as archive:
+              with archive.extractfile('sovagrid-bundle.json') as source:
+                  print('SOVAGRID_RESTORE_EXPECTED_MANIFEST=' + hashlib.sha256(source.read()).hexdigest())
+          PY
+          sudo -n install -d -o root -g root -m 0700 /root/sovagrid-signed-next
+          sudo -n install -o root -g root -m 0600 "$RUNNER_TEMP/sovagrid-signed-next.tar.gz" \
+            /root/sovagrid-signed-next/source.tar.gz
+      - name: Verify signed discovery, busy deferral and real automatic installation
+        if: inputs.release_validation
+        run: >-
+          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
+          GITHUB_RUN_ID="$GITHUB_RUN_ID"
+          SOVAGRID_PORTABLE_RESTORE_DISPOSABLE=1
+          SOVAGRID_RESTORE_EXPECTED_MANIFEST="$SOVAGRID_RESTORE_EXPECTED_MANIFEST"
+          SOVAGRID_SIGNED_TRANSITION_VM=1
+          python3 sovagrid-blueprint/tests/signed_feed_transition_vm.py
+          /root/sovagrid-signed-next/source.tar.gz
+      - name: Verify portable restore, interrupted recovery and preserved changed data
+        if: inputs.release_validation
+        run: >-
+          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
+          RUNNER_TEMP="$RUNNER_TEMP" GITHUB_RUN_ID="$GITHUB_RUN_ID"
+          SOVAGRID_PORTABLE_RESTORE_DISPOSABLE=1
+          SOVAGRID_RESTORE_EXPECTED_MANIFEST="$SOVAGRID_RESTORE_EXPECTED_MANIFEST"
+          python3 sovagrid-blueprint/tests/portable_restore_apply_vm.py
       - name: Remove disposable server and SSH identities
         if: always()
         run: >-

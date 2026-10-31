@@ -76,6 +76,25 @@ def machine_unit(name: str) -> str:
     return "sovagrid-ci-nspawn-" + name.removeprefix("sovagrid-ci-") + ".service"
 
 
+def portable_fixture(action, *args):
+    # Only the explicitly created install-time ledger opts this separate gate
+    # in. The creator passes its exact returned IDs, never a cleanup directory.
+    if not os.path.lexists("/var/lib/.sovagrid-portable-restore-ci-fixture.json"):
+        return
+    spec = importlib.util.spec_from_file_location("sovagrid_ci_portable_creator",
+        Path(__file__).with_name("portable_restore_apply_vm.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if action == "guest":
+        module.record_guest(*args)
+    elif action == "web-job":
+        fixture = module.fixture_module()
+        record = fixture.read(Path("/var/lib/sovagrid/web-agent/jobs") / (args[0] + ".json"))
+        fixture.optional_hook("web-job", args[0], record["bundle"]["path"])
+    else:
+        raise RuntimeError("Unknown portable fixture producer")
+
+
 def command(*argv: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(argv, capture_output=True, text=True, timeout=300, check=False)
     if check and result.returncode:
@@ -501,6 +520,7 @@ def start_web_target(state_dir: Path, state: dict) -> str:
     require(len(public) >= 2 and public[1] != state["known_lines"][1].split()[2],
             "Web Agent target reused the Connect target's host key")
     start_machine(name, WEB_PORT)
+    portable_fixture("guest", name, state)
     return COMPOSE_GATEWAY
 
 
@@ -553,6 +573,7 @@ def verify_web_agent(state_dir: Path, state: dict, host_id: str, connect_id: str
                 installed.get("registration_state") == "active" and
                 isinstance(web_id, str) and web_id not in (host_id, connect_id),
                 "Web Agent apply did not activate an independent server")
+        portable_fixture("web-job", job["request_id"])
         for unit in ("sovagrid-agent.service", "sovagrid-agent-tunnel.service"):
             require(machine_command(state["web_container"], "/usr/bin/systemctl",
                                     "is-active", "--quiet", unit, check=False).returncode == 0,

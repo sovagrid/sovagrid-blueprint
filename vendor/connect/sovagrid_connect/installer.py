@@ -97,7 +97,7 @@ _SERVER_TIMER_ACTIONS = frozenset({
     "SG_AUTO_UPDATE:ARMED", "SG_AUTO_UPDATE:ALREADY_ARMED", "SG_AUTO_UPDATE:DISABLED",
 })
 _REFUSALS = {
-    "SG_INSTALL_REFUSE:ROOT": "Для первой установки нужен SSH-вход под root.",
+    "SG_INSTALL_REFUSE:ROOT": "Нужен SSH-вход root или пользователь с правом sudo без запроса пароля. Пароль sudo приложение не запрашивает.",
     "SG_INSTALL_REFUSE:UBUNTU": "Первая установка сейчас поддерживает только Ubuntu.",
     "SG_INSTALL_REFUSE:EXISTING": (
         "На сервере уже есть SovaGrid или занято его место. Автоматическая первая установка "
@@ -138,15 +138,17 @@ _REFUSALS = {
     ),
     "SG_UPDATE_REFUSE:CANDIDATE": "Подготовленный пакет или его содержимое изменились; подготовьте пакет заново.",
     "SG_UPDATE_REFUSE:HASH": "SHA-256 подготовленного пакета не совпал; обновление не началось.",
-    "SG_UPDATE_REFUSE:HOST": "Обновление поддерживается только для Ubuntu с входом root.",
+    "SG_UPDATE_REFUSE:HOST": "Обновление поддерживается только для Ubuntu с root/sudo SSH-доступом.",
     "SG_UPDATE_REFUSE:ACTIVE": "Активная установка не имеет проверенного манифеста или признаков управления run.sh.",
+    "SG_UPDATE_REFUSE:RESTORE_RECOVERY": "На сервере не завершено восстановление SovaGrid. Сначала продолжите или отмените его, затем повторите обновление.",
+    "SG_UPDATE_REFUSE:HUB_ONLY_LAYOUT": "На узле есть отдельный Agent или незавершённое преобразование в собственный Hub. Используйте специальное обновление Hub; полная установка не будет заменена.",
     "SG_UPDATE_REFUSE:STATE": "Состояние функций или резервной копии неоднозначно; обновление остановлено.",
     "SG_UPDATE_REFUSE:BUSY": "На сервере есть активные сеансы или незавершённые действия; автоматическое обновление отложено.",
     "SG_UPDATE_REFUSE:SPACE": "Недостаточно свободного места для резервной копии и сборки новых образов.",
     "SG_UPDATE_REFUSE:RECOVERED": "Прерванное обновление восстановлено. Проверьте сервер и запустите проверку пакета заново.",
     "SG_UPDATE_REFUSE:RECOVERY": "Не удалось восстановить прерванное обновление. Резервная копия сохранена на сервере.",
     "SG_UPDATE_REFUSE:UNEXPECTED": "Обновление остановилось с неожиданной ошибкой. Проверьте состояние сервера.",
-    "SG_AUTO_UPDATE_REFUSE:ROOT_REQUIRED": "Для автообновления на самом сервере нужен SSH-вход root.",
+    "SG_AUTO_UPDATE_REFUSE:ROOT_REQUIRED": "Для автообновления на самом сервере нужен SSH-вход root или пользователь с sudo без запроса пароля.",
     "SG_AUTO_UPDATE_REFUSE:INVALID_DIGEST": "Неверный SHA-256 пакета или установленной версии.",
     "SG_AUTO_UPDATE_REFUSE:ALREADY_ARMED": "На сервере уже разрешён другой пакет. Сначала отключите его в этом окне.",
     "SG_AUTO_UPDATE_REFUSE:PREFLIGHT_FAILED": "Сервер не подтвердил подготовленный пакет и текущую версию. Проверьте пакет заново.",
@@ -381,6 +383,16 @@ _INSTALL_SCRIPT = _CHECKS + r'''
 command -v flock >/dev/null 2>&1 || { printf 'SG_INSTALL_REFUSE:UNKNOWN\n'; exit 22; }
 exec 9>/run/sovagrid-first-install.lock
 flock -n 9 || { printf 'SG_INSTALL_REFUSE:EXISTING\n'; exit 22; }
+installation_lock=/run/sovagrid-installation.lock
+[[ ! -L $installation_lock ]] || { printf 'SG_INSTALL_REFUSE:UNKNOWN\n'; exit 22; }
+if [[ ! -e $installation_lock ]]; then
+  ( set -o noclobber; : > "$installation_lock" ) 2>/dev/null || { printf 'SG_INSTALL_REFUSE:UNKNOWN\n'; exit 22; }
+fi
+[[ -f $installation_lock && $(stat -c '%u:%g:%a:%h' "$installation_lock") == 0:0:600:1 ]] || { printf 'SG_INSTALL_REFUSE:UNKNOWN\n'; exit 22; }
+exec 6>>"$installation_lock"
+[[ $(stat -Lc '%d:%i' /proc/self/fd/6) == "$(stat -c '%d:%i' "$installation_lock")" ]] || { printf 'SG_INSTALL_REFUSE:UNKNOWN\n'; exit 22; }
+flock -n 6 || { printf 'SG_INSTALL_REFUSE:EXISTING\n'; exit 22; }
+[[ ! -e /var/lib/.sovagrid-host-restore-in-progress && ! -L /var/lib/.sovagrid-host-restore-in-progress ]] || { printf 'SG_INSTALL_REFUSE:EXISTING\n'; exit 22; }
 archive=$(mktemp /opt/.sovagrid-bundle.XXXXXXXX)
 stage=$(mktemp -d /opt/.sovagrid-stage.XXXXXXXX)
 cleanup() { rm -f -- "$archive"; if [[ -d $stage ]]; then rm -rf -- "$stage"; fi; }
@@ -415,7 +427,7 @@ fi
 ''' + _CHECKS + r'''
 mv -T -- "$stage" /opt/sovagrid-src
 printf 'SG_INSTALL_STAGE:RUN\n'
-bash /opt/sovagrid-src/sovagrid-blueprint/run.sh "$@" 2>&1 | while IFS= read -r line; do
+SOVAGRID_INSTALLATION_LOCK_FD=6 bash /opt/sovagrid-src/sovagrid-blueprint/run.sh "$@" 2>&1 | while IFS= read -r line; do
   case "$line" in
     'SovaGrid: installing Docker from Ubuntu packages') printf 'SG_INSTALL_STAGE:DOCKER\n' ;;
     'SovaGrid: installing the Docker Compose plugin') printf 'SG_INSTALL_STAGE:COMPOSE\n' ;;
@@ -801,6 +813,17 @@ printf 'SG_UPDATE_STAGE:DONE\n'
 _STAGE_UPDATE_SCRIPT = _EXISTING_CHECKS + _STAGE_CANDIDATE_BODY
 
 
+def _privileged_command(command: str, *, uid_probe: tuple[str, ...] = ("/usr/bin/id", "-u"),
+                        sudo_executable: str = "/usr/bin/sudo") -> str:
+    """Elevate a fixed command without consuming its archive/script stdin."""
+    script = (
+        "set -- /bin/sh -c " + shlex.quote(command) + "; "
+        'if [ "$(' + " ".join(shlex.quote(part) for part in uid_probe) + ')" = 0 ]; '
+        'then exec "$@"; fi; exec ' + shlex.quote(sudo_executable) + ' -n -- "$@"'
+    )
+    return "/bin/sh -c " + shlex.quote(script)
+
+
 class ServerInstaller:
     # The embedded updater has no Hub writer/Agent quiescence barrier for
     # unattended apply. Server-side signed updates use a separate worker.
@@ -829,13 +852,16 @@ class ServerInstaller:
         finally:
             config_dir.cleanup()
 
-    def _ssh(self, config: str, helper: str, command: str, *, input_file=None) -> subprocess.Popen:
+    def _ssh(self, config: str, helper: str, command: str, *, input_file=None,
+             privileged: bool = True) -> subprocess.Popen:
         ssh = shutil.which(self.options.ssh_executable)
         if ssh is None:
             raise InstallError("Не найден системный OpenSSH; установите ssh и повторите")
         env = os.environ.copy()
         env["SSH_ASKPASS"] = helper
         env["SSH_ASKPASS_REQUIRE"] = "force"
+        if privileged and self.options.user != "root":
+            command = _privileged_command(command)
         argv = [
             ssh, "-F", config, "-T", "-o", "BatchMode=no",
             "-o", "ConnectTimeout=10", "-o", "ClearAllForwardings=yes",
@@ -952,14 +978,12 @@ class ServerInstaller:
             script = Path(private_dir) / "status.py"
             script.write_text(STATUS_SCRIPT, encoding="utf-8")
             with self._session() as (config, helper), script.open("rb") as input_file:
-                process = self._ssh(config, helper, STATUS_COMMAND, input_file=input_file)
+                process = self._ssh(config, helper, STATUS_COMMAND, input_file=input_file, privileged=False)
                 markers = self._read_markers(process, timeout=45)
         return parse_status(markers, returncode=process.returncode)
 
     def install(self, source: Path, features: InstallFeatures = InstallFeatures(),
                 *, expected_sha256: str | None = None) -> BundleSummary:
-        if self.options.user != "root":
-            raise InstallError("Для первой установки укажите SSH-пользователя root")
         if features.journal_disable:
             raise InstallError("Выключение журналов доступно только для существующей установки")
         with tempfile.TemporaryDirectory(prefix="sovagrid-install-") as private_dir:
@@ -980,11 +1004,11 @@ class ServerInstaller:
                             raise InstallError("В пакете нет компонента защищённого просмотра журналов")
             self._progress(f"Пакет проверен: {summary.files} файлов, {summary.size // 1024} КиБ")
             with self._session() as (config, helper):
-                self._progress("Проверка Ubuntu и прав root по SSH…")
+                self._progress("Проверка Ubuntu и прав администратора по SSH…")
                 preflight = self._ssh(config, helper, _PREFLIGHT_COMMAND)
                 markers = self._read_markers(preflight, timeout=180)
                 if preflight.returncode != 0 or _PREFLIGHT_OK not in markers:
-                    raise InstallError("SSH не прошёл проверку. Проверьте ключ сервера, root-вход и права доступа")
+                    raise InstallError("SSH не прошёл проверку. Проверьте ключ сервера и доступ root или sudo без пароля")
                 flags = " ".join(shlex.quote(flag) for flag in features.flags())
                 command = "bash -c " + shlex.quote(_INSTALL_SCRIPT) + " sovagrid" + (" " + flags if flags else "")
                 self._progress("Отправка пакета на сервер…")
@@ -1002,8 +1026,6 @@ class ServerInstaller:
 
     def preflight_features(self) -> FeatureState:
         """Read-only check of a managed, healthy existing Hub+Agent host."""
-        if self.options.user != "root":
-            raise InstallError("Для включения функций укажите SSH-пользователя root")
         with self._session() as (config, helper):
             self._progress("Проверка существующей установки без изменений…")
             process = self._ssh(config, helper, _FEATURE_PREFLIGHT_COMMAND)
@@ -1014,8 +1036,6 @@ class ServerInstaller:
 
     def enable_features(self, selected: InstallFeatures, *, expected_state: FeatureState | None = None) -> None:
         """Recheck state remotely and run only its existing root-owned run.sh."""
-        if self.options.user != "root":
-            raise InstallError("Для включения функций укажите SSH-пользователя root")
         if not selected.any_enabled():
             raise InstallError("Выберите хотя бы одну функцию")
         if (selected.containers or selected.containers_disable) and (
@@ -1043,8 +1063,6 @@ class ServerInstaller:
 
     def preview_update(self, source: Path, *, expected_sha256: str | None = None) -> UpdatePreview:
         """Check a candidate and the active installation without writing remotely."""
-        if self.options.user != "root":
-            raise InstallError("Для подготовки обновления укажите SSH-пользователя root")
         with tempfile.TemporaryDirectory(prefix="sovagrid-update-preview-") as private_dir:
             bundle = Path(private_dir) / "bundle.tar.gz"
             self._progress("Проверка выбранного пакета…")
@@ -1071,8 +1089,6 @@ class ServerInstaller:
 
     def prepare_update(self, source: Path, *, expected_sha256: str) -> PreparedUpdate:
         """Stage a verified candidate beside the active source; never run it."""
-        if self.options.user != "root":
-            raise InstallError("Для подготовки обновления укажите SSH-пользователя root")
         if not _SHA256.fullmatch(expected_sha256):
             raise InstallError("Неверный SHA-256 пакета обновления")
         with tempfile.TemporaryDirectory(prefix="sovagrid-update-") as private_dir:
@@ -1105,8 +1121,6 @@ class ServerInstaller:
     def _apply_update(self, prepared: PreparedUpdate, *, expected_current_manifest: str, mode: str) -> None:
         if mode not in ("apply", "apply-auto"):
             raise ValueError("unsupported update mode")
-        if self.options.user != "root":
-            raise InstallError("Для обновления укажите SSH-пользователя root")
         digest = prepared.sha256
         if not _SHA256.fullmatch(digest) or not _SHA256.fullmatch(expected_current_manifest) or \
                 prepared.remote_path != f"/opt/sovagrid-candidates/{digest}":
@@ -1139,8 +1153,6 @@ class ServerInstaller:
 
     def arm_server_timer(self, prepared: PreparedUpdate, *, expected_current_manifest: str) -> str:
         """Allow only this staged digest to update later, without Connect open."""
-        if self.options.user != "root":
-            raise InstallError("Для серверного автообновления укажите SSH-пользователя root")
         archive = prepared.sha256
         if (not _SHA256.fullmatch(archive) or
                 not _SHA256.fullmatch(expected_current_manifest) or
@@ -1158,8 +1170,6 @@ class ServerInstaller:
 
     def server_timer_status(self) -> ServerTimerStatus:
         """Read the selected host's root-owned one-candidate policy."""
-        if self.options.user != "root":
-            raise InstallError("Для состояния автообновления укажите SSH-пользователя root")
         with self._session() as (config, helper):
             process = self._ssh(config, helper, SERVER_TIMER_COMMAND + " status")
             raw = self._read_bounded(process, timeout=45)
@@ -1175,8 +1185,6 @@ class ServerInstaller:
 
     def disarm_server_timer(self) -> None:
         """Remove the one-candidate approval on this exact SSH target."""
-        if self.options.user != "root":
-            raise InstallError("Для отключения автообновления укажите SSH-пользователя root")
         with self._session() as (config, helper):
             process = self._ssh(config, helper, SERVER_TIMER_COMMAND + " disarm")
             markers = self._read_markers(process, timeout=45)

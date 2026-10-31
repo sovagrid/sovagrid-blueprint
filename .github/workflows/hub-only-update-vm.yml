@@ -5,24 +5,8 @@ name: Hub-only update and rollback on disposable Ubuntu VM
 
 # This root fixture is never run for fork PRs. It seeds an independent Agent
 # and inert SSH transport units, then installs and updates only the local Hub.
+# Expensive disposable-VM checks are selected explicitly for a combined release.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'run.sh'
-      - 'deploy/hub_only_update.py'
-      - 'deploy/remote_update_worker.py'
-      - 'deploy/release_feed.py'
-      - 'deploy/sovagrid-release-feed.service'
-      - 'deploy/sovagrid-release-feed.timer'
-      - 'deploy/hub_only_auto_update.py'
-      - 'deploy/sovagrid-hub-only-update.service'
-      - 'deploy/sovagrid-hub-only-update.timer'
-      - 'deploy/promote_agent_only.py'
-      - 'tests/hub_only_candidate.py'
-      - 'tests/hub_only_update_vm.py'
-      - 'tests/release_feed_vm.py'
-      - '.github/workflows/hub-only-update-vm.yml'
   workflow_dispatch:
     inputs:
       external_agent_apply:
@@ -30,6 +14,28 @@ on:
         type: boolean
         required: false
         default: false
+
+      signed_feed_transition:
+        description: Verify signed Hub-only discovery and automatic apply (exclusive with external Agent trial)
+        type: boolean
+        required: false
+        default: false
+      hub_ref:
+        description: Exact Hub SHA for the signed transition component set
+        type: string
+        required: false
+      web_ref:
+        description: Exact Web SHA for the signed transition component set
+        type: string
+        required: false
+      agent_ref:
+        description: Exact Agent SHA for the signed transition component set
+        type: string
+        required: false
+      vpn_ref:
+        description: Exact VPN SHA for the signed transition component set
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -47,7 +53,11 @@ jobs:
         with:
           persist-credentials: false
       - name: Confirm a fresh disposable runner
+        env:
+          SIGNED_TRANSITION: ${{ inputs.signed_feed_transition || false }}
+          EXTERNAL_TRIAL: ${{ inputs.external_agent_apply || false }}
         run: |
+          if [ "$SIGNED_TRANSITION" = true ]; then test "$EXTERNAL_TRIAL" != true; fi
           test "$RUNNER_ENVIRONMENT" = github-hosted
           test "$RUNNER_OS" = Linux
           test "$(cat /proc/1/comm)" = systemd
@@ -111,6 +121,30 @@ jobs:
           mkdir "$RUNNER_TEMP/sovagrid-candidate-source"
           tar -xzf "$RUNNER_TEMP/sovagrid-candidate.tar.gz" \
             -C "$RUNNER_TEMP/sovagrid-candidate-source" --no-same-owner
+      - name: Select the reviewed signed-transition component set
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.signed_feed_transition }}
+        env:
+          HUB_REF: ${{ inputs.hub_ref }}
+          WEB_REF: ${{ inputs.web_ref }}
+          AGENT_REF: ${{ inputs.agent_ref }}
+          VPN_REF: ${{ inputs.vpn_ref }}
+          EXTERNAL_TRIAL: ${{ inputs.external_agent_apply }}
+        run: |
+          test "$EXTERNAL_TRIAL" != true
+          while read -r repo commit; do
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+            git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/$repo" fetch --no-tags origin "$commit"
+            git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/$repo" checkout --quiet --detach "$commit"
+            test "$(git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/$repo" rev-parse HEAD)" = "$commit"
+          done <<REFS
+          sovagrid-hub $HUB_REF
+          sovagrid-web $WEB_REF
+          sovagrid-agent $AGENT_REF
+          sovagrid-vpn $VPN_REF
+          REFS
+          python3 "$RUNNER_TEMP/sovagrid-candidate-workspace/sovagrid-blueprint/package_server.py" \
+            "$RUNNER_TEMP/sovagrid-reviewed-hub-candidate.tar.gz"
+          mv "$RUNNER_TEMP/sovagrid-reviewed-hub-candidate.tar.gz" "$RUNNER_TEMP/sovagrid-candidate.tar.gz"
       - name: Seed and pin an independent external Agent and two transport units
         env:
           EXTERNAL_AGENT_APPLY: ${{ inputs.external_agent_apply || false }}
@@ -274,6 +308,22 @@ jobs:
           sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_RELEASE_FEED_VM_FIXTURE=1 \
             python3 tests/release_feed_vm.py installed
           test ! -e /etc/systemd/system/sovagrid-auto-update.timer
+      - name: Build the next signed Hub-only source and exercise its real broker sandbox
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.signed_feed_transition && !inputs.external_agent_apply }}
+        run: |
+          next_root="$RUNNER_TEMP/sovagrid-signed-hub-next"
+          cp -a "$RUNNER_TEMP/sovagrid-candidate-workspace" "$next_root"
+          printf '\nDisposable signed Hub-only transition fixture.\n' >> "$next_root/sovagrid-blueprint/README.md"
+          git -C "$next_root/sovagrid-blueprint" add README.md
+          git -C "$next_root/sovagrid-blueprint" -c user.name='SovaGrid VM Fixture' \
+            -c user.email='vm-fixture@example.invalid' commit -m 'VM fixture: next signed Hub-only source'
+          python3 "$next_root/sovagrid-blueprint/package_server.py" "$RUNNER_TEMP/sovagrid-signed-hub-next.tar.gz"
+          sudo -n install -d -o root -g root -m 0700 /root/sovagrid-signed-hub-next
+          sudo -n install -o root -g root -m 0600 "$RUNNER_TEMP/sovagrid-signed-hub-next.tar.gz" \
+            /root/sovagrid-signed-hub-next/source.tar.gz
+          sudo -n env GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted RUNNER_OS=Linux \
+            SOVAGRID_SIGNED_TRANSITION_VM=1 python3 tests/signed_feed_transition_vm.py \
+            /root/sovagrid-signed-hub-next/source.tar.gz hub_only
       - name: Exercise external Agent apply and boot recovery on the disposable VM
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.external_agent_apply }}
         run: |

@@ -5,21 +5,8 @@ name: Agent-only promotion on disposable Ubuntu VM
 
 # The root installer runs only after review on main, or by maintainer dispatch.
 # Fork PRs use the non-root validation workflow.
+# Expensive disposable-VM checks are selected explicitly for a combined release.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'run.sh'
-      - 'deploy/release_feed.py'
-      - 'deploy/sovagrid-release-feed.service'
-      - 'deploy/sovagrid-release-feed.timer'
-      - 'deploy/promote_agent_only.py'
-      - 'package_server.py'
-      - 'tests/promotion_candidate.py'
-      - 'tests/promotion_vm.py'
-      - 'tests/release_feed_vm.py'
-      - 'tests/test_promote_agent_only.py'
-      - '.github/workflows/promotion-vm.yml'
   workflow_dispatch:
 
 permissions:

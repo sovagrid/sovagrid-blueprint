@@ -5,6 +5,6 @@
 
 from .core import ConnectionOptions, Tunnel, TunnelError
 
-__version__ = "0.8.0"
+__version__ = "1.0.0"
 
 __all__ = ["ConnectionOptions", "Tunnel", "TunnelError"]

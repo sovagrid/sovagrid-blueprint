@@ -1,0 +1,232 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+"""A destructive VM helper must reject a developer/private host before reads."""
+
+import importlib.util
+import os
+from pathlib import Path
+import hashlib
+import json
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+from deploy import portable_restore_apply as core
+
+
+spec = importlib.util.spec_from_file_location("portable_restore_vm_guard_fixture",
+    Path(__file__).with_name("portable_restore_apply_vm.py"))
+vm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(vm)
+fixture = vm.fixture_module()
+
+
+class VmGuardTest(unittest.TestCase):
+    def test_same_byte_unit_and_external_template_replacements_refuse_before_cleanup(self):
+        for name in ("sovagrid-agent.service", "sovagrid-external-agent-apply@.service"):
+            with self.subTest(unit=name), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                unit = directory / name
+                unit.write_bytes(b"[Service]\nExecStart=/usr/bin/true\n")
+                unit.chmod(0o644)
+                original_inventory = fixture.unit_inventory
+                sealed = original_inventory(root=directory, uid=os.getuid(), gid=os.getgid())
+                replacement = directory / "replacement"
+                replacement.write_bytes(unit.read_bytes())
+                replacement.chmod(0o644)
+                os.replace(replacement, unit)
+                value = {"manifest_sha256": "a" * 64, "trees": {}, "units": sealed}
+                with (patch.object(vm, "api", return_value=(None, None, None)),
+                      patch.object(vm, "fixture_module", return_value=fixture),
+                      patch.object(fixture, "ledger", return_value=value), patch.object(fixture, "source_pin"),
+                      patch.object(vm, "expected_manifest", return_value="a" * 64),
+                      patch.object(vm, "ROOTS", set()), patch.object(vm, "command") as command,
+                      patch.object(fixture, "unit_inventory", side_effect=lambda **kwargs:
+                          original_inventory(root=directory, uid=os.getuid(), gid=os.getgid()))):
+                    with self.assertRaisesRegex(RuntimeError, "producer-owned fixture unit changed"):
+                        vm.uninstall(directory, "b" * 32, {})
+                    command.assert_not_called()
+                self.assertEqual(unit.read_bytes(), b"[Service]\nExecStart=/usr/bin/true\n")
+
+    def test_descendant_inserted_before_fresh_proof_is_not_adopted_after_rename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            live = root / "managed"
+            live.mkdir()
+            (live / "owned").write_bytes(b"fixture")
+            sealed = fixture.inventory(live)
+            fixture.compare(str(live), sealed)  # The initial ownership check passes.
+            (live / "injected-private-data").write_bytes(b"preserve after rename")
+            parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                info = os.fstat(parent)
+                proof = {"parent": [info.st_dev, info.st_ino], "resource": core.tree_proof(parent, "managed")}
+                identity, shadow = "a" * 32, ".sovagrid-restore-" + "a" * 32 + "-0"
+                step = {"kind": "publish", "resource": "/managed", "desired": {
+                    "shadow": shadow, "sha256": proof["resource"]["sha256"]}}
+                def rename(fd, source, destination):
+                    with self.assertRaises(FileNotFoundError):
+                        os.stat(destination, dir_fd=fd, follow_symlinks=False)
+                    os.rename(source, destination, src_dir_fd=fd, dst_dir_fd=fd)
+                with patch.object(core, "_rename_noreplace", side_effect=rename):
+                    core.Publisher(root, identity, {"/managed"}, uid=os.getuid()).undo(step, proof)
+                with patch.object(vm.shutil, "rmtree") as remove:
+                    with self.assertRaisesRegex(RuntimeError, "unknown descendant"):
+                        vm.remove_quarantined(fixture, core, parent, shadow, "/managed", proof, sealed)
+                    remove.assert_not_called()
+                self.assertEqual((root / shadow / "injected-private-data").read_bytes(), b"preserve after rename")
+            finally:
+                os.close(parent)
+
+    def test_renamed_tree_keeps_only_original_logical_path_mutable_exceptions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, shadow = Path(temporary), ".sovagrid-restore-" + "a" * 32 + "-0"
+            live = root / "managed"
+            (live / "hub").mkdir(parents=True)
+            database = live / "hub/hub.sqlite"
+            database.write_bytes(b"before known Hub writes")
+            sealed = fixture.inventory(live)
+            database.write_bytes(b"after known Hub writes")
+            parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                info = os.fstat(parent)
+                proof = {"parent": [info.st_dev, info.st_ino], "resource": core.tree_proof(parent, "managed")}
+                os.rename("managed", shadow, src_dir_fd=parent, dst_dir_fd=parent)
+                vm.remove_quarantined(fixture, core, parent, shadow, "/var/lib/sovagrid", proof, sealed)
+                self.assertFalse((root / shadow).exists())
+            finally:
+                os.close(parent)
+
+    def test_missing_artifact_pin_is_refused_before_copy_or_installed_import(self):
+        with (patch.dict(os.environ, {}, clear=True), patch.object(vm, "guard"),
+              patch.object(vm, "fixture_module") as module, patch.object(vm.shutil, "copytree") as copy):
+            with self.assertRaisesRegex(RuntimeError, "artifact-pinned source manifest"):
+                vm.run()
+            module.assert_not_called()
+            copy.assert_not_called()
+
+    def test_foreign_descendants_are_refused_before_any_cleanup_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "managed"
+            root.mkdir()
+            (root / "owned").write_bytes(b"fixture")
+            value = {"manifest_sha256": "a" * 64, "trees": {str(root): fixture.inventory(root)}}
+            (root / "foreign-directory").mkdir()
+            (root / "foreign-directory/personal-data").write_bytes(b"preserve")
+            with (patch.object(vm, "api", return_value=(None, None, None)),
+                  patch.object(vm, "fixture_module", return_value=fixture),
+                  patch.object(fixture, "ledger", return_value=value), patch.object(fixture, "source_pin"),
+                  patch.object(vm, "expected_manifest", return_value="a" * 64),
+                  patch.object(vm, "ROOTS", {str(root)}), patch.object(vm, "command") as command):
+                with self.assertRaisesRegex(RuntimeError, "unknown descendant"):
+                    vm.uninstall(Path(temporary), "b" * 32, {})
+                command.assert_not_called()
+            self.assertEqual((root / "foreign-directory/personal-data").read_bytes(), b"preserve")
+
+    def test_initial_critical_roots_have_closed_descendant_sets(self):
+        for root, foreign in (("/var/lib/sovagrid", "hub/foreign.txt"),
+                              ("/var/lib/sovagrid-agent", "files/personal-data"),
+                              ("/opt/sovagrid-candidates", "somebody-elses-candidate/data")):
+            with self.subTest(root=root):
+                with self.assertRaisesRegex(RuntimeError, "unknown initial"):
+                    vm.initial_names(root, {"": {}, foreign: {}}, Path("/unused"))
+
+    def test_source_manifest_pin_is_known_and_all_bytes_are_checked_before_import(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hashes = {}
+            for component in fixture.COMPONENTS:
+                (root / component).mkdir()
+                (root / component / "main.py").write_bytes(b"pass\n")
+                hashes[component + "/main.py"] = hashlib.sha256(b"pass\n").hexdigest()
+            raw = json.dumps({"format": 1, "components": {name: {} for name in fixture.COMPONENTS}, "sha256": hashes}).encode()
+            (root / "sovagrid-bundle.json").write_bytes(raw)
+            expected = hashlib.sha256(raw).hexdigest()
+            # The source verifier requires root-owned bytes in production.
+            with patch.object(fixture, "inventory", wraps=fixture.inventory):
+                with self.assertRaisesRegex(RuntimeError, "artifact manifest pin mismatch"):
+                    fixture.source_pin(root, "a" * 64)
+            source = root / "sovagrid-blueprint/main.py"
+            source.write_bytes(b"unreviewed code\n")
+            with patch.object(fixture, "inventory", return_value={"": {"kind": "dir", "uid": 0, "gid": 0, "mode": 0o755},
+                    "sovagrid-blueprint/main.py": {"kind": "file", "uid": 0, "gid": 0, "mode": 0o644,
+                    "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}}):
+                with self.assertRaisesRegex(RuntimeError, "pinned source bytes changed"):
+                    fixture.source_pin(root, expected)
+
+    def test_independent_verifier_rejects_even_manifest_named_module_bytecode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = json.dumps({"format": 1, "components": {name: {} for name in fixture.COMPONENTS},
+                              "sha256": {"sovagrid-blueprint/main.py": "a" * 64}}).encode()
+            (root / "sovagrid-bundle.json").write_bytes(raw)
+            cache = {"": {"kind": "dir", "uid": 0, "gid": 0, "mode": 0o755},
+                     "sovagrid-blueprint/__pycache__": {"kind": "dir", "uid": 0, "gid": 0, "mode": 0o755}}
+            with patch.object(fixture, "inventory", return_value=cache):
+                with self.assertRaisesRegex(RuntimeError, "unexpected pinned source directory"):
+                    fixture.source_pin(root, hashlib.sha256(raw).hexdigest())
+
+    def test_guest_provenance_mismatch_precedes_poweroff_and_image_retag(self):
+        state = {"container": "sovagrid-ci-target-123456abcdef", "image": "sovagrid-ci-target:123456abcdef"}
+        provenance = {"guests": {state["container"]: {"leader": "known"}}}
+        with (patch.dict(os.environ, {"RUNNER_TEMP": "/tmp"}),
+              patch.object(vm, "fixture_module", return_value=fixture),
+              patch.object(fixture, "ledger", return_value=provenance),
+              patch.object(vm, "private_json", return_value=state),
+              patch.object(vm.Path, "is_dir", return_value=True), patch.object(vm.Path, "is_symlink", return_value=False),
+              patch.object(vm, "guest_identity", return_value={"leader": "foreign"}),
+              patch.object(vm, "command") as command):
+            with self.assertRaisesRegex(RuntimeError, "guest identity changed before poweroff"):
+                vm.stop_ci_guests_and_retag(Path("/unused"))
+            command.assert_not_called()
+
+    def test_cleanup_accounts_require_exact_home_gecos_uid_groups_and_empty_group_members(self):
+        inspected = {"identities": {"users": {"sovagrid-hub": 10001},
+                                   "groups": {"sovagrid-hub": 10001, "sovagrid": 997}}}
+        provenance = {"trees": {"/var/lib/sovagrid-agent": {"": {"uid": 997}}}}
+        core = SimpleNamespace(Identities=SimpleNamespace(_locked_password=lambda *args, **kwargs: True))
+        for changed in ("home", "gecos", "uid", "supplementary", "members"):
+            users = {"sovagrid-hub": vm.pwd.struct_passwd(("sovagrid-hub", "x", 10001, 10001, "", "/nonexistent", "/usr/sbin/nologin")),
+                     "sovagrid": vm.pwd.struct_passwd(("sovagrid", "x", 997, 997, "", "/var/lib/sovagrid-agent", "/usr/sbin/nologin"))}
+            fields = list(users["sovagrid"])
+            if changed == "home": fields[5] = "/home/personal"
+            if changed == "gecos": fields[4] = "Somebody else's account"
+            if changed == "uid": fields[2] = 998
+            users["sovagrid"] = vm.pwd.struct_passwd(fields)
+            groups = {name: vm.grp.struct_group((name, "x", gid, ["foreign"] if changed == "members" else []))
+                      for name, gid in inspected["identities"]["groups"].items()}
+            with (self.subTest(changed=changed), patch.object(vm.pwd, "getpwnam", side_effect=users.__getitem__),
+                  patch.object(vm.grp, "getgrnam", side_effect=groups.__getitem__),
+                  patch.object(vm.os, "getgrouplist", side_effect=lambda name, gid: [gid, 27] if changed == "supplementary" else [gid])):
+                with self.assertRaisesRegex(RuntimeError, "unknown CI (service account|group)"):
+                    vm.identity_snapshot(inspected, core, provenance=provenance)
+
+    def test_every_disposable_host_condition_is_required_before_any_system_read(self):
+        good = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
+                "RUNNER_OS": "Linux", "SOVAGRID_PORTABLE_RESTORE_DISPOSABLE": "1"}
+        for missing in (*good, "root"):
+            environment = dict(good)
+            if missing != "root":
+                environment.pop(missing)
+            with self.subTest(missing=missing):
+                with (patch.dict(os.environ, environment, clear=True),
+                      patch.object(vm.os, "geteuid", return_value=1000 if missing == "root" else 0),
+                      patch.object(vm.Path, "read_text") as read,
+                      patch.object(vm.subprocess, "run") as command):
+                    with self.assertRaisesRegex(RuntimeError, "requires explicit disposable"):
+                        vm.guard()
+                    read.assert_not_called()
+                    command.assert_not_called()
+
+    def test_self_hosted_runner_is_refused_even_with_the_explicit_flag(self):
+        environment = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "self-hosted",
+                       "RUNNER_OS": "Linux", "SOVAGRID_PORTABLE_RESTORE_DISPOSABLE": "1"}
+        with patch.dict(os.environ, environment, clear=True), patch.object(vm.os, "geteuid", return_value=0):
+            with self.assertRaisesRegex(RuntimeError, "requires explicit disposable"):
+                vm.guard()
+
+
+if __name__ == "__main__":
+    unittest.main()

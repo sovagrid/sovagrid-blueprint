@@ -488,7 +488,10 @@ class AgentRPC:
         command = (self._prefix if prefix is None else prefix) + "/usr/bin/python3 -I -c " + shlex.quote(script)
         with self._installer._session() as (config, helper):
             try:
-                process = self._installer._ssh(config, helper, command, input_file=subprocess.PIPE)
+                # RPC measures the actual login EUID and owns its explicit sudo
+                # prefix. Installer elevation would hide that probe or nest sudo.
+                process = self._installer._ssh(config, helper, command,
+                    input_file=subprocess.PIPE, privileged=False)
             except (OSError, InstallError):
                 raise RPCError("SSH_FAILED") from None
             with self._lock:

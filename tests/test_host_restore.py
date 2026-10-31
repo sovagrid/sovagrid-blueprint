@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ast
+import fcntl
 import hashlib
 import io
 import json
@@ -1034,6 +1035,30 @@ class RestoreInspectionTest(unittest.TestCase):
             extra.chmod(0o600)
             with self.assertRaisesRegex(restore.Refused, "STAGE_CHANGED"):
                 restore.stage_status("a" * 32)
+
+    def test_stage_status_can_reuse_transaction_exclusive_descriptor_without_relocking(self):
+        archive, target, manifest = self._stage_fixture()
+        def archive_fd(_identity):
+            return os.open(archive, os.O_RDONLY), manifest
+        with (patch.object(restore, "_archive_fd", side_effect=archive_fd),
+              patch.object(restore, "_require_root"),
+              patch.object(restore.backup, "_sources", return_value=self.sources),
+              patch.object(restore.backup, "ROOT", target),
+              patch.object(restore.backup, "ROOT_UID", os.geteuid()),
+              patch.object(restore.backup, "ROOT_GID", os.getegid())):
+            restore.stage("a" * 32)
+            descriptor = restore.backup._safe_open(restore.STAGING, directory=True)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(restore.Refused, "BUSY"):
+                    restore.stage_status("a" * 32)
+                self.assertTrue(restore.stage_status("a" * 32, _root_fd=descriptor)["verified"])
+                # The caller's descriptor/lock remains valid after the helper.
+                self.assertTrue(stat.S_ISDIR(os.fstat(descriptor).st_mode))
+                with self.assertRaisesRegex(restore.Refused, "BUSY"):
+                    restore.stage_status("a" * 32)
+            finally:
+                os.close(descriptor)
 
     def test_staging_refuses_occupied_target_before_creating_stage_root(self):
         archive, target, manifest = self._stage_fixture()

@@ -20,6 +20,37 @@ export PYTHONDONTWRITEBYTECODE=1
 die() { printf 'SovaGrid: %s\n' "$*" >&2; exit 1; }
 say() { printf 'SovaGrid: %s\n' "$*"; }
 
+installation_lock() {
+  # This lock is outside every replaceable SovaGrid tree. Fail immediately:
+  # older updaters may already hold the later candidate/public locks.
+  local lock=/run/sovagrid-installation.lock inherited=${SOVAGRID_INSTALLATION_LOCK_FD:-}
+  command -v flock >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 ||
+    die 'installation requires flock and stat from Ubuntu core utilities'
+  [[ ! -L $lock ]] || die 'installation lock is unsafe'
+  if [[ ! -e $lock ]]; then
+    ( set -o noclobber; : > "$lock" ) 2>/dev/null ||
+      [[ -f $lock && ! -L $lock ]] || die 'cannot create installation lock'
+  fi
+  [[ -f $lock && $(stat -c '%u:%g:%a:%h' "$lock") == 0:0:600:1 ]] ||
+    die 'installation lock is unsafe'
+  if [[ -n $inherited ]]; then
+    [[ $inherited =~ ^[0-9]+$ && $inherited -ge 3 && $inherited -le 1048576 ]] ||
+      die 'invalid inherited installation lock'
+    [[ $(stat -Lc '%d:%i:%u:%g:%a:%h' "/proc/self/fd/$inherited") == \
+       "$(stat -c '%d:%i:%u:%g:%a:%h' "$lock")" ]] ||
+      die 'inherited installation lock does not match the host lock'
+    exec 7>&"$inherited"
+  else
+    exec 7>>"$lock"
+    [[ $(stat -Lc '%d:%i' /proc/self/fd/7) == "$(stat -c '%d:%i' "$lock")" ]] ||
+      die 'installation lock changed while opening'
+  fi
+  flock -n 7 || die 'another SovaGrid installation, update or restore is running'
+  [[ ! -e /var/lib/.sovagrid-host-restore-in-progress &&
+     ! -L /var/lib/.sovagrid-host-restore-in-progress ]] ||
+    die 'an interrupted host restore must be recovered before installing or updating SovaGrid'
+}
+
 [[ ${EUID} -eq 0 ]] || die 'run as root (sudo ./run.sh)'
 [[ -r /etc/os-release ]] || die 'cannot identify the operating system'
 # shellcheck disable=SC1091
@@ -281,7 +312,7 @@ PY
 }
 
 restore_dependencies_only() {
-  local expected=$1 blueprint_dir source_root source_manifest actual_manifest lock
+  local expected=$1 blueprint_dir source_root source_manifest actual_manifest
   [[ ${VERSION_ID:-} == 22.04 || ${VERSION_ID:-} == 24.04 || ${VERSION_ID:-} == 26.04 ]] ||
     die 'restore dependency setup requires Ubuntu 22.04, 24.04 or 26.04'
   [[ -d /run/systemd/system ]] || die 'restore dependency setup requires systemd'
@@ -306,19 +337,12 @@ restore_dependencies_only() {
   [[ $actual_manifest == "$expected" ]] || die 'source bundle differs from the reviewed manifest'
   [[ ${SOVAGRID_PUBLIC_WEB_LOCK_HELD:-0} != 1 ]] ||
     die 'restore dependency setup cannot run inside an update transaction'
+  installation_lock
   restore_target_empty /
   if command -v python3 >/dev/null 2>&1; then
     restore_source_and_target_verified "$source_root" "$expected"
   fi
 
-  # This transient lock serializes dependency bootstraps on the target host.
-  lock=/run/sovagrid-restore-dependencies.lock
-  [[ ! -L $lock ]] || die 'restore dependency lock is unsafe'
-  if [[ ! -e $lock ]]; then install -o root -g root -m 0600 /dev/null "$lock"; fi
-  [[ -f $lock && $(stat -c '%u:%g:%a:%h' "$lock") == 0:0:600:1 ]] ||
-    die 'restore dependency lock is unsafe'
-  exec 9>>"$lock"
-  flock -x -w 30 9 || die 'restore dependency setup is already running'
   restore_target_empty /
   install_core_dependencies restore
   if [[ ! -x /usr/bin/ss ]]; then
@@ -327,6 +351,18 @@ restore_dependencies_only() {
   fi
   [[ -x /usr/bin/docker && -x /usr/bin/ss ]] ||
     die 'restore requires the Ubuntu Docker and iproute2 binaries in /usr/bin'
+  # Prepare the supported archived features without installing SovaGrid units
+  # or enabling an interface. Apply rechecks the exact archived requirements.
+  if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1 ||
+     ! command -v nft >/dev/null 2>&1 ||
+     ! /usr/bin/python3 -I -c 'import cryptography' >/dev/null 2>&1; then
+    apt_refresh
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      wireguard-tools python3-cryptography nftables
+  fi
+  command -v wg >/dev/null && command -v wg-quick >/dev/null && command -v nft >/dev/null &&
+    /usr/bin/python3 -I -c 'import cryptography' >/dev/null ||
+    die 'restore feature dependencies are incomplete'
   restore_source_and_target_verified "$source_root" "$expected"
   restore_target_empty /
   say 'restore dependencies are ready; no SovaGrid account, secret, unit or container was installed'
@@ -338,6 +374,7 @@ if [[ ${1:-} == --restore-dependencies-only ]]; then
   restore_dependencies_only "$3"
   exit 0
 fi
+installation_lock
 # An older SSH updater does not snapshot the new timer units. Refuse before
 # changing this host if it supervises an upgrade without that rollback support.
 if [[ ${SOVAGRID_PUBLIC_WEB_LOCK_HELD:-0} == 1 && -f /var/lib/sovagrid/.managed-by-run-sh && ${SOVAGRID_UPDATER_TIMER_SNAPSHOT:-0} != 1 ]]; then
@@ -614,6 +651,31 @@ deploy_env=/etc/sovagrid/deploy.env
 bot_token=/etc/sovagrid-hub/bot.token
 admin_password=/etc/sovagrid/admin-password
 
+# Manual installer runs take the same candidate lock as backup create, full
+# update and offline restore, before dependencies, identities or data change.
+# Lock order: installation -> candidate -> public Web.
+[[ -d /opt && ! -L /opt && $(stat -c '%u:%g:%a' /opt) == 0:0:755 ]] || \
+  die '/opt must be a root-owned directory with mode 0755'
+if (( ! backup_broker_deferred )) && [[ ${SOVAGRID_PUBLIC_WEB_LOCK_HELD:-0} != 1 ]]; then
+  candidate_root=/opt/sovagrid-candidates
+  if [[ -e $candidate_root || -L $candidate_root ]]; then
+    [[ -d $candidate_root && ! -L $candidate_root &&
+       $(stat -c '%U:%G:%a' "$candidate_root") == root:root:700 ]] || die 'unsafe candidate directory for Hub backups'
+  else
+    install -d -o root -g root -m 0700 "$candidate_root"
+  fi
+  [[ ! -L $candidate_root/.lock ]] || die 'unsafe candidate lock for Hub backups'
+  # A lock inherited from another installer must retain its original mode;
+  # create only a missing lock with explicit permissions before opening it.
+  if [[ ! -e $candidate_root/.lock ]]; then
+    install -o root -g root -m 0600 /dev/null "$candidate_root/.lock"
+  fi
+  exec 9>>"$candidate_root/.lock"
+  candidate_lock_metadata=$(stat -c '%u:%g:%a:%h' -- "$candidate_root/.lock") || die 'cannot inspect candidate lock for Hub backups'
+  [[ -f $candidate_root/.lock && $candidate_lock_metadata == 0:0:600:1 ]] || die "unsafe candidate lock for Hub backups ($candidate_lock_metadata)"
+  flock -x -w 180 9 || die 'another SovaGrid update, restore or backup is running'
+fi
+
 install_core_dependencies
 
 for repo in sovagrid-hub sovagrid-web sovagrid-agent sovagrid-vpn; do
@@ -659,7 +721,7 @@ fi
    ! -L $source_root/sovagrid-vpn/deploy/install-wireguard-control.py &&
    ! -L $source_root/sovagrid-vpn/sovagrid_vpn/wireguard_install.py ]] ||
   die 'managed WireGuard installer source is missing or a symlink'
-for auto_file in auto_update.py remote_update_worker.py sovagrid-auto-update.service sovagrid-auto-update.timer \
+for auto_file in auto_update.py remote_update_worker.py runtime_locks.py sovagrid-auto-update.service sovagrid-auto-update.timer \
                  release_feed.py sovagrid-release-feed.service sovagrid-release-feed.timer \
                  sovagrid-hub-backup-control.socket sovagrid-hub-backup-control.service compose.backup.yaml \
                  external_agent_operation.py sovagrid-external-agent-apply@.service; do
@@ -667,7 +729,7 @@ for auto_file in auto_update.py remote_update_worker.py sovagrid-auto-update.ser
 done
 for web_agent_file in web_agent_bundle.py web_agent_jobs.py web_agent_local_rpc.py web_agent_target_ssh.py \
                       web_agent_service.py web_vpn_source.py web_wireguard_control.py web_amnezia_provision.py \
-                      vpn_source_install.py sovagrid-web-agent-control.socket \
+                      vpn_source_install.py vpn_source_maintenance.py sovagrid-web-agent-control.socket \
                       sovagrid-web-agent-control.service compose.web-agent.yaml; do
   [[ -f $source_root/sovagrid-blueprint/deploy/$web_agent_file &&
      ! -L $source_root/sovagrid-blueprint/deploy/$web_agent_file ]] ||
@@ -1007,27 +1069,6 @@ SOVAGRID_CADDY_DATA_DIR=/var/lib/sovagrid/caddy
 export SOVAGRID_HUB_DATA_DIR SOVAGRID_CADDY_DATA_DIR
 
 compose=(docker compose --env-file "$deploy_env" -f "$compose_file")
-# Manual installer runs take the same candidate lock as backup create, full
-# update and offline restore. Keep lock order candidate -> public Web.
-if (( ! backup_broker_deferred )) && [[ ${SOVAGRID_PUBLIC_WEB_LOCK_HELD:-0} != 1 ]]; then
-  candidate_root=/opt/sovagrid-candidates
-  if [[ -e $candidate_root || -L $candidate_root ]]; then
-    [[ -d $candidate_root && ! -L $candidate_root &&
-       $(stat -c '%U:%G:%a' "$candidate_root") == root:root:700 ]] || die 'unsafe candidate directory for Hub backups'
-  else
-    install -d -o root -g root -m 0700 "$candidate_root"
-  fi
-  [[ ! -L $candidate_root/.lock ]] || die 'unsafe candidate lock for Hub backups'
-  # A lock inherited from another installer must retain its original mode;
-  # create only a missing lock with explicit permissions before opening it.
-  if [[ ! -e $candidate_root/.lock ]]; then
-    install -o root -g root -m 0600 /dev/null "$candidate_root/.lock"
-  fi
-  exec 9>>"$candidate_root/.lock"
-  candidate_lock_metadata=$(stat -c '%u:%g:%a:%h' -- "$candidate_root/.lock") || die 'cannot inspect candidate lock for Hub backups'
-  [[ -f $candidate_root/.lock && $candidate_lock_metadata == 0:0:600:1 ]] || die "unsafe candidate lock for Hub backups ($candidate_lock_metadata)"
-  flock -x -w 180 9 || die 'another SovaGrid update, restore or backup is running'
-fi
 # Serialize manual installs/feature changes with public HTTPS and GUI updates.
 # The pinned GUI updater already owns this lock in its supervising process.
 if [[ ${SOVAGRID_PUBLIC_WEB_LOCK_HELD:-0} != 1 ]]; then

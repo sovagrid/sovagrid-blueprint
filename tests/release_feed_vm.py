@@ -98,12 +98,12 @@ def check(mode: str) -> None:
     # The public stable feed may exist by the time this migration is rerun.
     # A stale review must fail before network access; never opt a fixture in.
     attempt = subprocess.run(["python3", "-I", str(SCRIPT), "enable", "--expected-state",
-                              "0" * 64 if not hub_only else report["state_revision"]],
+                              "0" * 64],
                              check=False, capture_output=True, text=True, timeout=20)
-    expected_refusal = "HUB_ONLY_UNSUPPORTED" if hub_only else "STATE_CHANGED"
+    expected_refusal = "STATE_CHANGED"
     require(attempt.returncode == 40 and
             "SG_RELEASE_FEED_REFUSE:" + expected_refusal in attempt.stdout,
-            "enable accepted a stale review or unsupported Hub-only node")
+            "enable accepted a stale review")
     if mode == "installed":
         disabled = subprocess.run(["python3", "-I", str(SCRIPT), "disarm"],
                                   check=True, capture_output=True, text=True, timeout=20)

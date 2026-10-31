@@ -64,9 +64,25 @@ if "$run" "${args[@]}" >/dev/null 2>&1; then fail 'tampered candidate was accept
 cp -p -- "$backup" "$worker"
 worker_saved=0
 
-DOCKER_HOST=tcp://127.0.0.1:1 DOCKER_CONTEXT=nonexistent-restore-test "$run" "${args[@]}"
+# Refuse concurrent setup before APT, then keep the exact same open lock
+# description across exec, as the signed updater does for nested run.sh.
+lock=/run/sovagrid-installation.lock
+if [[ ! -e $lock ]]; then install -o root -g root -m 0600 /dev/null "$lock"; fi
+[[ ! -L $lock && $(stat -c '%u:%g:%a:%h' "$lock") == 0:0:600:1 ]] ||
+  fail 'installation lock is unsafe'
+exec 6>>"$lock"
+flock -n 6 || fail 'another installation is running on the disposable VM'
+if "$run" "${args[@]}" >/dev/null 2>&1; then fail 'concurrent installation was accepted'; fi
+after=$(dpkg-query -W -f='${Package} ${Version}\n' | sha256sum | cut -d' ' -f1)
+[[ $before == "$after" ]] || fail 'concurrent setup changed the OS package set'
+SOVAGRID_INSTALLATION_LOCK_FD=6 DOCKER_HOST=tcp://127.0.0.1:1 \
+  DOCKER_CONTEXT=nonexistent-restore-test "$run" "${args[@]}"
+exec 6>&-
 command -v python3 >/dev/null || fail 'Python is missing'
 [[ -x /usr/bin/docker && -x /usr/bin/ss ]] || fail 'restore dependencies are incomplete'
+command -v wg >/dev/null && command -v wg-quick >/dev/null && command -v nft >/dev/null ||
+  fail 'restore VPN/routing dependencies are incomplete'
+/usr/bin/python3 -I -c 'import cryptography' || fail 'restore profile encryption dependency is missing'
 local_docker() {
   env -u DOCKER_HOST -u DOCKER_CONTEXT /usr/bin/docker --host unix:///var/run/docker.sock "$@"
 }

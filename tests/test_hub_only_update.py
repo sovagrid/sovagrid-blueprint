@@ -159,6 +159,7 @@ class HubOnlyUpdatePolicy(unittest.TestCase):
                 mock.patch.object(update, "_state"),
                 mock.patch.object(update, "_restore", return_value=True),
                 mock.patch.object(update.common, "ROOT", root),
+                mock.patch.object(update.common, "installation_lock", return_value=contextlib.nullcontext(123)),
                 mock.patch.object(update.common, "HUB_UID", os.getuid()),
                 mock.patch.object(update.common, "HUB_GID", os.getgid()),
                 mock.patch.object(update.common, "public_web_lock", side_effect=contextlib.nullcontext),

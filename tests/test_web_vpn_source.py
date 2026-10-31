@@ -130,6 +130,53 @@ class WebVpnSourceTests(unittest.TestCase):
         self.assertFalse((self.directory / "vpn-source-stage.json").exists())
         self.assertEqual(FakeTransport.instances[0].rpc.cleaned, ["e" * 32])
 
+    def test_explicit_maintenance_confirmation_reaches_only_apply_with_longer_deadline(self):
+        expected = {"source_manifest_sha256": MANIFEST, "candidate_sha256": CANDIDATE,
+                    "installed_sha256": "0" * 64, "state_sha256": "0" * 64}
+        calls = []
+        def exchange(_rpc, bootstrap, chunks, timeout):
+            payload = json.loads(b"".join(chunks))
+            calls.append((payload, timeout))
+            result = {"protocol": 1, "installed": True, "changed": True,
+                      "source_manifest_sha256": MANIFEST, "candidate_sha256": CANDIDATE,
+                      "cleanup_required": False}
+            return module._canonical({"protocol": 1, "ok": True, "result": result}), 0
+        with mock.patch.object(FakeRPC, "_exchange", exchange):
+            result = self.bridge.execute("apply", options=self.options, fingerprint=FINGERPRINT,
+                credential=self.credential, expected=expected, maintenance=True)
+        self.assertTrue(result["installed"])
+        self.assertIs(calls[0][0]["maintenance"], True)
+        self.assertEqual(calls[0][1], 420)
+        for action, maintenance in (("preview", True), ("recover", True), ("apply", "yes")):
+            with self.assertRaisesRegex(module.VpnSourceError, "INVALID_REQUEST"):
+                self.bridge.execute(action, options=self.options, fingerprint=FINGERPRINT,
+                    credential=self.credential, expected=expected if action == "apply" else None,
+                    maintenance=maintenance)
+
+    def test_role_revoked_during_staging_prevents_mutation_and_cleans_owned_stage(self):
+        class Revoked(RuntimeError): pass
+        def refuse(): raise Revoked("admin no longer authorized")
+        expected = {"source_manifest_sha256": MANIFEST, "candidate_sha256": CANDIDATE,
+                    "installed_sha256": "0" * 64, "state_sha256": "0" * 64}
+        with mock.patch.object(FakeRPC, "_exchange") as exchange:
+            with self.assertRaises(Revoked):
+                self.bridge.execute("apply", options=self.options, fingerprint=FINGERPRINT,
+                    credential=self.credential, expected=expected, maintenance=True,
+                    recheck_admin=refuse)
+        exchange.assert_not_called()
+        self.assertFalse((self.directory / "vpn-source-stage.json").exists())
+        self.assertEqual(FakeTransport.instances[0].rpc.cleaned, ["e" * 32])
+
+    def test_optional_maintenance_preview_is_exact_and_bound_to_an_update(self):
+        original, _ = FakeRPC()._exchange("vpn_source_install.py", (
+            module._canonical({"source_manifest_sha256": MANIFEST}),), 180)
+        response = json.loads(original)
+        response["result"].update(change="update", maintenance_required=True)
+        self.assertTrue(self.bridge._response(module._canonical(response), 0, "preview")["maintenance_required"])
+        response["result"]["maintenance_required"] = False
+        with self.assertRaises(module.VpnSourceError):
+            self.bridge._response(module._canonical(response), 0, "preview")
+
     def test_transport_errors_distinguish_changed_host_key_from_unavailable_ssh(self):
         for failure, expected in ((module.HostKeyChanged("changed"), "HOST_KEY_CHANGED"),
                                   (OSError("offline"), "SSH_UNAVAILABLE")):

@@ -205,6 +205,22 @@ class ServiceTests(unittest.TestCase):
                              authorize=lambda token: None, vpn_source=vpn)
         self.assertEqual(len(vpn.calls), 1)
 
+    def test_vpn_source_maintenance_requires_exact_boolean_and_admin_before_dispatch(self):
+        expected = {key: "a" * 64 for key in ("source_manifest_sha256", "candidate_sha256",
+                                             "installed_sha256", "state_sha256")}
+        bridge = FakeVpnSource()
+        payload = {**login_payload(), "expected": expected, "maintenance": True}
+        service.dispatch(self.jobs, request("vpn-source-apply", payload),
+                         authorize=lambda token: None, vpn_source=bridge)
+        self.assertTrue(bridge.calls[0][1]["maintenance"])
+        self.assertEqual(payload["password"], "")
+        for value in (False, "yes", 1):
+            with self.assertRaises(service.RequestError):
+                service.dispatch(self.jobs, request("vpn-source-apply", {
+                    **login_payload(), "expected": expected, "maintenance": value}),
+                    authorize=lambda token: None, vpn_source=bridge)
+        self.assertEqual(len(bridge.calls), 1)
+
     def test_vpn_actions_bind_jump_route_and_wipe_both_secrets(self):
         for action, bridge, extra in (
             ("vpn-source-preview", FakeVpnSource(), {}),

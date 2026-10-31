@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import grp
 import json
 import os
@@ -146,6 +147,72 @@ def request(method: str, path: str, *, body: dict | None = None,
         return response.status, json.loads(raw)
 
 
+def verify_broker_runtime_locks_after_reboot() -> None:
+    """Simulate empty /run locks and inspect the real broker mount namespace."""
+    service = "sovagrid-hub-backup-control.service"
+    subprocess.run(["systemctl", "stop", service], check=True, timeout=20)
+    held = []
+    try:
+        for filename in ("sovagrid-installation.lock", "sovagrid-promotion.lock"):
+            target = Path("/run") / filename
+            descriptor = os.open(target, os.O_RDWR | os.O_NOFOLLOW)
+            held.append(descriptor)
+            value = os.fstat(descriptor)
+            require(stat.S_ISREG(value.st_mode) and value.st_nlink == 1 and
+                    (value.st_uid, value.st_gid, stat.S_IMODE(value.st_mode), value.st_size) ==
+                    (0, 0, 0o600, 0), "Unsafe runtime lock in disposable VM")
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for descriptor, filename in zip(held, ("sovagrid-installation.lock", "sovagrid-promotion.lock")):
+            target = Path("/run") / filename
+            value, observed = os.fstat(descriptor), target.lstat()
+            require((value.st_dev, value.st_ino) == (observed.st_dev, observed.st_ino),
+                    "Runtime lock changed before reboot simulation")
+            target.unlink()
+    finally:
+        for descriptor in held:
+            os.close(descriptor)
+    subprocess.run(["systemctl", "start", service], check=True, timeout=20)
+    deadline = time.monotonic() + 8
+    while True:
+        result = subprocess.run(["systemctl", "show", "-P", "MainPID", service],
+                                check=True, capture_output=True, text=True, timeout=5)
+        pid = result.stdout.strip()
+        require(pid.isdecimal() and int(pid) > 0, "Broker did not restart after empty runtime locks")
+        try:
+            ready = b"sovagrid_hub.backup_broker" in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except FileNotFoundError:
+            ready = False
+        if ready:
+            break
+        require(time.monotonic() < deadline, "Broker did not enter its execution namespace")
+        time.sleep(0.05)
+    probe = r'''
+import errno, os, uuid
+for name in ('sovagrid-installation.lock', 'sovagrid-promotion.lock'):
+    fd = os.open('/run/' + name, os.O_RDWR | os.O_NOFOLLOW)
+    os.close(fd)
+name = '.sovagrid-vm-rw-' + uuid.uuid4().hex
+path = '/etc/sovagrid-hub/' + name
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+os.close(fd)
+os.unlink(path)
+path = '/etc/' + name
+try:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+except OSError as error:
+    assert error.errno == errno.EROFS, 'unexpected broker root filesystem refusal'
+else:
+    os.close(fd)
+    os.unlink(path)
+    raise RuntimeError('broker root filesystem became writable')
+'''
+    checked = subprocess.run(["nsenter", "--target", pid, "--mount", "--",
+                              "/usr/bin/python3", "-I", "-c", probe],
+                             capture_output=True, check=False, timeout=15)
+    require(checked.returncode == 0, "Broker runtime locks or scoped writable paths failed")
+    print("INTEGRATED_BROKER_REBOOT_LOCKS_AND_SANDBOX_VERIFIED", flush=True)
+
+
 def main() -> None:
     require(os.environ.get("GITHUB_ACTIONS") == "true" and
             os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted" and
@@ -161,6 +228,7 @@ def main() -> None:
                            check=False)
     require(agent.returncode == 0, "Host Agent is not active")
     verify_agent_quiescence()
+    verify_broker_runtime_locks_after_reboot()
     hub = subprocess.run(["docker", "compose", "--env-file", "/etc/sovagrid/deploy.env",
                           "-f", str(SOURCE / "sovagrid-blueprint/deploy/compose.yaml"),
                           "ps", "--status", "running", "--quiet", "hub"],
@@ -184,6 +252,9 @@ def main() -> None:
                             token=server["agent_token"])
     require(status == 200 and proof == {"protocol": 1, "bundle_manifest_sha256": expected},
             "Running Hub image does not report this verified server bundle")
+    status, revoked = request("DELETE", "/api/v1/session", token=login["token"])
+    require(status == 200 and revoked.get("revoked") is True,
+            "Integrated install left its administrator session open")
     print("INTEGRATED_SERVER_BUNDLE_VERIFIED", flush=True)
 
 

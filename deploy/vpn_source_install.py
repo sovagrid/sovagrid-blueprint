@@ -5,9 +5,11 @@
 """Prepare the verified VPN source on an Agent-only Ubuntu target.
 
 This helper is executed from an already pinned, verified Connect bundle. It
-copies source code only; it never invokes Docker, systemd, or a VPN installer.
-The two trees required by the VPN installers are replaced with a durable
-rollback journal, so an interrupted copy cannot silently adopt foreign files.
+prepares source code without creating a VPN container or interface. With explicit
+maintenance consent, existing management and inventory units are drained and
+restored around source/control-file replacement. The source and maintenance
+journals preserve rollback and recovery after interruption. Docker and VPN
+commands are never invoked by this transaction.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import re
 import shutil
 import stat
 import sys
+import subprocess
 import uuid
 
 
@@ -85,10 +88,24 @@ def valid_hashes(value: object) -> dict[str, str]:
 class Installer:
     """Fixed-path target transaction; root/owner injection is for isolated tests."""
 
-    def __init__(self, *, root: Path = Path("/"), owner: int = 0):
+    def __init__(self, *, root: Path = Path("/"), owner: int = 0,
+                 run=subprocess.run, checkpoint=lambda _phase: None):
         self.root = Path(root)
         self.owner = owner
+        self.run = run
+        self.checkpoint = checkpoint
+        self._maintenance_instance = None
         need(self.root.is_absolute() and ".." not in self.root.parts, "INVALID_REQUEST")
+
+    def _maintenance(self):
+        if self._maintenance_instance is None:
+            spec = importlib.util.spec_from_file_location("sovagrid_vpn_source_maintenance",
+                Path(__file__).with_name("vpn_source_maintenance.py"))
+            need(spec is not None and spec.loader is not None, "SOURCE_UNTRUSTED")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self._maintenance_instance = module.Maintenance(self, Refuse)
+        return self._maintenance_instance
 
     def at(self, absolute: str) -> Path:
         need(absolute.startswith("/") and ".." not in Path(absolute).parts,
@@ -224,8 +241,10 @@ class Installer:
     def _state(self) -> tuple[dict | None, str]:
         if self._inspect(STATE_DIR, directory=True, absent=True) is not None:
             self._inspect(STATE_DIR, directory=True, private=True)
-            need({entry.name for entry in self.at(STATE_DIR).iterdir()} <=
-                 {".lock", "state.json"}, "OWNERSHIP_CONFLICT")
+            for entry in self.at(STATE_DIR).iterdir():
+                need(entry.name in {".lock", "state.json", "maintenance.json", "maintenance.blocked"} or
+                     re.fullmatch(r"\.sg-vpn-[0-9a-f]{32}", entry.name), "OWNERSHIP_CONFLICT")
+                self._inspect(STATE_DIR + "/" + entry.name, private=True)
             if os.path.lexists(self.at(LOCK_FILE)):
                 self._inspect(LOCK_FILE, private=True)
         if self._inspect(STATE_FILE, absent=True) is None:
@@ -294,6 +313,8 @@ class Installer:
                 source: dict[str, bytes], package: dict[str, bytes]) -> dict:
         need(type(source_manifest_sha256) is str and SHA.fullmatch(source_manifest_sha256),
              "INVALID_REQUEST")
+        maintenance = self._maintenance()
+        need(not maintenance.exists(), "RECOVERY_REQUIRED")
         state, state_sha = self._state()
         need(state is None or state["phase"] == "active", "RECOVERY_REQUIRED")
         installed_sha = self._active_files(state)
@@ -301,17 +322,16 @@ class Installer:
         valid_hashes(source_files); valid_hashes(package_files)
         candidate_sha = digest(canonical({"source": source_files, "package": package_files}))
         change = "install" if state is None else "current" if installed_sha == candidate_sha else "update"
-        # The package may be in use by an armed broker; source-only updates do
-        # not attempt to restart it or claim compatibility across versions.
-        if change == "update":
-            for marker in ("/etc/sovagrid-vpn/amnezia-control.enabled",
-                           "/etc/sovagrid-vpn/amnezia-wireguard-control.enabled",
-                           "/etc/sovagrid-vpn/amnezia-awg-settings.enabled",
-                           "/etc/systemd/system/sovagrid-amnezia-control.service",
-                           "/etc/systemd/system/sovagrid-vpn-control.service",
-                           "/var/lib/sovagrid-vpn/amnezia-provision/pending.json",
-                           "/var/lib/sovagrid-vpn/amnezia-provision/state.json"):
-                need(not os.path.lexists(self.at(marker)), "CONTROL_ACTIVE")
+        snapshot = maintenance.inspect(state, source) if change == "update" else None
+        if snapshot is not None:
+            for name, raw in package.items():
+                try:
+                    compile(raw, name, "exec", dont_inherit=True)
+                except (SyntaxError, UnicodeError, ValueError):
+                    raise Refuse("SOURCE_UNTRUSTED") from None
+            # Bind the reviewed source state and exact broker/runtime snapshot
+            # into the existing opaque CAS field, without exposing private data.
+            state_sha = digest(canonical({"source_state": state_sha, "control": snapshot}))
         expected = {"source_manifest_sha256": source_manifest_sha256,
                     "installed_sha256": installed_sha, "state_sha256": state_sha,
                     "candidate_sha256": candidate_sha}
@@ -320,7 +340,8 @@ class Installer:
                 "candidate_sha256": candidate_sha, "installed_sha256": installed_sha,
                 "state_sha256": state_sha,
                 "cleanup_required": bool(state and state["garbage_stage"]),
-                "expected": expected}
+                "expected": expected,
+                **({"maintenance_required": True} if snapshot is not None else {})}
 
     @contextmanager
     def _lock(self):
@@ -379,31 +400,53 @@ class Installer:
         need(pending["phase"] == "pending", "STATE_CONFLICT")
         stage = pending["stage"]
         previous = pending["previous"]
+        plans = []
+        # Decide both components before moving either one. Equal old/candidate
+        # hashes cannot identify which directory is live: the source may have
+        # changed while the installed package stayed byte-for-byte identical.
+        # A previous live tree with no backup is already restored (or was never
+        # moved), including a repeated recovery after its backup was consumed.
         for destination, key, old_name, discard in (
                 (SOURCE_DEST, "source_files", "old_source", "discard_source"),
                 (PACKAGE_DEST, "package_files", "old_package", "discard_package")):
             old = stage + "/" + old_name
             discarded = stage + "/" + discard
             current = self._inspect(destination, directory=True, absent=True)
-            backup = self._inspect(old, directory=True, absent=True) if self._inspect(
-                stage, directory=True, absent=True) is not None else None
-            if current is not None:
-                actual = self._tree(destination)
-                if actual == pending[key]:
-                    need(self._inspect(discarded, directory=True, absent=True) is None,
-                         "STATE_CONFLICT")
-                    self._rename(destination, discarded)
-                else:
-                    need(previous is not None and backup is None and
-                         actual == previous[key], "STATE_CONFLICT")
+            staged = self._inspect(stage, directory=True, absent=True)
+            backup = self._inspect(old, directory=True, absent=True) if staged is not None else None
+            rejected = self._inspect(discarded, directory=True, absent=True) if staged is not None else None
+            actual = self._tree(destination) if current is not None else None
+            discard_files = self._tree(discarded) if rejected is not None else None
+            if discard_files is not None:
+                # An interrupted owned-stage cleanup can leave a subset. Never
+                # discard a file whose name or digest is outside this candidate.
+                need(set(discard_files) <= set(pending[key]) and
+                     all(pending[key][name] == value for name, value in discard_files.items()),
+                     "STATE_CONFLICT")
             if backup is not None:
-                need(previous is not None and self._tree(old) == previous[key] and
-                     self._inspect(destination, directory=True, absent=True) is None,
-                     "STATE_CONFLICT")
-                self._rename(old, destination)
-            elif previous is None:
-                need(self._inspect(destination, directory=True, absent=True) is None,
-                     "STATE_CONFLICT")
+                need(previous is not None and self._tree(old) == previous[key], "STATE_CONFLICT")
+            if previous is None:
+                need(backup is None, "STATE_CONFLICT")
+                if current is not None:
+                    need(actual == pending[key] and rejected is None, "STATE_CONFLICT")
+                    plans.append((destination, discarded))
+                continue
+            if current is not None and backup is None and actual == previous[key]:
+                continue  # Keep an unchanged or already restored live component.
+            if backup is not None:
+                if current is not None:
+                    need(actual == pending[key] and rejected is None, "STATE_CONFLICT")
+                    plans.append((destination, discarded))
+                plans.append((old, destination))
+                continue
+            # Repair the exact state left by the older recovery bug: it moved
+            # an unchanged live component into discard before finding that no
+            # old backup existed. Only a complete identical proof is sufficient.
+            need(current is None and pending[key] == previous[key] and
+                 discard_files == previous[key], "STATE_CONFLICT")
+            plans.append((discarded, destination))
+        for old, new in plans:
+            self._rename(old, new)
         if previous is not None:
             self._active_files(previous)
             old = {**previous, "garbage_stage": stage}
@@ -416,8 +459,35 @@ class Installer:
         else:
             self._save_state({**previous, "garbage_stage": None})
 
+    @contextmanager
+    def _installation_guard(self):
+        # Shared with normal installation, promotion and server updates. Lock
+        # order is installation -> VPN source -> exact VPN resource locks.
+        self._mkdir("/run", 0o755)
+        absolute = "/run/sovagrid-installation.lock"
+        fd = os.open(self.at(absolute), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            need(stat.S_ISREG(info.st_mode) and info.st_uid == self.owner and
+                 info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600,
+                 "OWNERSHIP_CONFLICT")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Refuse("BUSY") from None
+            observed = self.at(absolute).lstat()
+            need((observed.st_dev, observed.st_ino) == (info.st_dev, info.st_ino), "OWNERSHIP_CONFLICT")
+            need(not os.path.lexists(self.at("/var/lib/.sovagrid-host-restore-in-progress")),
+                 "RESTORE_RECOVERY")
+            yield
+        finally:
+            os.close(fd)
+
     def recover(self) -> dict:
-        with self._lock():
+        with self._installation_guard(), self._lock():
+            maintenance = self._maintenance()
+            if maintenance.exists():
+                return maintenance.recover()
             state, _ = self._state()
             if state is None:
                 return {"protocol": PROTOCOL, "recovered": False}
@@ -433,73 +503,136 @@ class Installer:
             return {"protocol": PROTOCOL, "recovered": False}
 
     def apply(self, source_manifest_sha256: str, source: dict[str, bytes],
-              package: dict[str, bytes], expected: dict) -> dict:
+              package: dict[str, bytes], expected: dict, *, maintenance: bool = False) -> dict:
         need(type(expected) is dict and set(expected) == {"source_manifest_sha256",
              "installed_sha256", "state_sha256", "candidate_sha256"} and
-             all(type(value) is str and SHA.fullmatch(value) for value in expected.values()),
-             "INVALID_REQUEST")
-        with self._lock():
+             all(type(value) is str and SHA.fullmatch(value) for value in expected.values()) and
+             type(maintenance) is bool, "INVALID_REQUEST")
+        with self._installation_guard(), self._lock():
             preview = self.preview(source_manifest_sha256, source, package)
             need(preview["expected"] == expected, "STALE_PREVIEW")
-            if preview["cleanup_required"]:
-                state, _ = self._state()
-                need(state is not None and state["phase"] == "active", "STATE_CONFLICT")
-                self._remove_stage(state["garbage_stage"])
-                self._save_state({**state, "garbage_stage": None})
-            if preview["change"] == "current":
-                return {"protocol": PROTOCOL, "installed": True, "changed": False,
-                        "source_manifest_sha256": source_manifest_sha256,
-                        "candidate_sha256": preview["candidate_sha256"],
-                        "cleanup_required": False}
-            previous, _ = self._state()
-            stage = "/opt/.sovagrid-vpn-source-" + uuid.uuid4().hex
-            pending = {"protocol": PROTOCOL, "phase": "pending", "stage": stage,
-                       "source_manifest_sha256": source_manifest_sha256,
-                       "source_files": self._hashmap(source),
-                       "package_files": self._hashmap(package), "previous": previous}
-            self._save_state(pending)
+            if preview.get("maintenance_required"):
+                need(maintenance, "CONTROL_ACTIVE")
+                coordinator = self._maintenance()
+                with coordinator.locks():
+                    fresh = self.preview(source_manifest_sha256, source, package)
+                    need(fresh["expected"] == expected, "STALE_PREVIEW")
+                    previous, _ = self._state()
+                    snapshot = coordinator.inspect(previous, source)
+                    need(snapshot is not None, "STALE_PREVIEW")
+                    return self._apply_transaction(source_manifest_sha256, source, package,
+                        fresh, coordinator=coordinator, snapshot=snapshot)
+            return self._apply_transaction(source_manifest_sha256, source, package, preview)
+
+    def _space(self, source, package, snapshot=None):
+        # Reserve room for both staged trees and durable rollback metadata on
+        # each actual filesystem, before stopping any unit or saving intent.
+        costs = {"/opt": sum(len(raw) for raw in source.values()) +
+                         sum(len(raw) for raw in package.values()) +
+                         65536 * (len(source) + len(package)),
+                 STATE_DIR: 4 * 1024 * 1024}
+        if snapshot is not None:
+            for absolute, item in snapshot["new_files"].items():
+                parent = str(Path(absolute).parent)
+                costs[parent] = costs.get(parent, 0) + len(item["data"]) + 65536
+        devices = {}
+        for absolute, cost in costs.items():
+            existing = self.at(absolute)
+            while not existing.exists():
+                existing = existing.parent
+            info = existing.stat()
+            stats = os.statvfs(existing)
+            available = stats.f_bavail * stats.f_frsize
+            entry = devices.setdefault(info.st_dev, [available, 0])
+            entry[0] = min(entry[0], available)
+            entry[1] += cost
+        need(all(available >= cost + 16 * 1024 * 1024 for available, cost in devices.values()),
+             "INSUFFICIENT_SPACE")
+
+    def _apply_transaction(self, source_manifest_sha256, source, package, preview,
+                           *, coordinator=None, snapshot=None):
+        if preview["change"] != "current":
+            self._space(source, package, snapshot)
+        if preview["cleanup_required"]:
+            state, _ = self._state()
+            need(state is not None and state["phase"] == "active", "STATE_CONFLICT")
+            self._remove_stage(state["garbage_stage"])
+            self._save_state({**state, "garbage_stage": None})
+        if preview["change"] == "current":
+            return {"protocol": PROTOCOL, "installed": True, "changed": False,
+                    "source_manifest_sha256": source_manifest_sha256,
+                    "candidate_sha256": preview["candidate_sha256"], "cleanup_required": False}
+        previous, _ = self._state()
+        stage = "/opt/.sovagrid-vpn-source-" + uuid.uuid4().hex
+        pending = {"protocol": PROTOCOL, "phase": "pending", "stage": stage,
+                   "source_manifest_sha256": source_manifest_sha256,
+                   "source_files": self._hashmap(source),
+                   "package_files": self._hashmap(package), "previous": previous}
+        journal = None
+        committed = False
+        self._save_state(pending)
+        try:
+            if coordinator:
+                journal = coordinator.save({"protocol": 1, "phase": "prepared",
+                                            "snapshot": snapshot, "pending": pending})
+            self._mkdir(stage, 0o700)
+            self._write_tree(stage + "/new_source", source)
+            self._write_tree(stage + "/new_package", package)
+            need(self._tree(stage + "/new_source") == pending["source_files"] and
+                 self._tree(stage + "/new_package") == pending["package_files"], "SOURCE_CHANGED")
+            if coordinator:
+                coordinator.check_files(snapshot)
+                coordinator.barriers(snapshot)
+                coordinator.stop(snapshot)
+                journal = coordinator.save(journal, "stopped")
+            self._mkdir("/opt/sovagrid-src", 0o755)
+            self._mkdir("/opt/sovagrid-vpn", 0o755)
+            if previous is not None:
+                self._rename(SOURCE_DEST, stage + "/old_source")
+            self._rename(stage + "/new_source", SOURCE_DEST)
+            self.checkpoint("source_switched")
+            if previous is not None:
+                self._rename(PACKAGE_DEST, stage + "/old_package")
+            self._rename(stage + "/new_package", PACKAGE_DEST)
+            self.checkpoint("package_switched")
+            need(self._tree(SOURCE_DEST) == pending["source_files"] and
+                 self._tree(PACKAGE_DEST) == pending["package_files"], "STATE_CONFLICT")
+            if coordinator:
+                journal = coordinator.install_files(journal)
+                coordinator.restart(snapshot)
+                journal = coordinator.save(journal, "runtime_started")
+            active = {"protocol": PROTOCOL, "phase": "active",
+                      "source_manifest_sha256": source_manifest_sha256,
+                      "source_files": pending["source_files"],
+                      "package_files": pending["package_files"], "garbage_stage": stage}
+            self._save_state(active)
+            self.checkpoint("source_committed")
+            if coordinator:
+                journal = coordinator.save(journal, "committed")
+            committed = True
+        except Exception:
             try:
-                self._mkdir(stage, 0o700)
-                self._write_tree(stage + "/new_source", source)
-                self._write_tree(stage + "/new_package", package)
-                need(self._tree(stage + "/new_source") == pending["source_files"] and
-                     self._tree(stage + "/new_package") == pending["package_files"],
-                     "SOURCE_CHANGED")
-                self._mkdir("/opt/sovagrid-src", 0o755)
-                self._mkdir("/opt/sovagrid-vpn", 0o755)
-                if previous is not None:
-                    self._rename(SOURCE_DEST, stage + "/old_source")
-                self._rename(stage + "/new_source", SOURCE_DEST)
-                if previous is not None:
-                    self._rename(PACKAGE_DEST, stage + "/old_package")
-                self._rename(stage + "/new_package", PACKAGE_DEST)
-                need(self._tree(SOURCE_DEST) == pending["source_files"] and
-                     self._tree(PACKAGE_DEST) == pending["package_files"],
-                     "STATE_CONFLICT")
-                active = {"protocol": PROTOCOL, "phase": "active",
-                          "source_manifest_sha256": source_manifest_sha256,
-                          "source_files": pending["source_files"],
-                          "package_files": pending["package_files"],
-                          "garbage_stage": stage}
-                self._save_state(active)
-            except BaseException:
-                try:
+                if coordinator and journal is not None:
+                    coordinator.rollback(journal)
+                else:
                     self._rollback(pending)
-                except Exception:
-                    raise Refuse("RECOVERY_REQUIRED") from None
-                raise
-            try:
+            except Exception:
+                raise Refuse("RECOVERY_REQUIRED") from None
+            raise
+        try:
+            if coordinator:
+                coordinator.cleanup_committed(journal)
+            else:
                 self._remove_stage(stage)
                 self._save_state({**active, "garbage_stage": None})
-            except Exception:
-                return {"protocol": PROTOCOL, "installed": True, "changed": True,
-                        "source_manifest_sha256": source_manifest_sha256,
-                        "candidate_sha256": preview["candidate_sha256"],
-                        "cleanup_required": True}
+        except Exception:
+            need(committed, "RECOVERY_REQUIRED")
             return {"protocol": PROTOCOL, "installed": True, "changed": True,
                     "source_manifest_sha256": source_manifest_sha256,
-                    "candidate_sha256": preview["candidate_sha256"],
-                    "cleanup_required": False}
+                    "candidate_sha256": preview["candidate_sha256"], "cleanup_required": True}
+        return {"protocol": PROTOCOL, "installed": True, "changed": True,
+                "source_manifest_sha256": source_manifest_sha256,
+                "candidate_sha256": preview["candidate_sha256"], "cleanup_required": False}
 
 
 def _staged_source() -> tuple[Path, str, dict[str, bytes], dict[str, bytes]]:
@@ -528,6 +661,9 @@ def main() -> int:
         expected_fields = {"protocol", "action", "source_manifest_sha256"}
         if request["action"] == "apply":
             expected_fields.add("expected")
+            if "maintenance" in request:
+                need(request["maintenance"] is True, "INVALID_REQUEST")
+                expected_fields.add("maintenance")
         need(set(request) == expected_fields and
              type(request["source_manifest_sha256"]) is str and
              SHA.fullmatch(request["source_manifest_sha256"]), "INVALID_REQUEST")
@@ -537,7 +673,8 @@ def main() -> int:
         if request["action"] == "preview":
             result = installer.preview(source_sha, source, package)
         elif request["action"] == "apply":
-            result = installer.apply(source_sha, source, package, request["expected"])
+            result = installer.apply(source_sha, source, package, request["expected"],
+                                     maintenance=request.get("maintenance", False))
         else:
             result = installer.recover()
         response = {"protocol": PROTOCOL, "ok": True, "result": result}

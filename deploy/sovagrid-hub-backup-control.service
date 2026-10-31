@@ -8,6 +8,9 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/opt/sovagrid-src/sovagrid-hub
+# Create fixed lock files after reboot before applying file-only RW mounts.
+# The initializer accepts no arguments and never replaces an existing inode.
+ExecStartPre=+/usr/bin/python3 -B -I /opt/sovagrid-src/sovagrid-blueprint/deploy/runtime_locks.py
 ExecStart=/usr/bin/python3 -B -E -S -m sovagrid_hub.backup_broker
 Restart=on-failure
 RestartSec=5
@@ -25,7 +28,8 @@ AmbientCapabilities=
 # Offline restore must atomically exchange the hub directory with a staging
 # directory in /var/lib/sovagrid; writable child paths alone cannot rename
 # entries in their read-only parent under ProtectSystem=strict.
-ReadWritePaths=/var/lib/sovagrid /opt/sovagrid-candidates /var/lib/sovagrid-host-backup-operations /etc/sovagrid
+ReadWritePaths=/var/lib/sovagrid /opt/sovagrid-candidates /var/lib/sovagrid-host-backup-operations /etc/sovagrid /etc/sovagrid-hub
+ReadWritePaths=/run/sovagrid-installation.lock /run/sovagrid-promotion.lock
 # Docker Compose validates and recreates the Web container inside this unit.
 # On hosts with many CPU cores its Go runtime needs more than 32 threads.
 TasksMax=128

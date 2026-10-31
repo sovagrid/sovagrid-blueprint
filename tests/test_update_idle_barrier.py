@@ -33,6 +33,7 @@ class IdleBarrierTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
+        (root / "run").mkdir()
         db_path = root / "var/lib/sovagrid/hub/hub.sqlite"
         db_path.parent.mkdir(parents=True)
         with contextlib.closing(sqlite3.connect(db_path)) as db:

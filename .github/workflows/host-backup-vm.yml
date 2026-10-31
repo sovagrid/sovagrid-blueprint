@@ -4,18 +4,8 @@
 name: Managed host backup on disposable Ubuntu VM
 
 # Root operations and a brief Hub/Web stop are confined to a fresh GitHub VM.
+# Expensive disposable-VM checks are selected explicitly for a combined release.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'run.sh'
-      - 'deploy/host_backup.py'
-      - 'deploy/host_backup_orchestrator.py'
-      - 'deploy/sovagrid-hub-backup-control.service'
-      - 'deploy/sovagrid-hub-backup-control.socket'
-      - 'deploy/compose.backup.yaml'
-      - 'tests/host_backup_vm.py'
-      - '.github/workflows/host-backup-vm.yml'
   workflow_dispatch:
 
 permissions:

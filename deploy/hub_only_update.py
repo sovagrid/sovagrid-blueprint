@@ -848,6 +848,7 @@ def apply(archive_sha: str, current_manifest: str, *, automatic: bool = False) -
          SHA.fullmatch(current_manifest) is not None, "ARGS")
     _private_dir(CANDIDATES)
     with contextlib.ExitStack() as locks:
+        installation_descriptor = locks.enter_context(common.installation_lock())
         # Promotion uses this lock before run.sh's public lock. Keep the same
         # order so an interrupted promotion cannot race an update.
         locks.callback(os.close, _lock(PROMOTION_LOCK))
@@ -961,13 +962,15 @@ def apply(archive_sha: str, current_manifest: str, *, automatic: bool = False) -
                 os.chmod(output.fileno(), 0o600)
                 install_env = os.environ.copy()
                 install_env.update(SOVAGRID_PUBLIC_WEB_LOCK_HELD="1", SOVAGRID_UPDATER_TIMER_SNAPSHOT="1",
+                                   SOVAGRID_INSTALLATION_LOCK_FD=str(installation_descriptor),
                                    SOVAGRID_RELEASE_FEED_SNAPSHOT="1",
                                    SOVAGRID_HUB_BACKUP_BROKER_SNAPSHOT="1",
                                    SOVAGRID_EXTERNAL_APPLY_UNIT_SNAPSHOT="1",
                                    SOVAGRID_SSH_GATEWAY_SNAPSHOT="1",
                                    SOVAGRID_WEB_AGENT_SNAPSHOT="1")
                 common.command(["bash", str(SOURCE / "sovagrid-blueprint/run.sh"), "--hub-only"],
-                               timeout=2700, stdout=output, env=install_env)
+                               timeout=2700, stdout=output, env=install_env,
+                               pass_fds=(installation_descriptor,))
             _refresh_local_agent(new_manifest)
             _refresh_local_broker(folder / "source-before", units)
             if units[LOCAL_CONTAINER_UNITS[1]]["active"]:
