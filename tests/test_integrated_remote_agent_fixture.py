@@ -21,6 +21,15 @@ class Response(io.BytesIO):
 
 
 class BrowserRequestTests(unittest.TestCase):
+    def test_connect_journal_uses_a_root_owned_runtime_ancestor(self):
+        records = fixture.ci_records_dir({"container": "sovagrid-ci-target-012345abcdef"})
+        self.assertEqual(records, Path("/run/sovagrid-ci-connect-012345abcdef"))
+        self.assertNotIn("_temp", str(records))
+        for container in ("sovagrid-ci-target-../../etc",
+                          "sovagrid-ci-target-012345abcdef/else", "unrelated"):
+            with self.subTest(container=container), self.assertRaises(RuntimeError):
+                fixture.ci_records_dir({"container": container})
+
     def test_route_sends_same_origin_and_ephemeral_credentials_only_in_body(self):
         seen = []
 

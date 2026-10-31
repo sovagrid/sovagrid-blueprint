@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -48,6 +49,14 @@ def ci_guard(state_dir: Path) -> None:
     parent = Path(os.environ["RUNNER_TEMP"]).resolve()
     require(state_dir.parent.resolve() == parent and state_dir.name == "sovagrid-remote-ci"
             and not state_dir.is_symlink(), "Unexpected CI state path")
+
+
+def ci_records_dir(state: dict) -> Path:
+    """Keep Connect's private journal below a root-owned ancestor, not RUNNER_TEMP."""
+    container = state.get("container")
+    match = re.fullmatch(r"sovagrid-ci-target-([0-9a-f]{12})", container) if isinstance(container, str) else None
+    require(match is not None, "Unexpected disposable target identity")
+    return Path("/run/sovagrid-ci-connect-" + match.group(1))
 
 
 def command(*argv: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -112,7 +121,6 @@ def setup(state_dir: Path) -> None:
     require(not state_dir.exists(), "Disposable CI fixture already exists")
     require(not network_exists(COMPOSE_NETWORK), "The Hub Docker network already exists")
     require(not SSH_CONFIG.exists() and not SSH_CONFIG.is_symlink(), "CI SSH policy already exists")
-    state_dir.mkdir(mode=0o700)
     suffix = uuid.uuid4().hex[:12]
     state = {"network": "sovagrid-ci-target-" + suffix,
              "container": "sovagrid-ci-target-" + suffix,
@@ -124,6 +132,10 @@ def setup(state_dir: Path) -> None:
              "host_sshd_runtime_existed": Path("/run/sshd").exists(),
              "auth_file_existed": Path("/root/.ssh/authorized_keys").exists(),
              "known_hosts_existed": Path("/root/.ssh/known_hosts").exists()}
+    records = ci_records_dir(state)
+    require(not records.exists() and not records.is_symlink(),
+            "Disposable Connect journal already exists")
+    state_dir.mkdir(mode=0o700)
     save(state_dir, state)
     # Ubuntu 24.04 may use an inherited socket-activated SSH listener. Stop it
     # before the test opens any SSH service and restore its state at teardown.
@@ -537,7 +549,7 @@ def verify(state_dir: Path) -> None:
                 {**(tunnel.diagnostic or {"unavailable": True}),
                  "host_policy": policy}, sort_keys=True), flush=True)
             raise
-        controller = AgentEnrollment(tunnel, journal=EnrollmentJournal(state_dir / "records"))
+        controller = AgentEnrollment(tunnel, journal=EnrollmentJournal(ci_records_dir(state)))
         password = Path("/etc/sovagrid/admin-password").read_text(encoding="ascii").strip()
         preview = controller.prepare(target_options=target,
                                      name="ci-remote-agent-" + state["container"].rsplit("-", 1)[-1],
@@ -599,6 +611,16 @@ def cleanup(state_dir: Path) -> None:
             action()
         except Exception as error:
             failures.append(f"{label}: {error}")
+
+    records = ci_records_dir(state)
+    if records.exists() or records.is_symlink():
+        def remove_records() -> None:
+            info = records.lstat()
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and
+                    stat.S_IMODE(info.st_mode) == 0o700,
+                    "Disposable Connect journal changed ownership or permissions")
+            shutil.rmtree(records)
+        attempt("Connect journal", remove_records)
 
     compose = SOURCE / "sovagrid-blueprint/deploy/compose.yaml"
     attempt("host Agent stop", lambda: command("systemctl", "stop", "sovagrid-agent.service", check=False))
