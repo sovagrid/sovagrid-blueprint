@@ -27,7 +27,7 @@ VENDOR = ROOT / "vendor/connect"
 PACKAGE = VENDOR / "sovagrid_connect"
 LOCK = VENDOR / "SOURCE.json"
 UPSTREAM = "https://github.com/sovagrid/sovagrid-connect"
-UPSTREAM_COMMIT = "eba320f85b9944dd22c7b123ba3fe20bd39a08a2"
+UPSTREAM_COMMIT = "7353ffc880fcb3b3202187f1bff01731b12400f9"
 # Runtime-only Ubuntu closure for AgentEnrollment, EnrollmentAPI and AgentRPC.
 # core.ssh_grant and enrollment_journal.keygen are used only by the desktop UI
 # and Windows branches; the server worker never invokes those paths.

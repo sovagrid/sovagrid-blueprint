@@ -33,6 +33,12 @@ FINAL = "c" * 64
 
 
 class SignedFeed(unittest.TestCase):
+    def test_archive_member_allows_systemd_template_but_rejects_traversal(self) -> None:
+        template = tarfile.TarInfo("sovagrid-blueprint/deploy/sovagrid-external-agent-apply@.service")
+        self.assertEqual(feed._member_name(template), template.name)
+        with self.assertRaisesRegex(feed.Refused, "UNSAFE_ARCHIVE_MEMBER"):
+            feed._member_name(tarfile.TarInfo("sovagrid-blueprint/deploy/../escape@.service"))
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.keys = tempfile.TemporaryDirectory()

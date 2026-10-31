@@ -94,6 +94,17 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(rebuilt.read_bytes(), first_bytes)
         self.assertEqual(rebuilt_sha, digest)
 
+    def test_systemd_template_path_round_trip(self):
+        name = "sovagrid-blueprint/deploy/sovagrid-external-agent-apply@.service"
+        self.files[name] = b"[Unit]\nDescription=fixture\n"
+        (self.source / name).write_bytes(self.files[name])
+        self.write_manifest()
+        path, _ = self.ensure()
+        with tarfile.open(path, "r:gz") as archive:
+            self.assertEqual(archive.extractfile(name).read(), self.files[name])
+        _, summary = source_bundle(path)
+        self.assertEqual(set(summary.commits), COMPONENTS)
+
     def test_generated_bytecode_is_not_exported(self):
         generated = self.source / "sovagrid-blueprint" / "deploy" / "__pycache__"
         generated.mkdir()

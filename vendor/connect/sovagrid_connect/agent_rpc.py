@@ -182,7 +182,7 @@ def file_hash(path,limit):
 def safe_name(name):
     need(isinstance(name,str) and 1<=len(name)<=240 and name.isascii() and '\\' not in name)
     parts=name.split('/')
-    need(all(part not in ('','.','..') and re.fullmatch(r'[A-Za-z0-9_.-]+',part) for part in parts))
+    need(all(part not in ('','.','..') and re.fullmatch(r'[A-Za-z0-9_.@-]+',part) for part in parts))
     need(name=='sovagrid-bundle.json' or parts[0] in COMPONENTS)
     return name
 def manifest(raw):
