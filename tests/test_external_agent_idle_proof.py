@@ -223,6 +223,21 @@ class IdleProofTests(unittest.TestCase):
                 guard.confirm_stopped()
             self.assertEqual(len(calls), 2)
 
+    def test_late_eof_after_exact_stop_proof_does_not_fail_trial(self):
+        self.start_server()
+        with self.new_guard() as guard:
+            guard.begin_stop()
+            self.stop_agent()
+            guard.confirm_stopped()
+            self.assertTrue(guard.confirmed)
+            # The new Agent makes the shared systemd unit active again. An
+            # old heartbeat that was already pending must retain the exact
+            # original stop proof instead of testing the new unit's state.
+            self.proof.stopped = lambda: False
+            with mock.patch.object(guard._stop, "wait", return_value=False):
+                guard._heartbeat()
+            self.assertFalse(guard.failed)
+
     def test_stop_proof_cannot_accept_live_socket_or_expired_idle_hold(self):
         self.start_server()
         with self.new_guard() as guard:

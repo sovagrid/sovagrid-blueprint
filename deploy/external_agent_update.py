@@ -1759,6 +1759,12 @@ class AgentIdleProof:
                     except Exception:
                         pass
                 with self._state_lock:
+                    # The original unit is no longer required to remain
+                    # inactive once confirm_stopped has proved its exact PID,
+                    # cgroup and socket are gone. A delayed EOF must not
+                    # invalidate that proof after the trial Agent starts.
+                    if self.confirmed:
+                        return
                     if stopped_at_close:
                         self.closed_during_stop = True
                     else:
@@ -1856,6 +1862,9 @@ class AgentIdleProof:
         need(self.stop_proof.stopped(), "AGENT_STOP_NOT_PROVEN")
         with self._state_lock:
             self.confirmed = True
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=6)
 
     def close(self) -> None:
         self._stop.set()
