@@ -554,10 +554,31 @@ def run(archive_sha256: str) -> None:
     current, old, review = _review(planner, archive_sha256)
     trial_watch = []
     trial_watch_errors = []
+    watch_gate_values = []
     commit_gate_values = []
+    original_watch_init = planner.TrialWatchServer.__init__
     original_watch_start = planner.TrialWatchServer.start
     original_watch_handle = planner.TrialWatchServer._handle
     original_commit_trial = planner.recovery.Recovery.commit_trial
+
+    def record_watch_init(watch, *args, **kwargs):
+        for name in ("journal_current", "lease_active", "agent_idle_proven",
+                     "agent_peer_allowed"):
+            callback = kwargs[name]
+
+            def recorded(*callback_args, _name=name, _callback=callback, **callback_kwargs):
+                try:
+                    result = _callback(*callback_args, **callback_kwargs)
+                except Exception as error:
+                    watch_gate_values.append((_name, type(error).__name__))
+                    raise
+                valid = (result == watch.journal_sha256 if _name == "journal_current"
+                         else result is True)
+                watch_gate_values.append((_name, valid))
+                return result
+
+            kwargs[name] = recorded
+        return original_watch_init(watch, *args, **kwargs)
 
     def record_watch_start(watch):
         result = original_watch_start(watch)
@@ -585,6 +606,7 @@ def run(archive_sha256: str) -> None:
 
     with mock.patch.object(planner, "_normal_activation_ready", return_value=True), \
          mock.patch.object(planner, "_trial_peer", recorded_peer), \
+         mock.patch.object(planner.TrialWatchServer, "__init__", record_watch_init), \
          mock.patch.object(planner.TrialWatchServer, "start", record_watch_start), \
          mock.patch.object(planner.TrialWatchServer, "_handle", record_watch_error), \
          mock.patch.object(planner.recovery.Recovery, "commit_trial", record_commit_gates):
@@ -601,6 +623,7 @@ def run(archive_sha256: str) -> None:
                      "normal_ready": watch.normal_ready.is_set() if watch else False,
                      "ping_count": watch.ping_count if watch else 0,
                      "watch_errors": trial_watch_errors[-8:],
+                     "watch_gates": watch_gate_values[-24:],
                      "commit_gates": commit_gate_values,
                      "agent_cycle_failures": journal.count("Agent cycle failed; retrying"),
                      "metrics": _hub_counters()["metrics"],
