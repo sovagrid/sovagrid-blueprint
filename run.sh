@@ -34,22 +34,63 @@ apt_refresh() {
   fi
 }
 
+restore_docker_with_binary() {
+  local binary=$1
+  shift
+  env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH \
+    "$binary" --host unix:///var/run/docker.sock "$@"
+}
+
+restore_local_docker() {
+  restore_docker_with_binary /usr/bin/docker "$@"
+}
+
+restore_retained_docker_empty() {
+  local root=${1%/} required_owner=${2:-0} candidate entry mode
+  for candidate in "$root"/var/lib/docker "$root"/var/lib/containerd "$root"/etc/docker \
+                   "$root"/etc/systemd/system/docker.service.d; do
+    if [[ -e $candidate || -L $candidate ]]; then
+      [[ -d $candidate && ! -L $candidate ]] || die 'retained Docker state is unsafe to inspect'
+      [[ $(stat -c '%u' "$candidate") == "$required_owner" ]] || die 'retained Docker state has an unsafe owner'
+      mode=$(stat -c '%a' "$candidate") || die 'cannot inspect retained Docker permissions'
+      [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 022) == 0 )) ||
+        die 'retained Docker state has unsafe permissions'
+      entry=$(find "$candidate" -mindepth 1 -maxdepth 1 -print -quit) ||
+        die 'cannot inspect retained Docker state'
+      [[ -z $entry ]] || die 'retained Docker state requires manual inspection before restore setup'
+    fi
+  done
+  for candidate in "$root"/etc/default/docker "$root"/etc/systemd/system/docker.service \
+                   "$root"/run/docker.sock; do
+    [[ ! -e $candidate && ! -L $candidate ]] ||
+      die 'retained Docker configuration requires manual inspection before restore setup'
+  done
+}
+
 install_core_dependencies() {
+  local restore_mode=${1:-0} docker_available=0
+  local -a docker_command=(docker)
+  if [[ $restore_mode == restore ]]; then
+    docker_command=(restore_local_docker)
+    [[ ! -x /usr/bin/docker ]] || docker_available=1
+  elif command -v docker >/dev/null 2>&1; then
+    docker_available=1
+  fi
   if ! command -v python3 >/dev/null 2>&1; then
     apt_refresh
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3
   fi
   python3 -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ is required"' || die 'Python 3.10+ is required'
 
-  if ! command -v docker >/dev/null 2>&1; then
+  if (( ! docker_available )); then
     say 'installing Docker from Ubuntu packages'
     apt_refresh
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker.io
     systemctl enable --now docker
   fi
-  docker info >/dev/null || die 'Docker daemon is unavailable; existing containers were not changed'
+  "${docker_command[@]}" info >/dev/null || die 'Docker daemon is unavailable; existing containers were not changed'
 
-  if ! docker compose version >/dev/null 2>&1; then
+  if ! "${docker_command[@]}" compose version >/dev/null 2>&1; then
     say 'installing the Docker Compose plugin'
     apt_refresh
     if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
@@ -60,7 +101,7 @@ install_core_dependencies() {
       die 'no Compose plugin package is available in configured APT repositories'
     fi
   fi
-  docker compose version >/dev/null || die 'Docker Compose is unavailable'
+  "${docker_command[@]}" compose version >/dev/null || die 'Docker Compose is unavailable'
 }
 
 restore_target_empty() {
@@ -91,16 +132,21 @@ restore_target_empty() {
      printf '%s\n' "$group_entries" | cut -d: -f1 | grep -Eq '^sovagrid([_-]|$)'; then
     die 'restore target already has SovaGrid identities'
   fi
-  if [[ -z $root ]] && command -v docker >/dev/null 2>&1; then
-    docker info >/dev/null 2>&1 || die 'existing Docker daemon must be available to inspect the restore target'
-    inventory=$(docker ps -a --format '{{.Names}}') || die 'cannot inspect Docker containers'
+  if [[ -z $root && -x /usr/bin/docker ]]; then
+    restore_local_docker info >/dev/null 2>&1 || die 'existing local Docker daemon must be available to inspect the restore target'
+    inventory=$(restore_local_docker ps -a --format '{{.Names}}') || die 'cannot inspect Docker containers'
     if printf '%s\n' "$inventory" | grep -Eq '^sovagrid([-_]|$)'; then die 'restore target has SovaGrid containers'; fi
-    inventory=$(docker image ls -a --format '{{.Repository}}') || die 'cannot inspect Docker images'
+    inventory=$(restore_local_docker image ls -a --format '{{.Repository}}') || die 'cannot inspect Docker images'
     if printf '%s\n' "$inventory" | grep -Eq '(^|/)sovagrid([-_/]|$)'; then die 'restore target has SovaGrid images'; fi
-    inventory=$(docker network ls --format '{{.Name}}') || die 'cannot inspect Docker networks'
+    inventory=$(restore_local_docker network ls --format '{{.Name}}') || die 'cannot inspect Docker networks'
     if printf '%s\n' "$inventory" | grep -Eq '^sovagrid([-_]|$)'; then die 'restore target has SovaGrid networks'; fi
-    inventory=$(docker volume ls --format '{{.Name}}') || die 'cannot inspect Docker volumes'
+    inventory=$(restore_local_docker volume ls --format '{{.Name}}') || die 'cannot inspect Docker volumes'
     if printf '%s\n' "$inventory" | grep -Eq '^sovagrid([-_]|$)'; then die 'restore target has SovaGrid volumes'; fi
+  elif [[ -z $root ]]; then
+    if command -v docker >/dev/null 2>&1; then
+      die 'nonstandard Docker installation requires manual inspection before restore setup'
+    fi
+    restore_retained_docker_empty /
   fi
 }
 
@@ -274,7 +320,7 @@ restore_dependencies_only() {
   exec 9>>"$lock"
   flock -x -w 30 9 || die 'restore dependency setup is already running'
   restore_target_empty /
-  install_core_dependencies
+  install_core_dependencies restore
   if [[ ! -x /usr/bin/ss ]]; then
     apt_refresh
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2

@@ -20,10 +20,15 @@ marker=/etc/sovagrid-restore-bootstrap-smoke
 execution_marker=/run/sovagrid-restore-bootstrap-execution-marker
 backup=$(mktemp)
 worker_saved=0
+docker_data_created=0
 cleanup() {
   if (( worker_saved )); then cp -p -- "$backup" "$worker"; fi
   rm -f -- "$backup" "$execution_marker"
   rmdir -- "$marker" 2>/dev/null || true
+  if (( docker_data_created )); then
+    rm -f -- /var/lib/docker/.sovagrid-restore-bootstrap-smoke
+    rmdir -- /var/lib/docker 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 [[ ! -e $marker && ! -L $marker && ! -e $execution_marker ]] ||
@@ -36,6 +41,20 @@ after=$(dpkg-query -W -f='${Package} ${Version}\n' | sha256sum | cut -d' ' -f1)
 [[ $before == "$after" ]] || fail 'dirty target changed the OS package set'
 rmdir -- "$marker"
 
+if [[ ! -e /usr/bin/docker && ! -e /var/lib/docker && ! -L /var/lib/docker ]]; then
+  mkdir -m 0700 -- /var/lib/docker
+  docker_data_created=1
+  printf 'retained\n' > /var/lib/docker/.sovagrid-restore-bootstrap-smoke
+  if "$run" "${args[@]}" >/dev/null 2>&1; then
+    fail 'retained Docker data was accepted without a local Docker CLI'
+  fi
+  after=$(dpkg-query -W -f='${Package} ${Version}\n' | sha256sum | cut -d' ' -f1)
+  [[ $before == "$after" ]] || fail 'retained Docker data changed the OS package set'
+  rm -f -- /var/lib/docker/.sovagrid-restore-bootstrap-smoke
+  rmdir -- /var/lib/docker
+  docker_data_created=0
+fi
+
 # If the bootstrap imports candidate Python before hashing it, this line runs.
 cp -p -- "$worker" "$backup"
 worker_saved=1
@@ -45,10 +64,13 @@ if "$run" "${args[@]}" >/dev/null 2>&1; then fail 'tampered candidate was accept
 cp -p -- "$backup" "$worker"
 worker_saved=0
 
-"$run" "${args[@]}"
+DOCKER_HOST=tcp://127.0.0.1:1 DOCKER_CONTEXT=nonexistent-restore-test "$run" "${args[@]}"
 command -v python3 >/dev/null || fail 'Python is missing'
 [[ -x /usr/bin/docker && -x /usr/bin/ss ]] || fail 'restore dependencies are incomplete'
-docker compose version >/dev/null || fail 'Docker Compose is missing'
+local_docker() {
+  env -u DOCKER_HOST -u DOCKER_CONTEXT /usr/bin/docker --host unix:///var/run/docker.sock "$@"
+}
+local_docker compose version >/dev/null || fail 'Docker Compose is missing'
 
 for path in /etc/sovagrid* /opt/sovagrid* /var/lib/sovagrid* \
             /usr/local/bin/sovagrid* /usr/local/libexec/sovagrid*; do
@@ -65,10 +87,10 @@ if getent passwd | cut -d: -f1 | grep -Eq '^sovagrid([_-]|$)' ||
 fi
 for kind in containers images networks volumes; do
   case $kind in
-    containers) inventory=$(docker ps -a --format '{{.Names}}') ;;
-    images) inventory=$(docker image ls -a --format '{{.Repository}}') ;;
-    networks) inventory=$(docker network ls --format '{{.Name}}') ;;
-    volumes) inventory=$(docker volume ls --format '{{.Name}}') ;;
+    containers) inventory=$(local_docker ps -a --format '{{.Names}}') ;;
+    images) inventory=$(local_docker image ls -a --format '{{.Repository}}') ;;
+    networks) inventory=$(local_docker network ls --format '{{.Name}}') ;;
+    volumes) inventory=$(local_docker volume ls --format '{{.Name}}') ;;
   esac
   if printf '%s\n' "$inventory" | grep -Eq '(^|/)sovagrid([-_/]|$)'; then
     fail "SovaGrid Docker $kind were created"

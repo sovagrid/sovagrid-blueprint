@@ -13,6 +13,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -46,6 +47,10 @@ class RestoreDependencyBootstrapTest(unittest.TestCase):
         cls.source = SOURCE.read_text(encoding="utf-8")
         cls.target_guard = function_body(cls.source, "restore_target_empty",
                                          "restore_source_and_target_verified() {")
+        cls.local_docker = function_body(cls.source, "restore_docker_with_binary",
+                                         "restore_local_docker() {")
+        cls.retained_docker_guard = function_body(cls.source, "restore_retained_docker_empty",
+                                                  "install_core_dependencies() {")
         cls.bootstrap = function_body(cls.source, "restore_dependencies_only",
                                       "if [[ ${1:-} == --restore-dependencies-only ]]; then")
 
@@ -222,6 +227,63 @@ class RestoreDependencyBootstrapTest(unittest.TestCase):
         result = subprocess.run(["bash", "-c", script, "sovagrid", "unrelated/image"],
                                 capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_restore_docker_command_pins_local_socket_despite_ambient_context(self) -> None:
+        docker = self.bin / "docker"
+        docker.write_text(
+            "#!/bin/sh\n"
+            "[ \"${DOCKER_HOST+x}\" != x ] || exit 41\n"
+            "[ \"${DOCKER_CONTEXT+x}\" != x ] || exit 42\n"
+            "[ \"${DOCKER_TLS_VERIFY+x}\" != x ] || exit 43\n"
+            "[ \"${DOCKER_CERT_PATH+x}\" != x ] || exit 44\n"
+            "[ \"$1\" = --host ] && [ \"$2\" = unix:///var/run/docker.sock ] && "
+            "[ \"$3\" = info ] || exit 45\n",
+            encoding="utf-8",
+        )
+        docker.chmod(0o755)
+        script = f"{self.local_docker}\nrestore_docker_with_binary {shlex.quote(str(docker))} info\n"
+        env = os.environ.copy()
+        env.update(DOCKER_HOST="tcp://remote.invalid:2375", DOCKER_CONTEXT="remote",
+                   DOCKER_TLS_VERIFY="1", DOCKER_CERT_PATH="/tmp/remote-certs")
+        result = subprocess.run(["bash", "-c", script], env=env,
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for command in ("info", "ps -a", "image ls -a", "network ls", "volume ls"):
+            self.assertIn("restore_local_docker " + command, self.target_guard)
+        self.assertIn('docker_command=(restore_local_docker)', self.source)
+
+    def test_missing_docker_binary_with_retained_data_refuses_without_mutation(self) -> None:
+        stat_tool = self.bin / "stat"
+        stat_tool.write_text(
+            f"#!{sys.executable}\n"
+            "import os, stat, sys\n"
+            "value = os.stat(sys.argv[3], follow_symlinks=False)\n"
+            "print(value.st_uid if sys.argv[2] == '%u' else "
+            "format(stat.S_IMODE(value.st_mode), 'o'))\n",
+            encoding="utf-8",
+        )
+        stat_tool.chmod(0o755)
+        docker_data = self.root / "var/lib/docker"
+        docker_data.mkdir(mode=0o700)
+        docker_data.chmod(0o700)
+        (docker_data / "old-container").write_text("retained", encoding="utf-8")
+        before = tree_snapshot(self.root)
+        script = (
+            "set -euo pipefail\n"
+            "die() { printf '%s\\n' \"$*\" >&2; exit 1; }\n"
+            f"{self.retained_docker_guard}\n"
+            f"restore_retained_docker_empty {shlex.quote(str(self.root))} {os.getuid()}\n"
+        )
+        env = os.environ.copy()
+        env["PATH"] = str(self.bin) + os.pathsep + env.get("PATH", "")
+        result = subprocess.run(["bash", "-c", script], env=env,
+                                capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires manual inspection", result.stderr)
+        self.assertEqual(tree_snapshot(self.root), before)
+        self.assertIn("restore_retained_docker_empty /", self.target_guard)
+        self.assertLess(self.source.index("restore_target_empty /", self.source.index("restore_dependencies_only() {")),
+                        self.source.index("install_core_dependencies restore"))
 
 
 if __name__ == "__main__":
