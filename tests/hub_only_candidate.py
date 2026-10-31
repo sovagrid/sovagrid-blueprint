@@ -30,9 +30,9 @@ PUBLISHED_COMMITS = {
 
 CANDIDATE_COMMITS = {
     "sovagrid-agent": "7b4dab289ca239266b77584a927f6976f375042c",
-    "sovagrid-hub": "f63511381c9c0fd8d8976891ed462aec9a88398e",
+    "sovagrid-hub": "ae8b2fc6075aa76b418ad202887515b78e9e63d1",
     "sovagrid-vpn": "e500d5a9a97ad329c33af6a06eb1d2f17a541897",
-    "sovagrid-web": "cf126ca047f17df951ff40a5b75eb236b2939bd2",
+    "sovagrid-web": "eb53324c7f2ef6186ad445fb729b6687acf65595",
 }
 
 

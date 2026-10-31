@@ -49,8 +49,8 @@ AGENT_UNIT = "sovagrid-agent.service"
 BASELINE_AGENT_COMMIT = "1085a14a7c0c654a5a6ec16edd028dea1c543c8e"
 EXPECTED_TRIAL_COMPONENTS = {
     "sovagrid-agent": "7b4dab289ca239266b77584a927f6976f375042c",
-    "sovagrid-hub": "f63511381c9c0fd8d8976891ed462aec9a88398e",
-    "sovagrid-web": "cf126ca047f17df951ff40a5b75eb236b2939bd2",
+    "sovagrid-hub": "ae8b2fc6075aa76b418ad202887515b78e9e63d1",
+    "sovagrid-web": "eb53324c7f2ef6186ad445fb729b6687acf65595",
     "sovagrid-vpn": "e500d5a9a97ad329c33af6a06eb1d2f17a541897",
 }
 
@@ -509,7 +509,15 @@ def run(archive_sha256: str) -> None:
         try:
             planner.apply(archive_sha256, current, old, review)
         except planner.Refused as exc:
-            require(str(exc) == "VM_PRECOMMIT_FAULT", "wrong precommit failure")
+            causes = []
+            item: BaseException | None = exc
+            while item is not None and len(causes) < 4:
+                value = str(item)
+                causes.append(value if re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", value)
+                              else type(item).__name__)
+                item = item.__cause__
+            require(str(exc) == "VM_PRECOMMIT_FAULT",
+                    "wrong precommit failure: " + "/".join(causes))
         else:
             require(False, "precommit fault unexpectedly succeeded")
     _assert_restored(planner, old_sha, old_state, old_baseline)
