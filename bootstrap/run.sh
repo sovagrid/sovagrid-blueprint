@@ -21,6 +21,8 @@ die() { printf 'SovaGrid: %s\n' "$*" >&2; exit 1; }
 setup_mode=install
 panel_path=${SOVAGRID_PANEL_PATH:-}
 public_address=${SOVAGRID_PUBLIC_ADDRESS:-}
+public_address_supplied=0
+if [[ ${SOVAGRID_PUBLIC_ADDRESS+x} ]]; then public_address_supplied=1; fi
 root_behavior=${SOVAGRID_ROOT_BEHAVIOR:-}
 while (( $# )); do
   case $1 in
@@ -28,7 +30,7 @@ while (( $# )); do
     --public-address|--panel-path|--root-behavior)
       (( $# >= 2 )) || die "для $1 нужно значение"
       case $1 in
-        --public-address) public_address=$2 ;;
+        --public-address) public_address=$2; public_address_supplied=1 ;;
         --panel-path) panel_path=$2 ;;
         --root-behavior) root_behavior=$2 ;;
       esac
@@ -36,6 +38,73 @@ while (( $# )); do
     *) die "неизвестный параметр: $1" ;;
   esac
 done
+
+suggest_public_ipv4() {
+  command -v python3 >/dev/null 2>&1 && command -v ip >/dev/null 2>&1 || return 0
+  python3 -B -I - <<'PY'
+# SOVAGRID_BOOTSTRAP_ADDRESS_SUGGESTION_PY
+import ipaddress
+import json
+import subprocess
+
+def single_public_ipv4(interfaces):
+    addresses = set()
+    if not isinstance(interfaces, list):
+        return ''
+    for interface in interfaces:
+        if (not isinstance(interface, dict) or
+                not isinstance(interface.get('flags'), list) or
+                'UP' not in interface['flags'] or
+                not isinstance(interface.get('addr_info'), list)):
+            continue
+        for record in interface['addr_info']:
+            if (not isinstance(record, dict) or record.get('family') != 'inet' or
+                    record.get('scope') != 'global' or
+                    not isinstance(record.get('local'), str)):
+                continue
+            try:
+                address = ipaddress.IPv4Address(record['local'])
+            except ipaddress.AddressValueError:
+                continue
+            if address.is_global and not address.is_multicast:
+                addresses.add(str(address))
+    return next(iter(addresses)) if len(addresses) == 1 else ''
+
+def discover():
+    try:
+        reply = subprocess.run(['ip', '-j', '-4', 'address', 'show', 'scope', 'global'],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=5, check=False)
+        if reply.returncode or len(reply.stdout) > 65536:
+            return ''
+        return single_public_ipv4(json.loads(reply.stdout))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ''
+
+if __name__ == '__main__':
+    print(discover())
+PY
+}
+
+suggest_address_if_interactive() {
+  if [[ ${1:-0} == 1 && $setup_mode == install &&
+        -z ${SOVAGRID_SETUP_NONINTERACTIVE:-} && $public_address_supplied == 0 ]]; then
+    public_address=$(suggest_public_ipv4) || public_address=''
+    if [[ -n $public_address ]]; then
+      say "Найден публичный IPv4 сетевого интерфейса: $public_address. Enter выберет этот адрес."
+    else
+      say 'Публичный IPv4 не удалось определить однозначно. Укажите адрес вручную или выберите доступ только через SSH.'
+    fi
+  fi
+}
+
+apply_public_address_answer() {
+  case ${1:-} in
+    -) public_address='' ;;
+    '') ;; # Enter accepts the suggested or explicitly supplied address.
+    *) public_address=$1 ;;
+  esac
+}
 
 configure_web() {
 python3 -B -I - "$source_root" "$manifest_sha256" "$public_address" "$panel_path" "$root_behavior" <<'PY'
@@ -247,10 +316,11 @@ if [[ -z ${SOVAGRID_SETUP_NONINTERACTIVE:-} ]] &&
   say 'Публичный адрес нужен, чтобы открывать панель с телефона и в браузере через интернет без SSH-туннеля.'
   say 'Введите публичный IPv4 этого Ubuntu-сервера из панели провайдера или домен, указывающий на него.'
   say 'Для HTTPS сервер должен принимать входящие TCP-соединения на портах 80 и 443.'
-  say 'Если поле останется пустым, UI запустится только для доступа через SSH-туннель.'
+  suggest_address_if_interactive 1
+  say 'Введите -, чтобы оставить только SSH-туннель. Enter сохраняет адрес в скобках; без адреса выбирается только SSH.'
   printf 'Публичный IPv4 сервера или домен [%s]: ' "$public_address" >&"$tty_fd"
   IFS= read -r answer <&"$tty_fd" || answer=''
-  [[ -z $answer ]] || public_address=$answer
+  apply_public_address_answer "$answer"
 fi
 [[ $panel_path =~ ^/([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?/){1,3}$ &&
    ${#panel_path} -le 96 && $panel_path != /api/* && $panel_path != /healthz/* ]] ||
