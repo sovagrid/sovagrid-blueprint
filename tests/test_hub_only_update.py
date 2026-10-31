@@ -260,6 +260,13 @@ class HubOnlyUpdatePolicy(unittest.TestCase):
                     json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n")
                 with self.assertRaisesRegex(update.Refused, "EXTERNAL_APPLY_BUSY"):
                     update._external_apply_idle(request_id)
+                apply_state[0] = "inactive"
+                update._external_apply_idle(read_only_uncertain=True)
+                with self.assertRaisesRegex(update.Refused, "EXTERNAL_APPLY_BUSY"):
+                    update._external_apply_idle()
+                apply_state[0] = "activating"
+                with self.assertRaisesRegex(update.Refused, "EXTERNAL_APPLY_BUSY"):
+                    update._external_apply_idle(read_only_uncertain=True)
                 status["phase"] = "running"
                 status["error"] = None
                 (operation / "status.json").write_text(

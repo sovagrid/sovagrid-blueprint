@@ -234,7 +234,8 @@ def _external_runtime() -> dict[str, dict]:
     return result
 
 
-def _external_apply_idle(own_request_id: str | None = None) -> None:
+def _external_apply_idle(own_request_id: str | None = None, *,
+                         read_only_uncertain: bool = False) -> None:
     """An independent Agent writer cannot overlap a local Hub source swap."""
     if own_request_id is not None:
         try:
@@ -289,12 +290,13 @@ def _external_apply_idle(own_request_id: str | None = None) -> None:
         except (OSError, ValueError):
             raise Refused("EXTERNAL_APPLY_STATE") from None
         own_running = (request_id == own_request_id and status.get("phase") == "running") if isinstance(status, dict) else False
+        uncertain_read = (read_only_uncertain and status.get("phase") == "uncertain") if isinstance(status, dict) else False
         need(isinstance(status, dict) and set(status) == {
              "format", "request_id", "phase", "created_at", "updated_at", "error"} and
              raw == (json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n").encode() and
              type(status["format"]) is int and status["format"] == 1 and
              status["request_id"] == request_id and
-             (status["phase"] in ("complete", "failed") or own_running) and
+             (status["phase"] in ("complete", "failed") or own_running or uncertain_read) and
              type(status["created_at"]) is int and
              type(status["updated_at"]) is int and
              1 <= status["created_at"] <= status["updated_at"] <= 253402300799 and
@@ -366,7 +368,8 @@ def _container_health() -> None:
     need(inventory.is_file() and not inventory.is_symlink(), "VPN_INVENTORY")
 
 
-def inspect(*, external_apply_request_id: str | None = None) -> tuple[str, dict, dict[str, str], str]:
+def inspect(*, external_apply_request_id: str | None = None,
+            read_only_uncertain: bool = False) -> tuple[str, dict, dict[str, str], str]:
     need(os.geteuid() == 0, "ROOT")
     release = Path("/etc/os-release").read_text()
     need(re.search(r"(?m)^ID=ubuntu$", release) is not None, "UBUNTU")
@@ -405,7 +408,8 @@ def inspect(*, external_apply_request_id: str | None = None) -> tuple[str, dict,
     if common.web_agent_managed():
         need(all(_unit_state(unit)["active"] for unit in WEB_AGENT_UNITS), "WEB_AGENT")
         common.web_agent_socket_ready()
-    _external_apply_idle(external_apply_request_id)
+    _external_apply_idle(external_apply_request_id,
+                         read_only_uncertain=read_only_uncertain)
     state = promotion.inspect()
     need(state.get("phase") == "activated" and state.get("external_agent_preserved") is True,
          "PROMOTION_STATE")

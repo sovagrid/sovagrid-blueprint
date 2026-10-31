@@ -99,6 +99,8 @@ class ExternalAgentPreviewTests(unittest.TestCase):
     def test_status_reports_only_verified_hashes_and_socket_metadata(self):
         with mock.patch.object(previewer, "_idle_endpoint_present", return_value=True):
             result = previewer.status()
+        self.assertEqual(previewer.update.inspect.call_args.kwargs,
+                         {"read_only_uncertain": True})
         self.assertTrue(result["hub_only"])
         self.assertEqual(result["current_hub_manifest_sha256"], CURRENT)
         self.assertEqual(result["external_agent_manifest_sha256"], EXTERNAL)

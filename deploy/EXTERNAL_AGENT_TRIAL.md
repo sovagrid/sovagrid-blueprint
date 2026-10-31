@@ -6,7 +6,7 @@ part of a Hub-only update, the signed full-server feed, or an automatic timer.
 The source archive must already be staged by its SHA-256 in the local candidate
 store; this CLI does not download a package or accept a URL.
 
-`external_agent_update.py` exposes four operator-facing operations (plus boot
+`external_agent_update.py` exposes five operator-facing operations (plus boot
 `recover` and the internal `trial-start-guard`):
 
 ```text
@@ -14,6 +14,7 @@ status
 preview ARCHIVE_SHA256 CURRENT_HUB_MANIFEST_SHA256
 preflight ARCHIVE_SHA256 CURRENT_HUB_MANIFEST_SHA256
 apply ARCHIVE_SHA256 CURRENT_HUB_MANIFEST_SHA256 EXTERNAL_AGENT_MANIFEST_SHA256 REVIEW_SHA256
+reconcile REQUEST_UUID
 ```
 
 All operations require root. `status` returns verified Hub and external Agent
@@ -90,9 +91,19 @@ operation status and never submits an automatic second apply. The route is
 limited to a same-origin global administrator. It does not upload or stage a
 server bundle from the browser.
 
-An `uncertain` result deliberately blocks another Hub-only source swap until an
-administrator checks the original Agent, recovery journal, unit state and Hub
-state. It must not be treated as a failed preflight or retried with a new UUID.
+An `uncertain` result deliberately blocks another Hub-only source swap. The
+read-only `status` command remains available after the worker exits and the
+Agent returns healthy, but it
+does not clear the operation. A root administrator can run `reconcile
+REQUEST_UUID` after any required `recover` work. The command verifies the
+exact root-owned request, the stopped worker with no queued systemd job, the
+absence of transaction and trial artifacts, the pinned Hub source, all
+enrollment-managed Agent files, the active Agent process and the external
+baseline. It records `complete` only for the pinned new source, or `failed`
+only for the pinned old source. A later/overlapping operation, pending recovery,
+changed source or unhealthy service leaves the result `uncertain`. The command
+never restarts or retries an apply. A new UUID is not a substitute for
+reconciliation.
 The old external Agent without the idle socket still needs a separate one-time
 bootstrap. The fixed-unit path, including precommit rollback, SIGKILL recovery,
 same-PID `ACTIVE`/`DETACH` and normal dispatch, passed the

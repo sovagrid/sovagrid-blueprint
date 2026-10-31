@@ -92,6 +92,7 @@ def _module(name: str, filename: str):
 update = _module("sovagrid_external_agent_hub_only_update", "hub_only_update.py")
 remote = _module("sovagrid_external_agent_enrollment", "remote_agent.py")
 recovery = _module("sovagrid_external_agent_recovery", "external_agent_recovery.py")
+operation = _module("sovagrid_external_agent_operation", "external_agent_operation.py")
 common = update.common
 promotion = update.promotion
 
@@ -523,7 +524,10 @@ def status() -> dict:
     """Return verified local manifest IDs without a candidate or secret data."""
     need(os.geteuid() == 0, "ROOT")
     with _promotion_lock():
-        current, promoted, _commits, baseline = update.inspect()
+        # An uncertain operation still needs a read-only status page. The
+        # normal Hub-only writer continues to reject it until reconciliation.
+        current, promoted, _commits, baseline = update.inspect(
+            read_only_uncertain=True)
         hub_only = (promoted.get("phase") == "activated" and
                     promoted.get("external_agent_preserved") is True and
                     promoted.get("baseline_sha256") == baseline)
@@ -537,6 +541,140 @@ def status() -> dict:
             result["external_agent_manifest_sha256"] = external_sha
             result["idle_endpoint_present"] = _idle_endpoint_present()
         return result
+
+
+def _operation_unit_quiescent(request_id: str) -> None:
+    """Prove that the one-shot worker cannot still be changing the Agent."""
+    unit = "sovagrid-external-agent-apply@" + request_id + ".service"
+    fields = ("Id", "ActiveState", "MainPID", "Job", "ControlGroup",
+              "FragmentPath", "NeedDaemonReload")
+    try:
+        result = subprocess.run(
+            ["/usr/bin/systemctl", "show", unit,
+             *("--property=" + field for field in fields), "--no-pager"],
+            capture_output=True, timeout=5, check=False)
+        need(result.returncode == 0 and len(result.stdout) <= 4096,
+             "OPERATION_WORKER_BUSY")
+        lines = result.stdout.decode("ascii").splitlines()
+        pairs = [line.split("=", 1) for line in lines]
+        need(all(len(pair) == 2 for pair in pairs), "OPERATION_WORKER_BUSY")
+        values = dict(pairs)
+        need(len(values) == len(pairs) and set(values) == set(fields) and
+             values["Id"] == unit and
+             values["ActiveState"] in ("inactive", "failed") and
+             values["MainPID"] == "0" and values["Job"] in ("", "0") and
+             values["FragmentPath"] == update.EXTERNAL_APPLY_UNIT and
+             values["NeedDaemonReload"] == "no", "OPERATION_WORKER_BUSY")
+        source_unit = Path(__file__).with_name("sovagrid-external-agent-apply@.service")
+        installed_unit = Path(update.EXTERNAL_APPLY_UNIT)
+        need(promotion._read_regular(installed_unit, 8192) ==
+             promotion._read_regular(source_unit, 8192), "OPERATION_WORKER_BUSY")
+        cgroup = values["ControlGroup"]
+        if cgroup:
+            expected = ("/sovagrid-external-agent-apply@" + request_id + ".service")
+            need(cgroup.endswith(expected) and
+                 re.fullmatch(r"/(?:[A-Za-z0-9_.:-]+/)*"
+                              r"sovagrid-external-agent-apply@"
+                              + re.escape(request_id) + r"\.service", cgroup) is not None,
+                 "OPERATION_WORKER_BUSY")
+            need(_cgroup_empty(cgroup, pattern=re.compile(
+                 r"/(?:[A-Za-z0-9_.:-]+/)*sovagrid-external-agent-apply@"
+                 + re.escape(request_id) + r"\.service\Z")),
+                 "OPERATION_WORKER_BUSY")
+    except Refused:
+        raise
+    except (OSError, UnicodeError, ValueError, subprocess.TimeoutExpired):
+        raise Refused("OPERATION_WORKER_BUSY") from None
+
+
+def _only_uncertain_operation(request_id: str) -> dict:
+    """A later ambiguous request would make the observed source ambiguous."""
+    path = operation._record_dir(request_id)
+    request = operation._request(path, request_id)
+    current = operation._status(path, request_id)
+    need(current["phase"] == "uncertain", "OPERATION_NOT_UNCERTAIN")
+    entries = [item for item in operation.OPERATIONS.iterdir()
+               if item.name != ".lock"]
+    need(len(entries) <= 128, "OPERATION_STATE")
+    for item in entries:
+        try:
+            identifier = operation._id(item.name)
+        except operation.Refused:
+            raise Refused("OPERATION_STATE") from None
+        other = operation._record_dir(identifier)
+        operation._request(other, identifier)
+        status_value = operation._status(other, identifier)
+        need(status_value["phase"] in
+             (("uncertain",) if identifier == request_id else ("complete", "failed")),
+             "OPERATION_AMBIGUOUS")
+        if identifier != request_id:
+            # A later completed request could have produced the observed
+            # source. Ties also require manual review instead of a guess.
+            need(status_value["updated_at"] < current["created_at"],
+                 "OPERATION_AMBIGUOUS")
+    return request
+
+
+def reconcile(request_id: str) -> dict:
+    """Resolve one uncertain request only from a healthy, fully settled host.
+
+    This never retries apply or guesses from a journal. A pending journal,
+    trial guard, other uncertain request, or ambiguous source leaves the
+    operation uncertain for explicit host recovery and another inspection.
+    """
+    need(os.geteuid() == 0 and os.getegid() == 0 and
+         sys.platform.startswith("linux"), "ROOT_LINUX")
+    try:
+        request_id = operation._id(request_id)
+    except operation.Refused:
+        raise Refused("OPERATION_ID") from None
+    with contextlib.ExitStack() as locks:
+        locks.callback(os.close, _exclusive_lock(update.PROMOTION_LOCK))
+        locks.callback(os.close, _exclusive_lock(update.CANDIDATES / ".lock"))
+        enrollment = remote.Enrollment(executable=remote.TARGET_HELPER)
+        locks.enter_context(enrollment.locked("target", readonly=True))
+        request = _only_uncertain_operation(request_id)
+        _operation_unit_quiescent(request_id)
+        current, promoted, _commits, baseline = update.inspect(
+            read_only_uncertain=True)
+        need(current == request["current_hub_manifest_sha256"] and
+             promoted.get("phase") == "activated" and
+             promoted.get("external_agent_preserved") is True and
+             promoted.get("baseline_sha256") == baseline and
+             request["external_agent_manifest_sha256"] != current,
+             "OPERATION_SOURCE_CHANGED")
+        transaction = recovery.Recovery(enrollment.files)
+        need(transaction._load_journal() is None and
+             transaction._load_committed_marker() is None and
+             enrollment.files.inspect(recovery.TXN, directory=True, private=True,
+                                      missing=True) is None and
+             not any(os.path.lexists(name) for name in
+                     (recovery.TRIAL_DROPIN, recovery.TRIAL_GATE_SOCKET,
+                      TRIAL_WATCH_SOCKET, TRIAL_WATCH_EPOCH)),
+             "OPERATION_RECOVERY_PENDING")
+        external_sha, _source, _state = _external_snapshot_locked(enrollment)
+        running = _external_unit_properties()
+        pid = running["MainPID"]
+        need(running["ActiveState"] == "active" and
+             running["SubState"] == "running" and pid.isdecimal() and
+             int(pid) > 1 and _proc_start_ticks(int(pid)) is not None and
+             promotion.capture_external() == promotion._private_json(
+                 promotion.BASELINE), "OPERATION_AGENT_UNHEALTHY")
+        if external_sha == current:
+            phase, error = "complete", None
+        elif external_sha == request["external_agent_manifest_sha256"]:
+            phase, error = "failed", "RECONCILED_ROLLBACK"
+        else:
+            raise Refused("OPERATION_SOURCE_CHANGED")
+        _operation_unit_quiescent(request_id)
+        path = operation._record_dir(request_id)
+        try:
+            operation._transition(path, request_id, frozenset(("uncertain",)),
+                                  phase, error)
+        except operation.Refused:
+            raise Refused("OPERATION_STATE") from None
+    return {"protocol": 1, "request_id": request_id, "phase": phase,
+            "external_agent_manifest_sha256": external_sha}
 
 
 def _changes(before: dict, after: dict) -> list[dict[str, str]]:
@@ -1568,9 +1706,10 @@ def _proc_start_ticks(pid: int, *, root: Path = Path("/")) -> int | None:
     return int(start)
 
 
-def _cgroup_empty(cgroup: str, *, root: Path = Path("/"), owner: int = 0) -> bool:
+def _cgroup_empty(cgroup: str, *, root: Path = Path("/"), owner: int = 0,
+                  pattern=EXTERNAL_AGENT_CGROUP) -> bool:
     """Inspect the exact cgroup-v2 unit subtree, including delegated children."""
-    need(isinstance(cgroup, str) and EXTERNAL_AGENT_CGROUP.fullmatch(cgroup)
+    need(isinstance(cgroup, str) and pattern.fullmatch(cgroup)
          is not None, "EXTERNAL_CGROUP_INVALID")
     mount = root / "sys/fs/cgroup"
     need((mount / "cgroup.controllers").is_file(), "EXTERNAL_CGROUP_UNAVAILABLE")
@@ -2395,6 +2534,8 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if args == ["status"]:
         action = lambda: status()
+    elif len(args) == 2 and args[0] == "reconcile":
+        action = lambda: reconcile(args[1])
     elif args == ["recover"]:
         action = lambda: recover_pending()
     elif args == ["trial-start-guard"]:
@@ -2404,7 +2545,7 @@ def main(argv: list[str] | None = None) -> int:
     elif len(args) == 5 and args[0] == "apply":
         action = lambda: apply(args[1], args[2], args[3], args[4])
     else:
-        print("usage: external_agent_update.py status | {preview|preflight} ARCHIVE_SHA256 CURRENT_MANIFEST_SHA256 | apply ARCHIVE_SHA256 CURRENT_MANIFEST_SHA256 EXTERNAL_MANIFEST_SHA256 REVIEW_SHA256 | recover | trial-start-guard", file=sys.stderr)
+        print("usage: external_agent_update.py status | reconcile REQUEST_UUID | {preview|preflight} ARCHIVE_SHA256 CURRENT_MANIFEST_SHA256 | apply ARCHIVE_SHA256 CURRENT_MANIFEST_SHA256 EXTERNAL_MANIFEST_SHA256 REVIEW_SHA256 | recover | trial-start-guard", file=sys.stderr)
         return 2
     try:
         result = action()
@@ -2413,6 +2554,9 @@ def main(argv: list[str] | None = None) -> int:
         return 40
     except recovery.RecoveryError as exc:
         print("SG_EXTERNAL_AGENT_UPDATE_REFUSE:" + str(exc), file=sys.stderr)
+        return 40
+    except operation.Refused:
+        print("SG_EXTERNAL_AGENT_UPDATE_REFUSE:OPERATION_STATE", file=sys.stderr)
         return 40
     except Exception as exc:
         print(_safe_exception_marker(exc))
