@@ -106,6 +106,19 @@ apply_public_address_answer() {
   esac
 }
 
+bootstrap_installation_guard() {
+  local installation_lock=/run/sovagrid-installation.lock
+  [[ ! -L $installation_lock ]] || die 'небезопасная общая блокировка установки'
+  if [[ ! -e $installation_lock ]]; then
+    ( set -o noclobber; : > "$installation_lock" ) 2>/dev/null || die 'небезопасная общая блокировка установки'
+  fi
+  [[ -f $installation_lock && $(stat -c '%u:%g:%a:%h' "$installation_lock") == 0:0:600:1 ]] || die 'небезопасная общая блокировка установки'
+  exec 6>>"$installation_lock"
+  [[ $(stat -Lc '%d:%i' /proc/self/fd/6) == "$(stat -c '%d:%i' "$installation_lock")" ]] || die 'небезопасная общая блокировка установки'
+  flock -n 6 || die 'другая установка, восстановление или обновление SovaGrid уже выполняется'
+  [[ ! -e /var/lib/.sovagrid-host-restore-in-progress && ! -L /var/lib/.sovagrid-host-restore-in-progress ]] || die 'сначала завершите или отмените прерванное восстановление SovaGrid'
+}
+
 configure_web() {
 python3 -B -I - "$source_root" "$manifest_sha256" "$public_address" "$panel_path" "$root_behavior" <<'PY'
 # SOVAGRID_BOOTSTRAP_WEB_CONFIGURE_PY
@@ -293,6 +306,7 @@ if [[ $setup_mode == configure ]]; then
   [[ -f /var/lib/sovagrid/.managed-by-run-sh && ! -L /var/lib/sovagrid/.managed-by-run-sh &&
      $(stat -c '%u:%g:%a:%h' /var/lib/sovagrid/.managed-by-run-sh) == 0:0:600:1 ]] ||
     die 'нужна установленная управляемая SovaGrid'
+  bootstrap_installation_guard
   configure_web || die 'публичный доступ не настроен; проверьте адрес и доступность TCP 80/443'
   say 'Публичный HTTPS настроен. Используйте прежние логин и пароль Hub.'
   exit 0
@@ -313,12 +327,14 @@ if [[ -z ${SOVAGRID_SETUP_NONINTERACTIVE:-} ]] &&
   printf 'Путь панели [%s]: ' "$panel_path" >&"$tty_fd"
   IFS= read -r answer <&"$tty_fd" || answer=''
   [[ -z $answer ]] || panel_path=$answer
-  say 'Публичный адрес нужен, чтобы открывать панель с телефона и в браузере через интернет без SSH-туннеля.'
+  say 'Адрес веб-панели — ссылка для открытия этой панели с телефона и в браузере через интернет без SSH-туннеля.'
   say 'Введите публичный IPv4 этого Ubuntu-сервера из панели провайдера или домен, указывающий на него.'
+  say 'Домен не обязателен. Если используете домен, вы должны управлять его DNS и направить его на этот сервер.'
+  say 'Это адрес самой панели; дополнительные серверы подключаются позже по SSH в интерфейсе.'
   say 'Для HTTPS сервер должен принимать входящие TCP-соединения на портах 80 и 443.'
   suggest_address_if_interactive 1
   say 'Введите -, чтобы оставить только SSH-туннель. Enter сохраняет адрес в скобках; без адреса выбирается только SSH.'
-  printf 'Публичный IPv4 сервера или домен [%s]: ' "$public_address" >&"$tty_fd"
+  printf 'Адрес веб-панели (IPv4 или свой домен) [%s]: ' "$public_address" >&"$tty_fd"
   IFS= read -r answer <&"$tty_fd" || answer=''
   apply_public_address_answer "$answer"
 fi
@@ -345,6 +361,7 @@ fi
   die 'небезопасные права файла блокировки установки'
 exec 9>>/run/sovagrid-bootstrap.lock
 flock -n 9 || die 'другая первичная установка уже выполняется'
+bootstrap_installation_guard
 [[ ! -e $source_root && ! -L $source_root ]] || die 'исходники появились во время подготовки'
 stage=$(mktemp -d /opt/.sovagrid-bootstrap.XXXXXXXX) || die 'не удалось создать закрытый временный каталог'
 chmod 0700 "$stage"
@@ -382,7 +399,7 @@ options=(--with-terminal --with-files --with-wireguard --with-containers)
 if systemctl list-unit-files ssh.service --no-legend 2>/dev/null | grep -q '^ssh\.service '; then
   options+=(--with-journal --journal-unit ssh.service)
 fi
-bash "$source_root/sovagrid-blueprint/run.sh" "${options[@]}" ||
+SOVAGRID_INSTALLATION_LOCK_FD=6 bash "$source_root/sovagrid-blueprint/run.sh" "${options[@]}" ||
   die 'установка прервалась; исходники сохранены для диагностики, состояние служб не очищено'
 
 say 'Вход в Hub: admin. После входа смените начальный пароль в настройках.'
