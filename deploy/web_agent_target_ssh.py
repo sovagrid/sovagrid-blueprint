@@ -19,8 +19,10 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import struct
@@ -28,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 
 
@@ -43,6 +46,9 @@ PASSPHRASE_PROMPT = re.compile(r"(?i)\bpassphrase\b")
 MAX_SECRET = 1024
 MAX_SCAN = 32768
 MAX_ASKPASS_REQUEST = 2048
+HOST_KEY_DIAGNOSTIC = re.compile(
+    rb"^debug1: Server host key: (ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)) "
+    rb"(SHA256:[A-Za-z0-9+/]{43})\r?$", re.MULTILINE)
 
 
 class TargetSSHError(RuntimeError):
@@ -157,6 +163,102 @@ def reviewed_key_blob(blob: str, fingerprint: str) -> tuple[str, str]:
     except (UnicodeError, ValueError, struct.error):
         raise TargetSSHError("SSH-ключ изменился или не совпал с подтверждённым отпечатком.") from None
     return kind, blob
+
+
+def _read_bounded_probe_diagnostic(process: subprocess.Popen, *, timeout: float = 25) -> bytes:
+    """Read at most one byte beyond MAX_SCAN, then stop the whole SSH route."""
+    diagnostic = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        if process.stderr is None:
+            raise OSError("probe stderr unavailable")
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stderr, selectors.EVENT_READ)
+            while len(diagnostic) <= MAX_SCAN:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    break
+                try:
+                    chunk = os.read(process.stderr.fileno(),
+                                    min(4096, MAX_SCAN + 1 - len(diagnostic)))
+                except InterruptedError:
+                    continue
+                if not chunk:
+                    break
+                diagnostic.extend(chunk)
+    finally:
+        # A separate session lets us reap the ProxyCommand child as well as
+        # the outer SSH client after EOF, timeout, or diagnostic overflow.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            # Restricted test sandboxes may deny process-group signals.
+            # Closing the outer client also closes the -W proxy pipes.
+            if process.poll() is None:
+                process.kill()
+        process.wait(timeout=2)
+        if process.stderr is not None:
+            process.stderr.close()
+    return bytes(diagnostic)
+
+
+def _probe_jumped_target_host_key(config: Path, jump_broker: "AskpassBroker",
+                                  fingerprint: str) -> None:
+    """Check the live target key over the pinned, forward-only jump route.
+
+    OpenSSH does the target key exchange and strict known-hosts check. The
+    target gets no credential and no remote command. Only the jump SSH child
+    receives an askpass capability; its stderr is suppressed by the proxy so
+    it cannot forge the target client's diagnostic.
+    """
+    nonce = jump_broker.arm()
+    environment = os.environ.copy()
+    environment.pop("SSH_AUTH_SOCK", None)
+    environment.pop("SSH_ASKPASS", None)
+    environment.pop("SSH_ASKPASS_REQUIRE", None)
+    environment.pop("SOVAGRID_WEB_AGENT_ASKPASS_SOCKET", None)
+    environment.pop("SOVAGRID_WEB_AGENT_ASKPASS_NONCE", None)
+    environment["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_SOCKET"] = str(jump_broker.path)
+    environment["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_NONCE"] = nonce
+    environment["SOVAGRID_WEB_AGENT_TARGET_PROBE"] = "1"
+    argv = ["/usr/bin/ssh", "-F", str(config), "-v", "-N", "-T",
+            "-o", "BatchMode=yes", "-o", "PreferredAuthentications=none",
+            "-o", "ClearAllForwardings=yes",
+            "-o", "PubkeyAuthentication=no", "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no", "-o", "GSSAPIAuthentication=no",
+            "-o", "HostbasedAuthentication=no", "-o", "NumberOfPasswordPrompts=0",
+            "sovagrid-target"]
+    try:
+        process = subprocess.Popen(argv, env=environment, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                   start_new_session=True)
+        diagnostic = _read_bounded_probe_diagnostic(process)
+    except OSError:
+        raise TargetSSHError("SSH-ключ сервера не удалось получить.") from None
+    finally:
+        jump_broker.disarm()
+    if not isinstance(diagnostic, bytes) or len(diagnostic) > MAX_SCAN:
+        raise TargetSSHError("SSH-ключ сервера не удалось подтвердить.")
+    matches = HOST_KEY_DIAGNOSTIC.findall(diagnostic)
+    if len(matches) != 1:
+        raise TargetSSHError("SSH-ключ сервера не удалось подтвердить.")
+    _kind, observed = matches[0]
+    if observed.decode("ascii") == fingerprint:
+        alias = host_key_alias(fingerprint).encode("ascii")
+        known = (b"debug1: Host '" + alias +
+                 b"' is known and matches the ")
+        if not any(line.startswith(known) and line.endswith(b" host key.")
+                   for line in diagnostic.splitlines()):
+            raise TargetSSHError("SSH-ключ сервера не удалось подтвердить.")
+        return
+    # OpenSSH reports strict known-hosts mismatch before verifying the KEX
+    # signature. This live key offer is grounds to require independent
+    # re-review, never grounds to trust the offered key automatically.
+    if b"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!" in diagnostic:
+        raise HostKeyChanged("SSH-ключ изменился или не совпал с подтверждённым отпечатком.")
+    raise TargetSSHError("SSH-ключ сервера не удалось подтвердить.")
 
 
 def _prompt_matches(method: str, prompt: str) -> bool:
@@ -339,6 +441,7 @@ def _jump_proxy_client(directory: str) -> int:
                 type(route["port"]) is not int or not 1 <= route["port"] <= 65535):
             return 1
         environment = os.environ.copy()
+        quiet_probe = environment.pop("SOVAGRID_WEB_AGENT_TARGET_PROBE", "") == "1"
         jump_socket = environment.pop("SOVAGRID_WEB_AGENT_JUMP_ASKPASS_SOCKET", "")
         jump_nonce = environment.pop("SOVAGRID_WEB_AGENT_JUMP_ASKPASS_NONCE", "")
         if (jump_socket != str(folder / "jump.sock") or
@@ -355,6 +458,14 @@ def _jump_proxy_client(directory: str) -> int:
         argv = ["/usr/bin/ssh", "-F", str(folder / "ssh_config_jump"), "-T",
                 "-o", "BatchMode=no", "-o", "ClearAllForwardings=yes",
                 "-W", destination, "sovagrid-target"]
+        if quiet_probe:
+            # The outer SSH client's debug output is the target-key proof.
+            # A jump banner or warning must not be able to impersonate it.
+            null_fd = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(null_fd, 2)
+            finally:
+                os.close(null_fd)
         os.execve(argv[0], argv, environment)
     except (OSError, UnicodeError, ValueError, TypeError):
         return 1
@@ -554,6 +665,8 @@ class PinnedTargetSSH:
             if self._jump is not None:
                 self._jump_broker = AskpassBroker(folder / "jump.sock",
                     self._jump["method"], self._jump_secret, peer_uid=self._peer_uid)
+                _probe_jumped_target_host_key(self.config_path, self._jump_broker,
+                                              self.fingerprint)
             self._secret = ""
             self._private_key = ""
             self._jump_secret = self._jump_private_key = ""

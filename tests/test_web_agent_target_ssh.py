@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import stat
 import struct
@@ -24,7 +25,9 @@ sys.path.insert(0, str(ROOT / "vendor/connect"))
 sys.path.insert(0, str(ROOT / "deploy"))
 
 from web_agent_target_ssh import (AskpassBroker, HostKeyChanged, PinnedTargetSSH, TargetSSHError,
-                                  _jump_proxy_client, host_key_alias, reviewed_key_blob,
+                                  MAX_SCAN, _jump_proxy_client, _probe_jumped_target_host_key,
+                                  _read_bounded_probe_diagnostic,
+                                  host_key_alias, reviewed_key_blob,
                                   reviewed_public_key)
 
 
@@ -146,7 +149,9 @@ class TransportTests(unittest.TestCase):
         blob, _ = fixture_key()
         return f"example.invalid ssh-ed25519 {blob}\n".encode()
 
-    def test_private_key_and_strict_host_pin_live_only_in_private_runtime_directory(self):
+    @mock.patch("web_agent_target_ssh._probe_jumped_target_host_key",
+                side_effect=AssertionError("direct SSH used the jump probe"))
+    def test_private_key_and_strict_host_pin_live_only_in_private_runtime_directory(self, _probe):
         _blob, fingerprint = fixture_key()
         with tempfile.TemporaryDirectory() as directory:
             transport = PinnedTargetSSH(host="example.invalid", port=2222, username="root",
@@ -217,7 +222,8 @@ class TransportTests(unittest.TestCase):
                 fingerprint=fingerprint, method="password", password="pw", private_key="KEY",
                 require_root=False)
 
-    def test_jump_uses_two_pins_and_two_independent_secret_brokers(self):
+    @mock.patch("web_agent_target_ssh._probe_jumped_target_host_key")
+    def test_jump_uses_two_pins_and_two_independent_secret_brokers(self, probe):
         target_blob, target_fp = fixture_key()
         jump_blob, jump_fp = fixture_key(7)
         jump = {"host": "jump.example", "port": 2201, "username": "relay",
@@ -233,6 +239,8 @@ class TransportTests(unittest.TestCase):
                     runtime_root=Path(directory), require_root=False, scanner=scanner,
                     peer_uid=lambda _connection: os.geteuid(), python=sys.executable) as transport:
                 self.assertEqual(transport.options.jump_host, "jump.example")
+                probe.assert_called_once_with(transport.config_path, transport.jump_broker,
+                                              target_fp)
                 self.assertEqual(transport.options.jump_host_key_alias, host_key_alias(jump_fp))
                 folder = transport.config_path.parent
                 self.assertEqual((folder / "known_hosts").read_text(),
@@ -306,7 +314,29 @@ class TransportTests(unittest.TestCase):
                     scanner=lambda _host, _port: wrong):
                     self.fail("changed jump key was accepted")
 
-    def test_jump_private_key_isolated_from_target_password(self):
+    def test_changed_live_target_key_closes_transport_before_rpc(self):
+        target_blob, target_fp = fixture_key()
+        jump_blob, jump_fp = fixture_key(7)
+        jump = {"host": "jump.example", "port": 22, "username": "relay",
+                "fingerprint": jump_fp, "method": "password", "password": "jump-secret",
+                "private_key": "", "passphrase": "", "host_key_blob": jump_blob}
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("web_agent_target_ssh._probe_jumped_target_host_key",
+                            side_effect=HostKeyChanged("changed")) as probe:
+                with self.assertRaises(HostKeyChanged):
+                    with PinnedTargetSSH(host="target.example", port=22, username="root",
+                            fingerprint=target_fp, method="password", password="target-secret",
+                            jump=jump, target_host_key_blob=target_blob,
+                            runtime_root=Path(directory), require_root=False,
+                            scanner=lambda _host, _port: (
+                                f"jump.example ssh-ed25519 {jump_blob}\n".encode()),
+                            peer_uid=lambda _connection: os.geteuid(), python=sys.executable):
+                        self.fail("changed target key reached an Agent action")
+                probe.assert_called_once()
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    @mock.patch("web_agent_target_ssh._probe_jumped_target_host_key")
+    def test_jump_private_key_isolated_from_target_password(self, probe):
         target_blob, target_fp = fixture_key()
         jump_blob, jump_fp = fixture_key(9)
         jump = {"host": "relay.example", "port": 22, "username": "relay",
@@ -335,6 +365,108 @@ class TransportTests(unittest.TestCase):
                 nonce = transport.jump_broker.arm()
                 self.assertEqual(challenge(transport.jump_broker.path, nonce,
                     "Enter passphrase for key '/run/id':"), b"OK\nrelay-phrase\n")
+                probe.assert_called_once_with(transport.config_path, transport.jump_broker,
+                                              target_fp)
+
+
+class JumpedTargetProbeTests(unittest.TestCase):
+    def setUp(self):
+        self.fingerprint = fixture_key()[1]
+        self.jump_broker = mock.Mock(path=Path("/run/private/jump.sock"))
+        self.jump_broker.arm.return_value = "a" * 32
+
+    def diagnostic(self, fingerprint, *, status):
+        key_line = f"debug1: Server host key: ssh-ed25519 {fingerprint}\n".encode()
+        return key_line + status
+
+    def run_probe(self, diagnostic):
+        child = mock.Mock()
+        with mock.patch("web_agent_target_ssh.subprocess.Popen",
+                        return_value=child) as runner, \
+             mock.patch("web_agent_target_ssh._read_bounded_probe_diagnostic",
+                        return_value=diagnostic):
+            _probe_jumped_target_host_key(Path("/run/private/ssh_config"),
+                                          self.jump_broker, self.fingerprint)
+        return runner.call_args
+
+    def test_unchanged_target_is_proven_without_target_auth_or_command(self):
+        alias = host_key_alias(self.fingerprint)
+        diagnostic = self.diagnostic(self.fingerprint, status=(
+            f"debug1: Host '{alias}' is known and matches the ED25519 host key.\n".encode()
+        )).replace(b"\n", b"\r\n")
+        args, kwargs = self.run_probe(diagnostic)
+        argv = args[0]
+        self.assertIn("-N", argv)
+        self.assertIn("-T", argv)
+        self.assertNotIn("-W", argv)
+        self.assertEqual(argv[-1], "sovagrid-target")
+        self.assertIn("PreferredAuthentications=none", argv)
+        self.assertIn("PubkeyAuthentication=no", argv)
+        self.assertIn("PasswordAuthentication=no", argv)
+        self.assertTrue(kwargs["start_new_session"])
+        self.assertEqual(kwargs["env"]["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_NONCE"], "a" * 32)
+        self.assertEqual(kwargs["env"]["SOVAGRID_WEB_AGENT_TARGET_PROBE"], "1")
+        self.assertNotIn("SOVAGRID_WEB_AGENT_ASKPASS_NONCE", kwargs["env"])
+        self.jump_broker.disarm.assert_called_once()
+
+    def test_changed_target_requires_live_openssh_mismatch_diagnostic(self):
+        changed = fixture_key(1)[1]
+        diagnostic = self.diagnostic(changed, status=(
+            b"@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+            b"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n")).replace(b"\n", b"\r\n")
+        child = mock.Mock()
+        with mock.patch("web_agent_target_ssh.subprocess.Popen", return_value=child), \
+             mock.patch("web_agent_target_ssh._read_bounded_probe_diagnostic",
+                        return_value=diagnostic):
+            with self.assertRaises(HostKeyChanged):
+                _probe_jumped_target_host_key(Path("/run/private/ssh_config"),
+                                              self.jump_broker, self.fingerprint)
+        self.jump_broker.disarm.assert_called_once()
+
+    def test_no_route_and_ambiguous_diagnostics_are_generic(self):
+        changed = fixture_key(1)[1]
+        alias = host_key_alias(self.fingerprint)
+        cases = (
+            b"ssh: connect to host target.example port 22: No route to host\n",
+            self.diagnostic(changed, status=b"Host key verification failed.\n"),
+            self.diagnostic(self.fingerprint, status=b"Permission denied.\n"),
+            self.diagnostic(changed, status=b"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n")
+            + self.diagnostic(self.fingerprint, status=(
+                f"debug1: Host '{alias}' is known and matches the ED25519 host key.\n".encode())),
+        )
+        for diagnostic in cases:
+            self.jump_broker.reset_mock()
+            with self.subTest(diagnostic=diagnostic), self.assertRaises(TargetSSHError) as error:
+                self.run_probe(diagnostic)
+            self.assertNotIsInstance(error.exception, HostKeyChanged)
+            self.jump_broker.disarm.assert_called_once()
+
+    def test_diagnostic_capture_is_bounded_and_reaps_timed_out_process(self):
+        finished = subprocess.Popen([sys.executable, "-c", "pass"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, start_new_session=True)
+        with mock.patch("web_agent_target_ssh.os.killpg") as killpg:
+            self.assertEqual(_read_bounded_probe_diagnostic(finished), b"")
+        killpg.assert_called_once_with(finished.pid, signal.SIGKILL)
+        writer = subprocess.Popen([sys.executable, "-c",
+            "import os; os.write(2, b'x' * 50000)"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+        self.assertEqual(len(_read_bounded_probe_diagnostic(writer)), MAX_SCAN + 1)
+        self.assertIsNotNone(writer.returncode)
+        sleeper = subprocess.Popen([sys.executable, "-c",
+            "import time; time.sleep(5)"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+        self.assertEqual(_read_bounded_probe_diagnostic(sleeper, timeout=0.1), b"")
+        self.assertIsNotNone(sleeper.returncode)
+
+    def test_unavailable_probe_disarms_jump_secret(self):
+        with mock.patch("web_agent_target_ssh.subprocess.Popen", side_effect=OSError("offline")):
+            with self.assertRaises(TargetSSHError) as error:
+                _probe_jumped_target_host_key(Path("/run/private/ssh_config"),
+                                              self.jump_broker, self.fingerprint)
+        self.assertNotIsInstance(error.exception, HostKeyChanged)
+        self.assertNotIn("offline", str(error.exception))
+        self.jump_broker.disarm.assert_called_once()
 
 
 if __name__ == "__main__":
