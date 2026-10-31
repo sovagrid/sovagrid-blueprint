@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -155,6 +156,29 @@ class WebVpnSourceTests(unittest.TestCase):
                     self._preview()
                 self.assertEqual(error.exception.code, code)
                 self.assertFalse((self.directory / "vpn-source-stage.json").exists())
+
+    def test_target_refusal_requires_target_exit_status(self):
+        raw = module._canonical({"protocol": 1, "ok": False, "error": "CONTROL_ACTIVE"})
+        with self.assertRaises(module.VpnSourceError) as error:
+            self.bridge._response(raw, 1, "apply")
+        self.assertEqual(error.exception.code, "CONTROL_ACTIVE")
+        for action, code in (("apply", "APPLY_UNCERTAIN"),
+                             ("recover", "RECOVERY_UNCERTAIN")):
+            for status in (0, 255):
+                with self.subTest(action=action, status=status):
+                    with self.assertRaises(module.VpnSourceError) as error:
+                        self.bridge._response(raw, status, action)
+                    self.assertEqual(error.exception.code, code)
+
+    def test_transport_loss_after_apply_starts_is_uncertain(self):
+        expected = {"source_manifest_sha256": MANIFEST, "candidate_sha256": CANDIDATE,
+                    "installed_sha256": "0" * 64, "state_sha256": "0" * 64}
+        with mock.patch.object(FakeRPC, "_exchange", side_effect=module.RPCError("SSH_UNAVAILABLE")):
+            with self.assertRaises(module.VpnSourceError) as error:
+                self.bridge.execute("apply", options=self.options, fingerprint=FINGERPRINT,
+                                    credential=self.credential, expected=expected)
+        self.assertEqual(error.exception.code, "APPLY_UNCERTAIN")
+        self.assertFalse((self.directory / "vpn-source-stage.json").exists())
 
     def test_backup_accepts_only_bounded_private_stage_journal(self):
         path = host_backup.WEB_AGENT_DIR + "/vpn-source-stage.json"

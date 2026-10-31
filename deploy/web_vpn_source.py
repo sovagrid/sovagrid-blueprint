@@ -28,7 +28,8 @@ STAGE_PATH = re.compile(r"/var/tmp/sovagrid-agent-enroll\.[A-Za-z0-9_-]{8,32}\Z"
 ERRORS = frozenset({"ROOT_REQUIRED", "INVALID_REQUEST", "SOURCE_UNTRUSTED",
     "SOURCE_CHANGED", "STATE_CONFLICT", "OWNERSHIP_CONFLICT", "RECOVERY_REQUIRED",
     "STALE_PREVIEW", "CONTROL_ACTIVE", "BUSY", "OPERATION_FAILED",
-    "INTERNAL_ERROR", "SSH_UNAVAILABLE", "STAGE_CLEANUP_REQUIRED"})
+    "INTERNAL_ERROR", "SSH_UNAVAILABLE", "STAGE_CLEANUP_REQUIRED",
+    "APPLY_UNCERTAIN", "RECOVERY_UNCERTAIN"})
 
 
 class VpnSourceError(RuntimeError):
@@ -49,6 +50,11 @@ def _unique(pairs):
             raise ValueError("duplicate field")
         result[key] = value
     return result
+
+
+def _uncertain(action: str) -> str:
+    return "APPLY_UNCERTAIN" if action == "apply" else \
+           "RECOVERY_UNCERTAIN" if action == "recover" else "OPERATION_FAILED"
 
 
 class VpnSourceJobs:
@@ -161,6 +167,10 @@ class VpnSourceJobs:
                 if (set(value) != {"protocol", "ok", "error"} or
                         type(value["error"]) is not str or value["error"] not in ERRORS):
                     raise ValueError
+                # The target helper uses exit 1 for structured refusals. A
+                # transport failure after partial stdout is not a refusal.
+                if status != 1:
+                    raise VpnSourceError(_uncertain(action))
                 raise VpnSourceError(value["error"])
             if (status != 0 or set(value) != {"protocol", "ok", "result"} or
                     type(value["result"]) is not dict):
@@ -196,7 +206,7 @@ class VpnSourceJobs:
         except VpnSourceError:
             raise
         except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
-            raise VpnSourceError("OPERATION_FAILED") from None
+            raise VpnSourceError(_uncertain(action)) from None
 
     def execute(self, action: str, *, options, fingerprint: str, credential,
                 expected: dict | None = None) -> dict:
@@ -236,7 +246,10 @@ class VpnSourceJobs:
                                    "source_manifest_sha256": stage.source_manifest_sha256}
                         if action == "apply":
                             payload["expected"] = expected
-                        raw, status = rpc._exchange(bootstrap, (_canonical(payload),), 180)
+                        try:
+                            raw, status = rpc._exchange(bootstrap, (_canonical(payload),), 180)
+                        except RPCError:
+                            raise VpnSourceError(_uncertain(action)) from None
                         result = self._response(raw, status, action)
                         if action != "recover" and result["source_manifest_sha256"] != stage.source_manifest_sha256:
                             raise VpnSourceError("SOURCE_CHANGED")
