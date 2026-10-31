@@ -477,7 +477,10 @@ class SignedFeed(unittest.TestCase):
             feed.archive_url("../malicious")
 
     def test_private_opt_in_config_and_state(self) -> None:
-        self.assertEqual(DEFAULT_ANCHORS, {})
+        self.assertEqual(set(DEFAULT_ANCHORS), {"sovagrid-2026-10"})
+        self.assertEqual(hashlib.sha256(feed.ED25519_SPKI_PREFIX +
+                                        DEFAULT_ANCHORS["sovagrid-2026-10"]).hexdigest(),
+                         "abb6ed34e70fc1dd33d393987fb6067b4a69120eb3a5e00681f209e3666444bf")
         installer = (SCRIPT.parents[1] / "run.sh").read_text()
         self.assertIn("install_release_feed_units", installer)
         self.assertNotIn("systemctl enable --now sovagrid-release-feed.timer", installer)

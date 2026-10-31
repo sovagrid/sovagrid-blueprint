@@ -4,9 +4,8 @@
 # Additional author attribution terms: see ATTRIBUTION.md.
 """Disabled-by-default, signed server release feed for the existing update timer.
 
-No feed key is shipped yet. A reviewed public Ed25519 key must be pinned in
-TRUST_ANCHORS by a later source release before this module can be enabled.
-The release signing private key must never be present on a managed server.
+The public Ed25519 key is pinned in TRUST_ANCHORS. A server can opt in only
+after a signed stable feed is published. The private key stays off servers.
 """
 
 from __future__ import annotations
@@ -39,9 +38,13 @@ CANDIDATES = Path("/opt/sovagrid-candidates")
 WORKER = Path(__file__).with_name("remote_update_worker.py")
 AUTO_UPDATE = Path(__file__).with_name("auto_update.py")
 
-# Deliberately empty until the release signing ceremony and independent key
-# verification. Values are raw 32-byte Ed25519 public keys, never URLs/files.
-TRUST_ANCHORS: dict[str, bytes] = {}
+# The corresponding signing key is kept off servers, outside Git and CI.
+# A server still requires an explicit opt-in and a valid signed stable feed.
+# Values are raw 32-byte Ed25519 public keys, never URLs or local files.
+TRUST_ANCHORS: dict[str, bytes] = {
+    "sovagrid-2026-10": bytes.fromhex(
+        "63dbc4f1a8622c7f0e3020a7246cba63137231437a71c6458b2d69f9bb069675"),
+}
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 OPENSSL = "/usr/bin/openssl"
 # Keep the feed in a separate repository. Tracking it in the packaged
