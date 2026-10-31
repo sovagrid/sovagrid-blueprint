@@ -317,6 +317,20 @@ class OriginalHubCompatibilityTests(unittest.TestCase):
                          "SG_EXTERNAL_AGENT_UPDATE_REFUSE:ORIGINAL_HUB_COMPATIBILITY_UNAVAILABLE\n")
         self.assertNotIn(TOKEN, stderr.getvalue())
 
+    def test_unexpected_exception_reports_only_bounded_code_location(self):
+        secret = "private-host-token-and-path"
+        def fail(*_args):
+            raise PermissionError(secret)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(previewer, "apply", side_effect=fail), \
+             contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(previewer.main(["apply", ARCHIVE, CURRENT, EXTERNAL, BASELINE]), 40)
+        self.assertRegex(stdout.getvalue(),
+                         r"\ASG_EXTERNAL_AGENT_UPDATE_DIAGNOSTIC:PermissionError:update:main:[1-9][0-9]{0,5}\n\Z")
+        self.assertEqual(stderr.getvalue(),
+                         "SG_EXTERNAL_AGENT_UPDATE_REFUSE:UNSAFE_STATE\n")
+        self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

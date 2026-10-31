@@ -224,6 +224,12 @@ def _apply(request_id: str) -> int:
     refusal = re.fullmatch(rb"SG_EXTERNAL_AGENT_UPDATE_REFUSE:([A-Z][A-Z0-9_]{1,63})\n",
                            result.stderr[:MAX_OUTPUT])
     code = refusal.group(1).decode("ascii") if refusal and len(result.stderr) <= MAX_OUTPUT else "APPLY_UNCERTAIN"
+    if code == "UNSAFE_STATE" and len(result.stdout) <= 256 and re.fullmatch(
+            rb"SG_EXTERNAL_AGENT_UPDATE_DIAGNOSTIC:(?:UNAVAILABLE|"
+            rb"[A-Za-z][A-Za-z0-9_]{0,63}:(?:update|recovery|enrollment|worker):"
+            rb"[A-Za-z_][A-Za-z0-9_]{0,63}:[1-9][0-9]{0,5})\n",
+            result.stdout):
+        print(result.stdout.decode("ascii").strip(), file=sys.stderr)
     # Only checks completed before the transaction writer can touch the Agent
     # tree are definitely failed. A generic rollback refusal can also follow
     # a durable commit with a later health failure, so its outcome is unknown.

@@ -115,6 +115,12 @@ def fixed_writer_diagnostic(unit: str) -> None:
         codes = sorted(set(re.findall(
             r"SG_EXTERNAL_AGENT_(?:UPDATE|OPERATION)_REFUSE:[A-Z][A-Z0-9_]{1,63}",
             journal.stdout)))[:8] if journal.returncode == 0 else []
+        if journal.returncode == 0:
+            codes.extend(sorted(set(re.findall(
+                r"SG_EXTERNAL_AGENT_UPDATE_DIAGNOSTIC:(?:UNAVAILABLE|"
+                r"[A-Za-z][A-Za-z0-9_]{0,63}:(?:update|recovery|enrollment|worker):"
+                r"[A-Za-z_][A-Za-z0-9_]{0,63}:[1-9][0-9]{0,5})",
+                journal.stdout)))[:8])
     except (OSError, subprocess.TimeoutExpired):
         codes = []
     print("Fixed writer diagnostic: " + ",".join(values) + " codes=" + ",".join(codes),

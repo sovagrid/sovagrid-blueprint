@@ -2332,6 +2332,33 @@ def apply(archive_sha256: str, current_manifest_sha256: str,
             "review_sha256": review_sha256}
 
 
+def _safe_exception_marker(exc: Exception) -> str:
+    """Expose only a code location for an otherwise opaque unexpected error."""
+    try:
+        names = {"external_agent_update.py": "update",
+                 "external_agent_recovery.py": "recovery",
+                 "remote_agent.py": "enrollment",
+                 "remote_update_worker.py": "worker"}
+        selected = None
+        trace = exc.__traceback__
+        while trace is not None:
+            label = names.get(Path(trace.tb_frame.f_code.co_filename).name)
+            function, line = trace.tb_frame.f_code.co_name, trace.tb_lineno
+            if (label is not None and
+                    re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", function) and
+                    type(line) is int and 1 <= line <= 999999):
+                selected = (label, function, line)
+            trace = trace.tb_next
+        kind = type(exc).__name__
+        if selected is not None:
+            label, function, line = selected
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", kind):
+                return f"SG_EXTERNAL_AGENT_UPDATE_DIAGNOSTIC:{kind}:{label}:{function}:{line}"
+    except Exception:
+        pass
+    return "SG_EXTERNAL_AGENT_UPDATE_DIAGNOSTIC:UNAVAILABLE"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if args == ["status"]:
@@ -2355,7 +2382,8 @@ def main(argv: list[str] | None = None) -> int:
     except recovery.RecoveryError as exc:
         print("SG_EXTERNAL_AGENT_UPDATE_REFUSE:" + str(exc), file=sys.stderr)
         return 40
-    except Exception:
+    except Exception as exc:
+        print(_safe_exception_marker(exc))
         print("SG_EXTERNAL_AGENT_UPDATE_REFUSE:UNSAFE_STATE", file=sys.stderr)
         return 40
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))

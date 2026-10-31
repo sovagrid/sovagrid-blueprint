@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -102,6 +104,26 @@ class ExternalOperationTests(TestCase):
                  [], 40, b"", b"SG_EXTERNAL_AGENT_UPDATE_REFUSE:LOCK_UNAVAILABLE\n")):
             self.assertEqual(operation._apply(REQUEST_ID), 40)
         self.assertEqual(transitions[-1][0][3:], ("failed", "LOCK_UNAVAILABLE"))
+
+    def test_only_bounded_child_diagnostic_reaches_unit_journal(self):
+        marker = b"SG_EXTERNAL_AGENT_UPDATE_DIAGNOSTIC:PermissionError:update:apply:2180\n"
+        for stdout, expected in ((marker, marker.decode()),
+                                 (b"private-host-token\n" + marker, "")):
+            transitions = []
+            journal = io.StringIO()
+            with self.subTest(stdout=stdout == marker), \
+                 mock.patch.object(operation.os, "geteuid", return_value=0), \
+                 mock.patch.object(operation.os, "getegid", return_value=0), \
+                 mock.patch.object(operation.sys, "platform", "linux"), \
+                 mock.patch.object(operation, "_record_dir", return_value=Path("/unused")), \
+                 mock.patch.object(operation, "_request", return_value=self._request()), \
+                 mock.patch.object(operation, "_transition", side_effect=lambda *a, **kw: transitions.append((a, kw))), \
+                 mock.patch.object(operation.subprocess, "run", return_value=subprocess.CompletedProcess(
+                     [], 40, stdout, b"SG_EXTERNAL_AGENT_UPDATE_REFUSE:UNSAFE_STATE\n")), \
+                 contextlib.redirect_stderr(journal):
+                self.assertEqual(operation._apply(REQUEST_ID), 40)
+            self.assertEqual(journal.getvalue(), expected)
+            self.assertEqual(transitions[-1][0][3:], ("uncertain", "UNSAFE_STATE"))
 
     def test_terminal_request_never_runs_apply_again(self):
         with mock.patch.object(operation.os, "geteuid", return_value=0), \
