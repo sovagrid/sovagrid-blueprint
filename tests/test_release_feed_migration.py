@@ -56,14 +56,24 @@ class ReleaseFeedMigration(unittest.TestCase):
                          "/etc/systemd/system/sovagrid-agent.service", "/opt/sovagrid-agent"):
             self.assertNotIn(external, hub_only.SNAPSHOT)
 
-    def test_unreviewed_key_and_older_worker_cannot_enable_discovery(self) -> None:
+    def test_pinned_key_and_older_worker_cannot_enable_discovery(self) -> None:
         installer = (ROOT / "run.sh").read_text()
         self.assertLess(installer.index("SOVAGRID_RELEASE_FEED_SNAPSHOT"),
                         installer.index("apt_refresh()"))
         self.assertIn("release_feed_deferred=1", installer)
         self.assertIn("install_release_feed_units", installer)
         self.assertNotIn("systemctl enable --now sovagrid-release-feed.timer", installer)
-        self.assertEqual(feed.TRUST_ANCHORS, {})
+        self.assertEqual(feed.TRUST_ANCHORS, {
+            "sovagrid-2026-10": bytes.fromhex(
+                "63dbc4f1a8622c7f0e3020a7246cba63137231437a71c6458b2d69f9bb069675"),
+        })
+        # A pinned verification key alone does not opt the host in. The
+        # release-feed timer is installed without being enabled by run.sh;
+        # enable() checks the signed feed before writing its config.
+        source = (ROOT / "deploy/release_feed.py").read_text()
+        enable = source[source.index("def enable("):source.index("\ndef disable(")]
+        self.assertLess(enable.index("validate_manifest(raw, signature, key_id, ledger)"),
+                        enable.index("_atomic_private(CONFIG, config)"))
         self.assertIn("SOVAGRID_RELEASE_FEED_SNAPSHOT", (ROOT / "deploy/remote_update_worker.py").read_text())
         self.assertIn("SOVAGRID_RELEASE_FEED_SNAPSHOT", (ROOT / "deploy/hub_only_update.py").read_text())
         subprocess.run(["bash", "-n", str(ROOT / "run.sh")], check=True)

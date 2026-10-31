@@ -4,10 +4,10 @@
 # Additional author attribution terms: see ../ATTRIBUTION.md.
 """Sync or verify the exact Connect Python package carried by the server bundle.
 
-No network fetch is performed. ``sync`` reads committed Git blobs from a
-separately checked out Connect repository at the pinned revision. ``check``
-verifies the vendored bytes offline and, when --source is supplied, compares
-every byte with that exact upstream commit.
+No network fetch is performed. ``sync`` reads committed Git blobs from the
+pinned Connect revision in a separate checkout, even when its HEAD has moved.
+``check`` verifies the vendored bytes offline and, when --source is supplied,
+compares every byte with that exact upstream commit.
 """
 
 from __future__ import annotations
@@ -68,8 +68,6 @@ def git(repo: Path, *args: str) -> bytes:
 
 def source_files(repo: Path) -> dict[str, tuple[int, bytes]]:
     require(repo.is_dir() and not repo.is_symlink(), "Connect checkout is missing")
-    actual = git(repo, "rev-parse", "HEAD").decode("ascii", "strict").strip()
-    require(actual == UPSTREAM_COMMIT, "Connect checkout differs from the pinned commit")
     raw = git(repo, "ls-tree", "-r", "-z", "--full-tree", UPSTREAM_COMMIT, "--", "sovagrid_connect")
     result: dict[str, tuple[int, bytes]] = {}
     for item in raw.split(b"\0"):

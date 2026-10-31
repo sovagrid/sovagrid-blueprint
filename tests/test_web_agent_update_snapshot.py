@@ -24,9 +24,15 @@ class WebAgentUpdateSnapshotTest(unittest.TestCase):
             "/etc/systemd/system/sovagrid-web-agent-control.service",
         )
         self.assertEqual(worker.SNAPSHOT, worker.SSH_GATEWAY_SNAPSHOT + expected)
-        self.assertEqual(hub_only.SNAPSHOT, hub_only.LOCAL_CONTAINERS_SNAPSHOT + expected + (
+        self.assertEqual(hub_only.WEB_AGENT_SNAPSHOT,
+                         hub_only.LOCAL_CONTAINERS_SNAPSHOT + expected + (
             "/etc/sovagrid/.external-agent-recovery-managed-by-run-sh",
             "/etc/systemd/system/sovagrid-external-agent-recovery.service",
+        ))
+        self.assertEqual(hub_only.SNAPSHOT, hub_only.WEB_AGENT_SNAPSHOT + (
+            hub_only.EXTERNAL_APPLY_MARKER,
+            hub_only.EXTERNAL_APPLY_UNIT,
+            hub_only.EXTERNAL_APPLY_LEDGER,
         ))
         self.assertEqual(worker.UNITS, worker.SSH_GATEWAY_UNITS + worker.WEB_AGENT_UNITS)
         self.assertEqual(hub_only.UNITS,
