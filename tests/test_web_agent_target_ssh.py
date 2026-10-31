@@ -24,12 +24,14 @@ sys.path.insert(0, str(ROOT / "vendor/connect"))
 sys.path.insert(0, str(ROOT / "deploy"))
 
 from web_agent_target_ssh import (AskpassBroker, PinnedTargetSSH, TargetSSHError,
-                                  host_key_alias, reviewed_public_key)
+                                  _jump_proxy_client, host_key_alias, reviewed_key_blob,
+                                  reviewed_public_key)
 
 
-def fixture_key():
+def fixture_key(seed=0):
     key = b"ssh-ed25519"
-    raw = struct.pack(">I", len(key)) + key + struct.pack(">I", 32) + bytes(range(32))
+    raw = struct.pack(">I", len(key)) + key + struct.pack(">I", 32) + bytes(
+        (value + seed) % 256 for value in range(32))
     blob = base64.b64encode(raw).decode("ascii")
     fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode("ascii").rstrip("=")
     return blob, fingerprint
@@ -74,6 +76,16 @@ class ReviewedKeyTests(unittest.TestCase):
         self.assertNotEqual(alias, host_key_alias("SHA256:" + "A" * 43))
         with self.assertRaises(TargetSSHError):
             host_key_alias("SHA256:" + "A" * 42)
+
+    def test_reviewed_blob_requires_canonical_wire_key_and_exact_fingerprint(self):
+        blob, fingerprint = fixture_key()
+        self.assertEqual(reviewed_key_blob(blob, fingerprint), ("ssh-ed25519", blob))
+        with self.assertRaises(TargetSSHError):
+            reviewed_key_blob(blob, fixture_key(1)[1])
+        with self.assertRaises(TargetSSHError):
+            reviewed_key_blob(blob + "=", fingerprint)
+        with self.assertRaises(TargetSSHError):
+            reviewed_key_blob(base64.b64encode(b"wrong").decode(), fingerprint)
 
 
 class AskpassTests(unittest.TestCase):
@@ -193,6 +205,125 @@ class TransportTests(unittest.TestCase):
             PinnedTargetSSH(host="example.invalid", port=22, username="root",
                 fingerprint=fingerprint, method="password", password="pw", private_key="KEY",
                 require_root=False)
+
+    def test_jump_uses_two_pins_and_two_independent_secret_brokers(self):
+        target_blob, target_fp = fixture_key()
+        jump_blob, jump_fp = fixture_key(7)
+        jump = {"host": "jump.example", "port": 2201, "username": "relay",
+                "fingerprint": jump_fp, "method": "password", "password": "jump-secret",
+                "private_key": "", "passphrase": "", "host_key_blob": jump_blob}
+        def scanner(host, _port):
+            self.assertEqual(host, "jump.example")
+            return f"jump.example ssh-ed25519 {jump_blob}\n".encode()
+        with tempfile.TemporaryDirectory() as directory:
+            with PinnedTargetSSH(host="target.example", port=2222, username="root",
+                    fingerprint=target_fp, method="password", password="target-secret",
+                    jump=jump, target_host_key_blob=target_blob,
+                    runtime_root=Path(directory), require_root=False, scanner=scanner,
+                    peer_uid=lambda _connection: os.geteuid(), python=sys.executable) as transport:
+                self.assertEqual(transport.options.jump_host, "jump.example")
+                self.assertEqual(transport.options.jump_host_key_alias, host_key_alias(jump_fp))
+                folder = transport.config_path.parent
+                self.assertEqual((folder / "known_hosts").read_text(),
+                    f"{host_key_alias(target_fp)} ssh-ed25519 {target_blob}\n")
+                self.assertEqual((folder / "known_hosts_jump").read_text(),
+                    f"{host_key_alias(jump_fp)} ssh-ed25519 {jump_blob}\n")
+                target_config = subprocess.run(["/usr/bin/ssh", "-F", str(transport.config_path),
+                    "-G", "sovagrid-target"], capture_output=True, text=True, timeout=5, check=True).stdout
+                jump_config = subprocess.run(["/usr/bin/ssh", "-F", str(transport.jump_config_path),
+                    "-G", "sovagrid-target"], capture_output=True, text=True, timeout=5, check=True).stdout
+                self.assertIn("proxycommand " + str(transport.jump_proxy_path), target_config)
+                self.assertIn(f"hostkeyalias {host_key_alias(target_fp)}", target_config)
+                self.assertIn(f"hostkeyalias {host_key_alias(jump_fp)}", jump_config)
+                self.assertIn("known_hosts_jump", jump_config)
+                self.assertNotIn("target-secret", repr([p.read_text() for p in folder.iterdir()
+                    if p.is_file()]))
+                self.assertNotIn("jump-secret", repr([p.read_text() for p in folder.iterdir()
+                    if p.is_file()]))
+                rpc = transport.target_rpc(transport.options)
+                calls = []
+                class Child:
+                    def poll(self): return 0
+                def spawn(argv, **kwargs):
+                    calls.append((argv, kwargs)); return Child()
+                rpc._installer._popen = spawn
+                with rpc._installer._session() as (config, helper):
+                    rpc._installer._ssh(config, helper, "true")
+                argv, kwargs = calls[0]
+                self.assertNotIn("target-secret", repr(argv) + repr(kwargs["env"]))
+                self.assertNotIn("jump-secret", repr(argv) + repr(kwargs["env"]))
+                env = kwargs["env"]
+                self.assertEqual(challenge(transport.broker.path,
+                    env["SOVAGRID_WEB_AGENT_ASKPASS_NONCE"], "Password:"),
+                    b"OK\ntarget-secret\n")
+                self.assertEqual(challenge(transport.jump_broker.path,
+                    env["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_NONCE"], "Password:"),
+                    b"OK\njump-secret\n")
+                self.assertEqual(challenge(transport.broker.path,
+                    env["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_NONCE"], "Password:"), b"DENY\n")
+                captured = []
+                class Replaced(BaseException): pass
+                def fake_exec(path, args, child_env):
+                    captured.append((path, args, child_env)); raise Replaced()
+                with mock.patch.dict(os.environ, env, clear=True), \
+                     mock.patch("web_agent_target_ssh.os.execve", side_effect=fake_exec):
+                    with self.assertRaises(Replaced):
+                        _jump_proxy_client(str(folder))
+                _, proxy_argv, proxy_env = captured[0]
+                self.assertEqual(proxy_argv[-2:], ["target.example:2222", "sovagrid-target"])
+                self.assertEqual(proxy_env["SOVAGRID_WEB_AGENT_ASKPASS_SOCKET"],
+                                 str(transport.jump_broker.path))
+                self.assertNotIn("SOVAGRID_WEB_AGENT_JUMP_ASKPASS_NONCE", proxy_env)
+
+    def test_jump_changed_key_and_malformed_blob_fail_before_authentication(self):
+        target_blob, target_fp = fixture_key()
+        jump_blob, jump_fp = fixture_key(7)
+        jump = {"host": "jump.example", "port": 22, "username": "relay",
+                "fingerprint": jump_fp, "method": "password", "password": "jump-secret",
+                "private_key": "", "passphrase": "", "host_key_blob": jump_blob}
+        with self.assertRaises(TargetSSHError):
+            PinnedTargetSSH(host="target.example", port=22, username="root",
+                fingerprint=target_fp, method="password", password="target-secret",
+                jump=jump, target_host_key_blob=jump_blob, require_root=False)
+        with tempfile.TemporaryDirectory() as directory:
+            wrong = f"jump.example ssh-ed25519 {target_blob}\n".encode()
+            with self.assertRaises(TargetSSHError):
+                with PinnedTargetSSH(host="target.example", port=22, username="root",
+                    fingerprint=target_fp, method="password", password="target-secret",
+                    jump=jump, target_host_key_blob=target_blob,
+                    runtime_root=Path(directory), require_root=False,
+                    scanner=lambda _host, _port: wrong):
+                    self.fail("changed jump key was accepted")
+
+    def test_jump_private_key_isolated_from_target_password(self):
+        target_blob, target_fp = fixture_key()
+        jump_blob, jump_fp = fixture_key(9)
+        jump = {"host": "relay.example", "port": 22, "username": "relay",
+                "fingerprint": jump_fp, "method": "private_key", "password": "",
+                "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n-----END OPENSSH PRIVATE KEY-----\n",
+                "passphrase": "relay-phrase", "host_key_blob": jump_blob}
+        with tempfile.TemporaryDirectory() as directory:
+            with PinnedTargetSSH(host="target.example", port=22, username="root",
+                    fingerprint=target_fp, method="password", password="target-secret",
+                    jump=jump, target_host_key_blob=target_blob,
+                    runtime_root=Path(directory), require_root=False,
+                    scanner=lambda _host, _port: f"relay.example ssh-ed25519 {jump_blob}\n".encode(),
+                    peer_uid=lambda _connection: os.geteuid(), python=sys.executable) as transport:
+                identity = Path(transport.options.jump_identity)
+                self.assertEqual(stat.S_IMODE(identity.stat().st_mode), 0o600)
+                self.assertIn("fixture", identity.read_text())
+                self.assertIsNone(transport.options.identity)
+                target_config = subprocess.run(["/usr/bin/ssh", "-F", str(transport.config_path),
+                    "-G", "sovagrid-target"], capture_output=True, text=True, timeout=5, check=True).stdout
+                jump_config = subprocess.run(["/usr/bin/ssh", "-F", str(transport.jump_config_path),
+                    "-G", "sovagrid-target"], capture_output=True, text=True, timeout=5, check=True).stdout
+                self.assertIn("pubkeyauthentication false", target_config)
+                self.assertIn("passwordauthentication no", jump_config)
+                self.assertIn("kbdinteractiveauthentication no", jump_config)
+                self.assertIn(f"identityfile {identity}", jump_config)
+                nonce = transport.jump_broker.arm()
+                self.assertEqual(challenge(transport.jump_broker.path, nonce,
+                    "Enter passphrase for key '/run/id':"), b"OK\nrelay-phrase\n")
 
 
 if __name__ == "__main__":

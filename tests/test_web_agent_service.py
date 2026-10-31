@@ -128,6 +128,38 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.jobs.calls[0][1]["credential"].password, "")
         self.assertEqual(payload["password"], "")
 
+    def test_jump_prepare_binds_both_host_pins_and_wipes_both_credentials(self):
+        jump = {"host": "jump.example", "port": 2200, "username": "relay",
+                "method": "password", "fingerprint": FINGERPRINT,
+                "password": "jump-only-secret", "private_key": "", "passphrase": "",
+                "host_key_blob": "public-jump-blob"}
+        payload = {**login_payload(), "host_key_blob": "public-target-blob", "jump": jump,
+                   "name": "Via jump", "hub_host": "192.0.2.1", "hub_port": 22,
+                   "local_port": 18767}
+        service.dispatch(self.jobs, request("prepare", payload), authorize=lambda token: None)
+        options = self.jobs.calls[0][1]["target_options"]
+        self.assertEqual((options.jump_host, options.jump_user, options.jump_port),
+                         ("jump.example", "relay", 2200))
+        self.assertEqual(options.jump_host_key_alias, service.host_key_alias(FINGERPRINT))
+        credential = self.jobs.calls[0][1]["credential"]
+        self.assertEqual(credential.password, "")
+        self.assertEqual(credential.jump["password"], "")
+        self.assertEqual(payload["password"], "")
+        self.assertEqual(payload["jump"]["password"], "")
+
+    def test_jump_rejects_extra_field_and_scrubs_nested_secret(self):
+        jump = {"host": "jump.example", "port": 22, "username": "relay",
+                "method": "password", "fingerprint": FINGERPRINT,
+                "password": "jump-only-secret", "private_key": "", "passphrase": "",
+                "host_key_blob": "public-jump-blob", "unsafe": "extra"}
+        payload = {**login_payload(), "host_key_blob": "public-target-blob", "jump": jump,
+                   "name": "Via jump", "hub_host": "192.0.2.1", "hub_port": 22,
+                   "local_port": 18767}
+        with self.assertRaises(service.RequestError):
+            service.dispatch(self.jobs, request("prepare", payload), authorize=lambda token: None)
+        self.assertEqual(payload["password"], "")
+        self.assertEqual(jump["password"], "")
+
     def test_auth_runs_before_any_job(self):
         with self.assertRaises(service.RequestError) as error:
             service.dispatch(self.jobs, request("list", {}),

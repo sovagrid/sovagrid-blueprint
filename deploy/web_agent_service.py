@@ -31,7 +31,7 @@ _ACTIONS = frozenset({"prepare", "apply", "resume", "cleanup", "interrupt", "sta
                       "wg-control-preview", "wg-control-apply", "wg-control-recover",
                       "amnezia-provision-preview", "amnezia-provision-apply",
                       "amnezia-provision-recover"})
-_MAX_REQUEST = 72 * 1024
+_MAX_REQUEST = 160 * 1024  # Two bounded private keys on a reviewed jump route.
 _MAX_REPLY = 32 * 1024 - 1  # Gateway's 32 KiB limit includes the newline.
 _GATEWAY_UID = 10003
 _PUBLIC_WEB_LOCK = Path("/var/lib/sovagrid/.public-web.lock")
@@ -54,7 +54,7 @@ def _trusted_imports() -> None:
 
 _trusted_imports()
 from web_agent_local_rpc import LocalHubFacade, LocalHubRPC  # noqa: E402
-from web_agent_target_ssh import PinnedTargetSSH  # noqa: E402
+from web_agent_target_ssh import PinnedTargetSSH, TargetSSHError, host_key_alias  # noqa: E402
 from web_agent_jobs import ControllerBinding, JobError, WebAgentJobs  # noqa: E402
 from web_vpn_source import VpnSourceError, VpnSourceJobs  # noqa: E402
 from web_wireguard_control import WireguardControlError, WireguardControlJobs  # noqa: E402
@@ -94,11 +94,42 @@ class Credential:
         self.password = self.private_key = self.passphrase = ""
 
 
+class RouteCredential(Credential):
+    """An installer route owns two independent, short-lived SSH secrets."""
+
+    def __init__(self, payload: dict):
+        super().__init__(payload)
+        self.target_host_key_blob = ""
+        self.jump: dict | None = None
+        if "jump" in payload:
+            target_blob = payload.get("host_key_blob")
+            jump = payload["jump"]
+            if (not isinstance(target_blob, str) or len(target_blob) > 12000 or
+                    not isinstance(jump.get("host_key_blob"), str) or
+                    len(jump["host_key_blob"]) > 12000):
+                raise RequestError("INVALID_INPUT")
+            second = Credential(jump)
+            self.target_host_key_blob = target_blob
+            self.jump = {"host": jump["host"], "port": jump["port"],
+                         "username": jump["username"], "fingerprint": jump["fingerprint"],
+                         "host_key_blob": jump["host_key_blob"], "method": second.method,
+                         "password": second.password, "private_key": second.private_key,
+                         "passphrase": second.passphrase}
+
+    def wipe(self) -> None:
+        super().wipe()
+        self.target_host_key_blob = ""
+        if self.jump is not None:
+            for key in ("password", "private_key", "passphrase"):
+                self.jump[key] = ""
+
+
 def _target_factory(*, target_options, fingerprint, credential, journal, progress):
     transport = PinnedTargetSSH(host=target_options.host, port=target_options.port,
         username=target_options.user, fingerprint=fingerprint, method=credential.method,
         password=credential.password, private_key=credential.private_key,
-        passphrase=credential.passphrase)
+        passphrase=credential.passphrase, jump=getattr(credential, "jump", None),
+        target_host_key_blob=getattr(credential, "target_host_key_blob", ""))
     transport.__enter__()
     try:
         tunnel = LocalHubFacade()
@@ -142,15 +173,22 @@ def _fields(payload: object, required: frozenset[str]) -> dict:
 
 _LOGIN = frozenset({"host", "port", "username", "method", "fingerprint",
                     "password", "private_key", "passphrase"})
+_JUMP_LOGIN = _LOGIN | {"host_key_blob"}
 _PREPARE = _LOGIN | {"name", "hub_host", "hub_port", "local_port"}
 _RESUME = _LOGIN | {"request_id"}
 
 
 def _options(payload: dict) -> ConnectionOptions:
     try:
+        jump = payload.get("jump")
+        extra = ({} if jump is None else {
+            "jump_host": jump["host"], "jump_user": jump["username"],
+            "jump_port": jump["port"],
+            "jump_host_key_alias": host_key_alias(jump["fingerprint"]),
+        })
         return ConnectionOptions(host=payload["host"], user=payload["username"],
-                                 port=payload["port"]).validated()
-    except (ValueError, TypeError, OSError):
+                                 port=payload["port"], **extra).validated()
+    except (ValueError, TypeError, OSError, TargetSSHError):
         raise RequestError("INVALID_INPUT") from None
 
 
@@ -265,23 +303,35 @@ def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: o
             for key in ("password", "private_key", "passphrase"):
                 payload[key] = ""
     if action in ("prepare", "resume"):
-        _fields(payload, _PREPARE if action == "prepare" else _RESUME)
-        credential = Credential(payload)
         try:
-            options = _options(payload)
-            args = {"target_options": options,
-                    "reviewed_fingerprint": payload["fingerprint"],
-                    "credential": credential, "session_token": token}
-            if action == "prepare":
-                result = jobs.prepare(**args, name=payload["name"],
-                    hub_host=payload["hub_host"], hub_port=payload["hub_port"],
-                    local_port=payload["local_port"])
-            else:
-                result = jobs.resume(payload["request_id"], **args)
+            jumped = type(payload) is dict and "jump" in payload
+            fields = _PREPARE if action == "prepare" else _RESUME
+            _fields(payload, fields | {"host_key_blob", "jump"} if jumped else fields)
+            if jumped:
+                _fields(payload["jump"], _JUMP_LOGIN)
+            credential = RouteCredential(payload)
+            try:
+                options = _options(payload)
+                args = {"target_options": options,
+                        "reviewed_fingerprint": payload["fingerprint"],
+                        "credential": credential, "session_token": token}
+                if action == "prepare":
+                    result = jobs.prepare(**args, name=payload["name"],
+                        hub_host=payload["hub_host"], hub_port=payload["hub_port"],
+                        local_port=payload["local_port"])
+                else:
+                    result = jobs.resume(payload["request_id"], **args)
+            finally:
+                credential.wipe()
         finally:
-            credential.wipe()
-            for key in ("password", "private_key", "passphrase"):
-                payload[key] = ""
+            if type(payload) is dict:
+                for key in ("password", "private_key", "passphrase"):
+                    if key in payload:
+                        payload[key] = ""
+                if type(payload.get("jump")) is dict:
+                    for key in ("password", "private_key", "passphrase"):
+                        if key in payload["jump"]:
+                            payload["jump"][key] = ""
         return result
     if action in ("apply", "cleanup"):
         _fields(payload, frozenset({"request_id", "expected_revision"}))

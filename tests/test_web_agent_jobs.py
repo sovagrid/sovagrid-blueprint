@@ -243,6 +243,24 @@ class JobsTests(unittest.TestCase):
         self.assertTrue(fresh.wiped)
         self.assert_secretless(second)
 
+    def test_resume_rejects_changed_jump_route_before_target_rpc(self):
+        first = self.jobs()
+        jump = ConnectionOptions(host="target.example", user="root",
+            jump_host="jump.example", jump_user="relay", jump_port=2200,
+            jump_host_key_alias="sg-reviewed-jump").validated()
+        review = first.prepare(target_options=jump, reviewed_fingerprint=FINGERPRINT,
+            credential=Credential(), session_token=BEARER, name="via jump",
+            hub_host="192.0.2.40", hub_port=22, local_port=18767)
+        first.close()
+        second = self.jobs()
+        changed = ConnectionOptions(**{**asdict(jump), "jump_port": 2201}).validated()
+        with self.assertRaises(JobError) as raised:
+            second.resume(review["request_id"], target_options=changed,
+                reviewed_fingerprint=FINGERPRINT, credential=Credential(),
+                session_token=BEARER)
+        self.assertEqual(raised.exception.code, "TARGET_CHANGED")
+        self.assert_secretless(second)
+
     def test_failed_apply_is_recoverable_and_cleanup_is_explicit(self):
         self.fail_apply = True
         jobs = self.jobs()
