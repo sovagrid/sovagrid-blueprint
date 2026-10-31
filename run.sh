@@ -25,6 +25,263 @@ say() { printf 'SovaGrid: %s\n' "$*"; }
 # shellcheck disable=SC1091
 . /etc/os-release
 [[ ${ID:-} == ubuntu ]] || die 'this installer currently supports Ubuntu only'
+
+apt_refreshed=0
+apt_refresh() {
+  if (( ! apt_refreshed )); then
+    DEBIAN_FRONTEND=noninteractive apt-get update
+    apt_refreshed=1
+  fi
+}
+
+install_core_dependencies() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    apt_refresh
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3
+  fi
+  python3 -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ is required"' || die 'Python 3.10+ is required'
+
+  if ! command -v docker >/dev/null 2>&1; then
+    say 'installing Docker from Ubuntu packages'
+    apt_refresh
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker.io
+    systemctl enable --now docker
+  fi
+  docker info >/dev/null || die 'Docker daemon is unavailable; existing containers were not changed'
+
+  if ! docker compose version >/dev/null 2>&1; then
+    say 'installing the Docker Compose plugin'
+    apt_refresh
+    if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-compose-v2
+    elif apt-cache show docker-compose-plugin >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-compose-plugin
+    else
+      die 'no Compose plugin package is available in configured APT repositories'
+    fi
+  fi
+  docker compose version >/dev/null || die 'Docker Compose is unavailable'
+}
+
+restore_target_empty() {
+  local root=${1%/} candidate inventory passwd_entries group_entries
+  [[ -z $root || $root == /* ]] || die 'invalid restore target root'
+  for candidate in "$root"/var/lib/sovagrid-host-backups "$root"/var/lib/sovagrid-host-image-exports \
+                   "$root"/var/lib/.sovagrid-host-restore-staging; do
+    if [[ -e $candidate || -L $candidate ]]; then
+      [[ -d $candidate && ! -L $candidate &&
+         $(stat -c '%u:%g:%a' "$candidate") == 0:0:700 ]] ||
+        die 'restore input or staging directory is unsafe'
+    fi
+  done
+  for candidate in "$root"/etc/sovagrid* "$root"/opt/sovagrid* "$root"/var/lib/sovagrid* \
+                   "$root"/usr/local/bin/sovagrid* "$root"/usr/local/libexec/sovagrid*; do
+    case $candidate in
+      "$root"/var/lib/sovagrid-host-backups|"$root"/var/lib/sovagrid-host-image-exports) continue ;;
+    esac
+    [[ ! -e $candidate && ! -L $candidate ]] || die 'restore target already has SovaGrid state'
+  done
+  inventory=$(find "$root"/etc/systemd/system -name 'sovagrid-*' -print -quit) ||
+    die 'cannot inspect target systemd units'
+  [[ -z $inventory ]] ||
+    die 'restore target already has SovaGrid units'
+  passwd_entries=$(getent passwd) || die 'cannot inspect target user identities'
+  group_entries=$(getent group) || die 'cannot inspect target group identities'
+  if printf '%s\n' "$passwd_entries" | cut -d: -f1 | grep -Eq '^sovagrid([_-]|$)' ||
+     printf '%s\n' "$group_entries" | cut -d: -f1 | grep -Eq '^sovagrid([_-]|$)'; then
+    die 'restore target already has SovaGrid identities'
+  fi
+  if [[ -z $root ]] && command -v docker >/dev/null 2>&1; then
+    docker info >/dev/null 2>&1 || die 'existing Docker daemon must be available to inspect the restore target'
+    inventory=$(docker ps -a --format '{{.Names}}') || die 'cannot inspect Docker containers'
+    if printf '%s\n' "$inventory" | grep -Eq '^sovagrid([-_]|$)'; then die 'restore target has SovaGrid containers'; fi
+    inventory=$(docker image ls -a --format '{{.Repository}}') || die 'cannot inspect Docker images'
+    if printf '%s\n' "$inventory" | grep -Eq '(^|/)sovagrid([-_]|$)'; then die 'restore target has SovaGrid images'; fi
+    inventory=$(docker network ls --format '{{.Name}}') || die 'cannot inspect Docker networks'
+    if printf '%s\n' "$inventory" | grep -Eq '^sovagrid([-_]|$)'; then die 'restore target has SovaGrid networks'; fi
+    inventory=$(docker volume ls --format '{{.Name}}') || die 'cannot inspect Docker volumes'
+    if printf '%s\n' "$inventory" | grep -Eq '^sovagrid([-_]|$)'; then die 'restore target has SovaGrid volumes'; fi
+  fi
+}
+
+restore_source_and_target_verified() {
+  python3 -B -I - "$1" "$2" <<'PY' || die 'reviewed source or restore target changed'
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+root, expected = Path(sys.argv[1]), sys.argv[2]
+components = frozenset(('sovagrid-blueprint', 'sovagrid-hub', 'sovagrid-web',
+                        'sovagrid-agent', 'sovagrid-vpn'))
+
+def reject(reason):
+    raise SystemExit(reason)
+
+def checked_directory(path, *, exact_mode=None):
+    info = path.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or
+            (exact_mode is not None and stat.S_IMODE(info.st_mode) != exact_mode) or
+            info.st_mode & 0o022):
+        reject('unsafe reviewed source directory')
+
+checked_directory(Path('/'))
+checked_directory(Path('/root'), exact_mode=0o700)
+try:
+    parts = root.relative_to('/root').parts
+except ValueError:
+    reject('reviewed source must be under /root')
+if not parts:
+    reject('reviewed source root is missing')
+cursor = Path('/root')
+for part in parts:
+    cursor /= part
+    checked_directory(cursor)
+
+manifest_path = root / 'sovagrid-bundle.json'
+manifest_info = manifest_path.lstat()
+if (not stat.S_ISREG(manifest_info.st_mode) or manifest_info.st_uid != 0 or
+        manifest_info.st_nlink != 1 or stat.S_IMODE(manifest_info.st_mode) != 0o644 or
+        manifest_info.st_size > 512 * 1024):
+    reject('unsafe reviewed source manifest')
+raw = manifest_path.read_bytes()
+if hashlib.sha256(raw).hexdigest() != expected:
+    reject('reviewed source manifest changed')
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            reject('duplicate reviewed source manifest field')
+        result[key] = value
+    return result
+
+manifest = json.loads(raw, object_pairs_hook=unique_object)
+if (not isinstance(manifest, dict) or set(manifest) != {'format', 'components', 'sha256'} or
+        type(manifest['format']) is not int or manifest['format'] != 1 or
+        not isinstance(manifest['components'], dict) or
+        set(manifest['components']) != components or
+        not isinstance(manifest['sha256'], dict)):
+    reject('invalid reviewed source manifest')
+hashes = manifest['sha256']
+for relative, digest in hashes.items():
+    if (not isinstance(relative, str) or relative.startswith('/') or '\x00' in relative or
+            any(part in ('', '.', '..') for part in relative.split('/')) or
+            relative.split('/')[0] not in components or
+            not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest)):
+        reject('unsafe reviewed source path or hash')
+for component, record in manifest['components'].items():
+    if (not isinstance(record, dict) or set(record) != {'commit', 'file_count'} or
+            not isinstance(record['commit'], str) or
+            not re.fullmatch(r'[0-9a-f]{40}', record['commit']) or
+            type(record['file_count']) is not int or
+            record['file_count'] != sum(name.startswith(component + '/') for name in hashes)):
+        reject('invalid reviewed source component')
+if {entry.name for entry in root.iterdir()} != components | {'sovagrid-bundle.json'}:
+    reject('incomplete reviewed source tree')
+seen = set()
+for parent, directories, files in os.walk(root, followlinks=False):
+    for name in directories:
+        checked_directory(Path(parent) / name, exact_mode=0o755)
+    for name in files:
+        item = Path(parent) / name
+        info = item.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or
+                stat.S_IMODE(info.st_mode) not in (0o644, 0o755)):
+            reject('unsafe reviewed source file')
+        relative = item.relative_to(root).as_posix()
+        if relative == 'sovagrid-bundle.json':
+            continue
+        if relative not in hashes:
+            reject('unexpected reviewed source file')
+        digest = hashlib.sha256()
+        with item.open('rb') as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(block)
+        if digest.hexdigest() != hashes[relative]:
+            reject('reviewed source file changed')
+        seen.add(relative)
+if seen != set(hashes):
+    reject('reviewed source file list mismatch')
+
+worker_path = root / 'sovagrid-blueprint/deploy/remote_update_worker.py'
+restore_path = root / 'sovagrid-blueprint/deploy/host_restore.py'
+for module_name, path in (('sovagrid_restore_source_verifier', worker_path),
+                          ('sovagrid_restore_target_checker', restore_path)):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise SystemExit('restore verifier unavailable')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if module_name.endswith('source_verifier'):
+        digest, _commits = module.source_manifest(root)
+        if digest != expected:
+            raise SystemExit('source manifest changed')
+    else:
+        for target in module.TARGET_NAMESPACES:
+            present, unsafe = module._target_path(target)
+            if present or unsafe:
+                raise SystemExit('restore target is not clean')
+PY
+}
+
+restore_dependencies_only() {
+  local expected=$1 blueprint_dir source_root source_manifest actual_manifest
+  [[ ${VERSION_ID:-} == 22.04 || ${VERSION_ID:-} == 24.04 || ${VERSION_ID:-} == 26.04 ]] ||
+    die 'restore dependency setup requires Ubuntu 22.04, 24.04 or 26.04'
+  [[ -d /run/systemd/system ]] || die 'restore dependency setup requires systemd'
+  [[ $expected =~ ^[0-9a-f]{64}$ ]] || die 'expected source manifest must be a SHA-256 digest'
+  for tool in sha256sum stat find flock getent grep cut; do
+    command -v "$tool" >/dev/null 2>&1 || die "restore dependency setup requires $tool"
+  done
+  blueprint_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+  [[ ! -L ${BASH_SOURCE[0]} ]] || die 'restore bootstrap script must be a regular source file'
+  source_root=$(dirname -- "$blueprint_dir")
+  [[ -d /root && ! -L /root && $(stat -c '%u:%g:%a' /root) == 0:0:700 ]] ||
+    die 'restore source requires a private, root-owned /root directory'
+  [[ $source_root == /root/* && $source_root != /root && -d $source_root && ! -L $source_root &&
+     $(stat -c '%u:%g' "$source_root") == 0:0 ]] ||
+    die 'extract the reviewed source bundle under a root-owned /root directory'
+  source_manifest=$source_root/sovagrid-bundle.json
+  [[ -f $source_manifest && ! -L $source_manifest &&
+     $(stat -c '%u:%g:%a:%h' "$source_manifest") == 0:0:644:1 ]] ||
+    die 'reviewed source bundle manifest is missing or unsafe'
+  actual_manifest=$(sha256sum "$source_manifest" | cut -d' ' -f1) ||
+    die 'cannot hash source bundle manifest'
+  [[ $actual_manifest == "$expected" ]] || die 'source bundle differs from the reviewed manifest'
+  [[ ${SOVAGRID_PUBLIC_WEB_LOCK_HELD:-0} != 1 ]] ||
+    die 'restore dependency setup cannot run inside an update transaction'
+  restore_target_empty /
+  if command -v python3 >/dev/null 2>&1; then
+    restore_source_and_target_verified "$source_root" "$expected"
+  fi
+
+  # Lock a pre-existing read-only inode so this mode creates no SovaGrid paths.
+  exec 9< /etc/os-release
+  flock -x -w 30 9 || die 'restore dependency setup is already running'
+  restore_target_empty /
+  install_core_dependencies
+  if [[ ! -x /usr/bin/ss ]]; then
+    apt_refresh
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2
+  fi
+  [[ -x /usr/bin/docker && -x /usr/bin/ss ]] ||
+    die 'restore requires the Ubuntu Docker and iproute2 binaries in /usr/bin'
+  restore_source_and_target_verified "$source_root" "$expected"
+  restore_target_empty /
+  say 'restore dependencies are ready; no SovaGrid account, secret, unit or container was installed'
+}
+
+if [[ ${1:-} == --restore-dependencies-only ]]; then
+  (( $# == 3 )) && [[ $2 == --expected-source-manifest-sha256 ]] ||
+    die 'usage: sudo ./run.sh --restore-dependencies-only --expected-source-manifest-sha256 SHA256'
+  restore_dependencies_only "$3"
+  exit 0
+fi
 # An older SSH updater does not snapshot the new timer units. Refuse before
 # changing this host if it supervises an upgrade without that rollback support.
 if [[ ${SOVAGRID_PUBLIC_WEB_LOCK_HELD:-0} == 1 && -f /var/lib/sovagrid/.managed-by-run-sh && ${SOVAGRID_UPDATER_TIMER_SNAPSHOT:-0} != 1 ]]; then
@@ -301,40 +558,7 @@ deploy_env=/etc/sovagrid/deploy.env
 bot_token=/etc/sovagrid-hub/bot.token
 admin_password=/etc/sovagrid/admin-password
 
-apt_refreshed=0
-apt_refresh() {
-  if (( ! apt_refreshed )); then
-    DEBIAN_FRONTEND=noninteractive apt-get update
-    apt_refreshed=1
-  fi
-}
-
-if ! command -v python3 >/dev/null 2>&1; then
-  apt_refresh
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3
-fi
-python3 -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ is required"' || die 'Python 3.10+ is required'
-
-if ! command -v docker >/dev/null 2>&1; then
-  say 'installing Docker from Ubuntu packages'
-  apt_refresh
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker.io
-  systemctl enable --now docker
-fi
-docker info >/dev/null || die 'Docker daemon is unavailable; existing containers were not changed'
-
-if ! docker compose version >/dev/null 2>&1; then
-  say 'installing the Docker Compose plugin'
-  apt_refresh
-  if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-compose-v2
-  elif apt-cache show docker-compose-plugin >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-compose-plugin
-  else
-    die 'no Compose plugin package is available in configured APT repositories'
-  fi
-fi
-docker compose version >/dev/null || die 'Docker Compose is unavailable'
+install_core_dependencies
 
 for repo in sovagrid-hub sovagrid-web sovagrid-agent sovagrid-vpn; do
   path="$source_root/$repo"
