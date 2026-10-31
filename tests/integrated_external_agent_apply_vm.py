@@ -554,8 +554,10 @@ def run(archive_sha256: str) -> None:
     current, old, review = _review(planner, archive_sha256)
     trial_watch = []
     trial_watch_errors = []
+    commit_gate_values = []
     original_watch_start = planner.TrialWatchServer.start
     original_watch_handle = planner.TrialWatchServer._handle
+    original_commit_trial = planner.recovery.Recovery.commit_trial
 
     def record_watch_start(watch):
         result = original_watch_start(watch)
@@ -571,10 +573,21 @@ def run(archive_sha256: str) -> None:
                                       else type(exc).__name__)
             raise
 
+    def record_commit_gates(transaction, **gates):
+        def wrap(name, callback):
+            def checked():
+                result = callback()
+                commit_gate_values.append((name, result is True))
+                return result
+            return checked
+        return original_commit_trial(transaction, **{name: wrap(name, callback)
+                                                     for name, callback in gates.items()})
+
     with mock.patch.object(planner, "_normal_activation_ready", return_value=True), \
          mock.patch.object(planner, "_trial_peer", recorded_peer), \
          mock.patch.object(planner.TrialWatchServer, "start", record_watch_start), \
-         mock.patch.object(planner.TrialWatchServer, "_handle", record_watch_error):
+         mock.patch.object(planner.TrialWatchServer, "_handle", record_watch_error), \
+         mock.patch.object(planner.recovery.Recovery, "commit_trial", record_commit_gates):
         try:
             result = planner.apply(archive_sha256, current, old, review)
         except planner.Refused as exc:
@@ -588,6 +601,7 @@ def run(archive_sha256: str) -> None:
                      "normal_ready": watch.normal_ready.is_set() if watch else False,
                      "ping_count": watch.ping_count if watch else 0,
                      "watch_errors": trial_watch_errors[-8:],
+                     "commit_gates": commit_gate_values,
                      "agent_cycle_failures": journal.count("Agent cycle failed; retrying"),
                      "metrics": _hub_counters()["metrics"],
                      "jobs": _hub_counters()["jobs"],
