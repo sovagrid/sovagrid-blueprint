@@ -308,7 +308,9 @@ class Installer:
                            "/etc/sovagrid-vpn/amnezia-wireguard-control.enabled",
                            "/etc/sovagrid-vpn/amnezia-awg-settings.enabled",
                            "/etc/systemd/system/sovagrid-amnezia-control.service",
-                           "/etc/systemd/system/sovagrid-vpn-control.service"):
+                           "/etc/systemd/system/sovagrid-vpn-control.service",
+                           "/var/lib/sovagrid-vpn/amnezia-provision/pending.json",
+                           "/var/lib/sovagrid-vpn/amnezia-provision/state.json"):
                 need(not os.path.lexists(self.at(marker)), "CONTROL_ACTIVE")
         expected = {"source_manifest_sha256": source_manifest_sha256,
                     "installed_sha256": installed_sha, "state_sha256": state_sha,

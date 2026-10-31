@@ -138,6 +138,22 @@ class SourceInstallTests(unittest.TestCase):
             self.installer.preview("b" * 64, source, {"amnezia_install.py": b"new module\n"})
         self.assertEqual(error.exception.code, "CONTROL_ACTIVE")
 
+    def test_amnezia_provision_state_blocks_source_update(self):
+        self._install()
+        source = {**self.source, "sovagrid_vpn/amnezia_install.py": b"new module\n"}
+        package = {"amnezia_install.py": b"new module\n"}
+        directory = self.root / "var/lib/sovagrid-vpn/amnezia-provision"
+        directory.mkdir(parents=True)
+        for name in ("pending.json", "state.json"):
+            with self.subTest(name=name):
+                marker = directory / name
+                marker.write_bytes(b"owned provision state")
+                with self.assertRaises(Refuse) as error:
+                    self.installer.preview("b" * 64, source, package)
+                self.assertEqual(error.exception.code, "CONTROL_ACTIVE")
+                marker.unlink()
+        self.assertEqual(self.installer.preview("b" * 64, source, package)["change"], "update")
+
     def test_python_bytecode_does_not_change_managed_source_hash(self):
         self._install()
         cache = self.root / "opt/sovagrid-vpn/sovagrid_vpn/__pycache__"
