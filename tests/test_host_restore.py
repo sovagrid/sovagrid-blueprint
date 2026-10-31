@@ -705,6 +705,8 @@ class RestoreInspectionTest(unittest.TestCase):
             self.assertEqual(result["blockers"], ["APPLY_NOT_IMPLEMENTED"])
             self.assertEqual(result["image_count"], 1)
             self.assertEqual(result["images_sha256"], "d" * 64)
+            self.assertRegex(result["review_sha256"], r"^[0-9a-f]{64}$")
+            reviewed = result["review_sha256"]
             clean["vpn_udp_ports"] = [51820]
             clean["vpn_ports_verified"] = True
             with patch.object(restore, "_occupied_vpn_ports", return_value=1):
@@ -712,6 +714,7 @@ class RestoreInspectionTest(unittest.TestCase):
             self.assertFalse(vpn_blocked["target_empty"])
             self.assertEqual(vpn_blocked["target_vpn_ports_in_use"], 1)
             self.assertIn("PORT_IN_USE", vpn_blocked["blockers"])
+            self.assertNotEqual(vpn_blocked["review_sha256"], reviewed)
             clean["vpn_ports_verified"] = False
             unverified = restore.portable_clean_plan(identity)
             self.assertFalse(unverified["target_empty"])
@@ -852,6 +855,17 @@ class RestoreInspectionTest(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue()), sample)
         self.assertNotIn("/var/lib", output.getvalue())
 
+    def test_portable_stage_cli_requires_an_exact_review_digest(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(restore.main(["portable-stage", "a" * 32]), 40)
+            self.assertEqual(json.loads(output.getvalue())["error"], "USAGE")
+        with (patch.object(restore, "_require_root"),
+              patch("sys.stdout", new_callable=io.StringIO) as output):
+            self.assertEqual(restore.main(["portable-stage", "a" * 32,
+                                           "invalid-review"]), 40)
+            self.assertEqual(json.loads(output.getvalue())["error"],
+                             "INVALID_REVIEW")
+
     def _stage_fixture(self):
         content = make_archive(self.entries)
         archive = self.folder / "stage-archive.tar.gz"
@@ -939,6 +953,94 @@ class RestoreInspectionTest(unittest.TestCase):
         stage_root = target / "var/lib/.sovagrid-host-restore-staging"
         self.assertEqual(list(stage_root.iterdir()), [])
         self.assertFalse((target / "opt").exists())
+
+    def test_portable_stage_binds_review_host_tree_and_image_pair_without_apply(self):
+        archive, target, manifest = self._stage_fixture()
+        identity = "a" * 32
+        image_digest = "d" * 64
+        reviewed = "e" * 64
+        plan = {"review_sha256": reviewed, "target_empty": True,
+                "blockers": ["APPLY_NOT_IMPLEMENTED"],
+                "host_archive_sha256": manifest["sha256"],
+                "source_manifest_sha256": self.source_sha,
+                "images_sha256": image_digest, "image_bytes": 4096}
+        receipt = {"host_archive_sha256": manifest["sha256"],
+                   "source_manifest_sha256": self.source_sha,
+                   "images_sha256": image_digest}
+        artifact = {"verified": True, "receipt": receipt, "bytes": 4096}
+        exporter = SimpleNamespace(verify=lambda _identity, *, require_receipt: artifact,
+                                   Refused=restore.Refused,
+                                   backup=SimpleNamespace(Refused=restore.Refused),
+                                   restore=SimpleNamespace(Refused=restore.Refused))
+
+        def archive_fd(_identity):
+            return os.open(archive, os.O_RDONLY), manifest
+
+        def publish(root_fd, temporary, final):
+            self.assertFalse((target / "var/lib/.sovagrid-host-restore-staging" / final).exists())
+            os.rename(temporary, final, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+
+        with (patch.object(restore, "_archive_fd", side_effect=archive_fd),
+              patch.object(restore, "_require_root"),
+              patch.object(restore.backup, "_sources", return_value=self.sources),
+              patch.object(restore.backup, "ROOT", target),
+              patch.object(restore.backup, "ROOT_UID", os.geteuid()),
+              patch.object(restore.backup, "ROOT_GID", os.getegid()),
+              patch.object(restore, "portable_clean_plan", return_value=plan),
+              patch.object(restore, "_portable_export_module", return_value=exporter),
+              patch.object(restore, "_rename_noreplace", side_effect=publish)):
+            with self.assertRaisesRegex(restore.Refused, "STALE_REVIEW"):
+                restore.portable_stage(identity, "f" * 64)
+            self.assertFalse((target / "var/lib/.sovagrid-host-restore-staging").exists())
+
+            result = restore.portable_stage(identity, reviewed)
+            self.assertTrue(result["verified"])
+            self.assertFalse(result["apply_available"])
+            self.assertEqual(result["review_sha256"], reviewed)
+            staged = target / "var/lib/.sovagrid-host-restore-staging"
+            self.assertEqual(stat.S_IMODE((staged / (".portable-" + identity + ".json"))
+                                           .stat().st_mode), 0o600)
+            self.assertFalse((target / "opt").exists())
+            self.assertFalse((target / "etc").exists())
+            self.assertEqual(restore.portable_stage(identity, reviewed), result)
+            receipt["images_sha256"] = "f" * 64
+            with self.assertRaisesRegex(restore.Refused, "PORTABLE_STAGE_CHANGED"):
+                restore.portable_stage_status(identity)
+
+    def test_portable_stage_resumes_an_existing_verified_host_stage(self):
+        archive, target, manifest = self._stage_fixture()
+        identity = "a" * 32
+        plan = {"review_sha256": "e" * 64, "target_empty": True,
+                "blockers": ["APPLY_NOT_IMPLEMENTED"],
+                "host_archive_sha256": manifest["sha256"],
+                "source_manifest_sha256": self.source_sha,
+                "images_sha256": "d" * 64, "image_bytes": 4096}
+        artifact = {"verified": True, "receipt": {
+            "host_archive_sha256": manifest["sha256"],
+            "source_manifest_sha256": self.source_sha,
+            "images_sha256": "d" * 64}, "bytes": 4096}
+        exporter = SimpleNamespace(verify=lambda _identity, *, require_receipt: artifact,
+                                   Refused=restore.Refused,
+                                   backup=SimpleNamespace(Refused=restore.Refused),
+                                   restore=SimpleNamespace(Refused=restore.Refused))
+        with (patch.object(restore, "_archive_fd",
+                           side_effect=lambda _id: (os.open(archive, os.O_RDONLY), manifest)),
+              patch.object(restore, "_require_root"),
+              patch.object(restore.backup, "_sources", return_value=self.sources),
+              patch.object(restore.backup, "ROOT", target),
+              patch.object(restore.backup, "ROOT_UID", os.geteuid()),
+              patch.object(restore.backup, "ROOT_GID", os.getegid()),
+              patch.object(restore, "portable_clean_plan", return_value=plan),
+              patch.object(restore, "_portable_export_module", return_value=exporter),
+              patch.object(restore, "_rename_noreplace",
+                           side_effect=lambda fd, a, b: os.rename(
+                               a, b, src_dir_fd=fd, dst_dir_fd=fd))):
+            restore.stage(identity)
+            result = restore.portable_stage(identity, plan["review_sha256"])
+            self.assertTrue(result["verified"])
+            self.assertEqual(result["images_sha256"], "d" * 64)
+            self.assertEqual(len(list((target / "var/lib/.sovagrid-host-restore-staging")
+                                      .glob(identity))), 1)
 
 
 if __name__ == "__main__":

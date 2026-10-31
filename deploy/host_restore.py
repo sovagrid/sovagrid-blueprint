@@ -4,14 +4,16 @@
 # Additional author attribution terms: see ATTRIBUTION.md.
 """Validation and private staging for SovaGrid host archives.
 
-This module deliberately has no apply entry point. Staging writes only to a
-private directory and never installs files or starts services. Docker images,
-writer fencing, durable recovery, and rollback remain prerequisites to apply.
+Staging writes only to a private directory and never installs files or starts
+services. Writer fencing, durable recovery, and rollback remain prerequisites
+to a future apply transaction.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import ctypes
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -52,6 +54,7 @@ def _sibling(filename: str, name: str):
 backup = _sibling("host_backup.py", "_sovagrid_host_restore_backup")
 PROTOCOL = "sovagrid-host-restore-plan-v1"
 STAGE_PROTOCOL = "sovagrid-host-restore-stage-v1"
+PORTABLE_STAGE_PROTOCOL = "sovagrid-portable-restore-stage-v1"
 STAGING = Path("/var/lib/.sovagrid-host-restore-staging")
 RESTORE_PORTS = frozenset((80, 443, 8766, 8767))
 MIN_RESTORE_FREE = 512 * 1024**2
@@ -926,7 +929,7 @@ def portable_clean_plan(identity: str) -> dict:
                                     docker["root_free_bytes"] < 4 * artifact["bytes"] +
                                     MIN_RESTORE_FREE):
         blockers.append("DISK_SPACE")
-    return {**clean, "portable_verified": True,
+    result = {**clean, "portable_verified": True,
             "host_archive_sha256": receipt["host_archive_sha256"],
             "images_sha256": receipt["images_sha256"],
             "image_count": artifact["image_count"], "image_bytes": artifact["bytes"],
@@ -941,6 +944,35 @@ def portable_clean_plan(identity: str) -> dict:
                             ports == 0 and vpn_ports == 0 and
                             clean.get("vpn_ports_verified", True),
             "apply_available": False, "blockers": list(dict.fromkeys(blockers))}
+    result["review_sha256"] = _portable_review_sha256(identity, result)
+    return result
+
+
+def _portable_review_sha256(identity: str, plan_result: dict) -> str:
+    """Bind one explicit review to the pair and relevant clean-host observations.
+
+    Exact free byte counts vary harmlessly as journals grow; the disk-space
+    decision is captured by the blocker list and rechecked before staging.
+    """
+    review = {"protocol": "sovagrid-portable-restore-review-v1",
+              "id": _id(identity),
+              "archive_sha256": plan_result["host_archive_sha256"],
+              "source_manifest_sha256": plan_result["source_manifest_sha256"],
+              "images_sha256": plan_result["images_sha256"],
+              "image_bytes": plan_result["image_bytes"],
+              "image_platforms": plan_result["image_platforms"],
+              "target_docker_architecture": plan_result["target_docker_architecture"],
+              "target_empty": plan_result["target_empty"],
+              "target_conflicts": plan_result["target_conflicts"],
+              "target_unsafe_paths": plan_result["target_unsafe_paths"],
+              "target_identity_conflicts": plan_result["target_identity_conflicts"],
+              "target_docker_conflicts": plan_result["target_docker_conflicts"],
+              "target_ports_in_use": plan_result["target_ports_in_use"],
+              "target_vpn_ports_in_use": plan_result["target_vpn_ports_in_use"],
+              "blockers": plan_result["blockers"]}
+    raw = json.dumps(review, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=True).encode("ascii")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _staging_root() -> tuple[Path, int]:
@@ -1231,6 +1263,7 @@ def stage_status(identity: str) -> dict:
         return {"ok": True, "protocol": STAGE_PROTOCOL, "id": identity,
                 "staged": True, "verified": True, "entries": receipt["entries"],
                 "uncompressed_bytes": receipt["uncompressed_bytes"],
+                "tree_sha256": receipt["tree_sha256"],
                 "apply_available": False,
                 "blockers": ["APPLY_NOT_IMPLEMENTED", "DOCKER_IMAGES_NOT_INCLUDED"]}
     finally:
@@ -1325,15 +1358,210 @@ def stage(identity: str) -> dict:
         os.close(root_fd)
 
 
+def _portable_marker_name(identity: str) -> str:
+    return ".portable-" + _id(identity) + ".json"
+
+
+def _read_portable_marker(root_fd: int, identity: str) -> dict:
+    try:
+        fd = os.open(_portable_marker_name(identity), os.O_RDONLY |
+                     os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
+    except FileNotFoundError as exc:
+        raise Refused("PORTABLE_STAGE_NOT_FOUND") from exc
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+                info.st_size > 4096 or
+                (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) !=
+                (backup.ROOT_UID, backup.ROOT_GID, 0o600)):
+            raise Refused("UNSAFE_STAGE")
+        raw = os.read(fd, 4097)
+    finally:
+        os.close(fd)
+    try:
+        receipt = json.loads(raw, object_pairs_hook=_unique)
+    except (Refused, ValueError, UnicodeError) as exc:
+        raise Refused("INVALID_PORTABLE_STAGE") from exc
+    digests = ("review_sha256", "archive_sha256", "source_manifest_sha256",
+               "images_sha256", "tree_sha256")
+    if (not isinstance(receipt, dict) or set(receipt) !=
+            {"protocol", "id", "review_sha256", "archive_sha256",
+             "source_manifest_sha256", "images_sha256", "image_bytes",
+             "tree_sha256", "created_at"} or
+            receipt["protocol"] != PORTABLE_STAGE_PROTOCOL or
+            receipt["id"] != identity or
+            any(not isinstance(receipt[key], str) or SHA.fullmatch(receipt[key]) is None
+                for key in digests) or
+            type(receipt["image_bytes"]) is not int or
+            not 0 < receipt["image_bytes"] <= 8 * 1024**3 or
+            not isinstance(receipt["created_at"], str) or
+            len(receipt["created_at"]) > 40):
+        raise Refused("INVALID_PORTABLE_STAGE")
+    return receipt
+
+
+def _rename_noreplace(root_fd: int, temporary: str, final: str) -> None:
+    """Publish a fully synced marker without replacing another operation."""
+    if not sys.platform.startswith("linux"):
+        raise Refused("UNSUPPORTED_PLATFORM")
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = getattr(libc, "renameat2", None)
+    if rename is None:
+        raise Refused("UNSUPPORTED_PLATFORM")
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                       ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    if rename(root_fd, temporary.encode("ascii"), root_fd,
+              final.encode("ascii"), 1) != 0:  # RENAME_NOREPLACE
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise Refused("PORTABLE_STAGE_EXISTS")
+        raise Refused("IO_ERROR")
+
+
+def portable_stage_status(identity: str) -> dict:
+    """Recheck the sealed host tree and exact image pair without applying it."""
+    _require_root()
+    identity = _id(identity)
+    stage_result = stage_status(identity)
+    try:
+        root_fd = backup._safe_open(STAGING, directory=True)
+    except FileNotFoundError as exc:
+        raise Refused("PORTABLE_STAGE_NOT_FOUND") from exc
+    try:
+        try:
+            fcntl.flock(root_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Refused("BUSY") from exc
+        marker = _read_portable_marker(root_fd, identity)
+    finally:
+        os.close(root_fd)
+    try:
+        exporter = _portable_export_module()
+    except (RuntimeError, ImportError, OSError) as exc:
+        raise Refused("IMAGE_PAIR_UNAVAILABLE") from exc
+    try:
+        artifact = exporter.verify(identity, require_receipt=True)
+    except (exporter.Refused, exporter.backup.Refused,
+            exporter.restore.Refused) as exc:
+        raise Refused(str(exc)) from None
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        raise Refused("IMAGE_PAIR_INVALID") from exc
+    receipt = artifact.get("receipt") if isinstance(artifact, dict) else None
+    if (not isinstance(receipt, dict) or artifact.get("verified") is not True or
+            marker["archive_sha256"] != receipt.get("host_archive_sha256") or
+            marker["source_manifest_sha256"] != receipt.get("source_manifest_sha256") or
+            marker["images_sha256"] != receipt.get("images_sha256") or
+            marker["image_bytes"] != artifact.get("bytes") or
+            marker["tree_sha256"] != stage_result["tree_sha256"]):
+        raise Refused("PORTABLE_STAGE_CHANGED")
+    return {"ok": True, "protocol": PORTABLE_STAGE_PROTOCOL, "id": identity,
+            "staged": True, "verified": True,
+            "review_sha256": marker["review_sha256"],
+            "tree_sha256": marker["tree_sha256"],
+            "host_archive_sha256": marker["archive_sha256"],
+            "images_sha256": marker["images_sha256"],
+            "image_bytes": marker["image_bytes"],
+            "apply_available": False, "blockers": ["APPLY_NOT_IMPLEMENTED"]}
+
+
+def portable_stage(identity: str, expected_review_sha256: str) -> dict:
+    """Seal a reviewed portable pair; resumable after an interrupted marker write."""
+    _require_root()
+    identity = _id(identity)
+    if (not isinstance(expected_review_sha256, str) or
+            SHA.fullmatch(expected_review_sha256) is None):
+        raise Refused("INVALID_REVIEW")
+    preview = portable_clean_plan(identity)
+    if preview["review_sha256"] != expected_review_sha256:
+        raise Refused("STALE_REVIEW")
+    if (not preview["target_empty"] or
+            preview["blockers"] != ["APPLY_NOT_IMPLEMENTED"]):
+        raise Refused("TARGET_NOT_READY")
+    try:
+        staged = stage_status(identity)
+    except Refused as exc:
+        if str(exc) != "STAGE_NOT_FOUND":
+            raise
+        stage(identity)
+        staged = stage_status(identity)
+    # Staging itself consumes disk space, so a second clean-plan would compare
+    # a different free-space snapshot to the one the administrator reviewed.
+    # This phase changes no live path. The final status verifies both sealed
+    # artifacts again; a future apply must repeat target checks under its own
+    # transaction lock before touching services or installed state.
+    marker = {"protocol": PORTABLE_STAGE_PROTOCOL, "id": identity,
+              "review_sha256": expected_review_sha256,
+              "archive_sha256": preview["host_archive_sha256"],
+              "source_manifest_sha256": preview["source_manifest_sha256"],
+              "images_sha256": preview["images_sha256"],
+              "image_bytes": preview["image_bytes"],
+              "tree_sha256": staged["tree_sha256"],
+              "created_at": datetime.now(timezone.utc).isoformat()}
+    raw = (json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if len(raw) > 4096:
+        raise Refused("INVALID_PORTABLE_STAGE")
+    root_fd = backup._safe_open(STAGING, directory=True)
+    temporary = ".portable-" + identity + "." + uuid.uuid4().hex + ".tmp"
+    already = False
+    try:
+        try:
+            fcntl.flock(root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Refused("BUSY") from exc
+        try:
+            old = _read_portable_marker(root_fd, identity)
+        except Refused as exc:
+            if str(exc) != "PORTABLE_STAGE_NOT_FOUND":
+                raise
+        else:
+            if old["review_sha256"] != expected_review_sha256:
+                raise Refused("PORTABLE_STAGE_EXISTS")
+            already = True
+        if not already:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                         os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=root_fd)
+            try:
+                info = os.fstat(fd)
+                if (info.st_uid, info.st_gid) != (backup.ROOT_UID, backup.ROOT_GID):
+                    os.fchown(fd, backup.ROOT_UID, backup.ROOT_GID)
+                os.fchmod(fd, 0o600)
+                info = os.fstat(fd)
+                if (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (
+                        backup.ROOT_UID, backup.ROOT_GID, 0o600):
+                    raise Refused("UNSAFE_STAGE")
+                view = memoryview(raw)
+                while view:
+                    count = os.write(fd, view)
+                    if count <= 0:
+                        raise Refused("IO_ERROR")
+                    view = view[count:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            _rename_noreplace(root_fd, temporary, _portable_marker_name(identity))
+            os.fsync(root_fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=root_fd)
+        except FileNotFoundError:
+            pass
+        os.close(root_fd)
+    return portable_stage_status(identity)
+
+
 def main(argv: list[str]) -> int:
     try:
-        if len(argv) != 2 or argv[0] not in ("verify", "plan", "clean-plan",
-                                              "portable-clean-plan", "stage",
-                                              "stage-status"):
+        if ((len(argv) != 2 or argv[0] not in
+             ("verify", "plan", "clean-plan", "portable-clean-plan",
+              "stage", "stage-status", "portable-stage-status")) and
+            (len(argv) != 3 or argv[0] != "portable-stage")):
             raise Refused("USAGE")
         result = (verify(argv[1]) if argv[0] == "verify" else
                   clean_plan(argv[1]) if argv[0] == "clean-plan" else
                   portable_clean_plan(argv[1]) if argv[0] == "portable-clean-plan" else
+                  portable_stage(argv[1], argv[2]) if argv[0] == "portable-stage" else
+                  portable_stage_status(argv[1]) if argv[0] == "portable-stage-status" else
                   stage(argv[1]) if argv[0] == "stage" else
                   stage_status(argv[1]) if argv[0] == "stage-status" else plan(argv[1]))
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
