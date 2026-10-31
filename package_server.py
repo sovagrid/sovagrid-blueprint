@@ -15,6 +15,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -27,6 +28,13 @@ COMPONENTS = (
     "sovagrid-agent",
     "sovagrid-vpn",
 )
+
+
+def valid_manifest_source_name(name: str) -> bool:
+    """Reject paths the installed enrollment helper cannot verify."""
+    return (isinstance(name, str) and len(name) <= 240
+            and re.fullmatch(r"[A-Za-z0-9_.@-]+(?:/[A-Za-z0-9_.@-]+)*", name) is not None
+            and all(part not in (".", "..") for part in name.split("/")))
 
 
 def git(repo: Path, *args: str) -> bytes:
@@ -83,7 +91,10 @@ def package(destination: Path) -> None:
             path = repo / relative
             if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(repo.resolve()):
                 raise SystemExit(f"Unsupported tracked file in {name}: {relative}")
-            files.append((path, f"{name}/{relative.as_posix()}", git_mode))
+            bundled_name = f"{name}/{relative.as_posix()}"
+            if not valid_manifest_source_name(bundled_name):
+                raise SystemExit(f"Unsupported bundled filename in {name}: {relative}")
+            files.append((path, bundled_name, git_mode))
         manifest["components"][name] = {"commit": commit, "file_count": len(entries)}
 
     destination = destination.expanduser().resolve()

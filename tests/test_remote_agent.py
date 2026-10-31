@@ -16,6 +16,8 @@ import uuid
 from types import SimpleNamespace
 from unittest import mock
 
+import package_server
+
 SOURCE = Path(__file__).resolve().parents[1] / "deploy/remote_agent.py"
 spec = importlib.util.spec_from_file_location("remote_agent_helper", SOURCE)
 helper = importlib.util.module_from_spec(spec)
@@ -28,6 +30,21 @@ def ssh_key():
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_package_and_enrollment_share_source_path_rules(self):
+        for name, expected in (
+                ("sovagrid-blueprint/deploy/sovagrid-external-agent-apply@.service", True),
+                ("sovagrid-agent/README.md", True),
+                ("sovagrid-vpn/sovagrid_vpn/__init__.py", True),
+                ("sovagrid-agent//README.md", False),
+                ("sovagrid-agent/../README.md", False),
+                ("sovagrid-agent/.hidden/./README.md", False),
+                ("sovagrid-agent/тест.py", False),
+                ("sovagrid-agent/README.md/", False),
+                ("sovagrid-agent/README+unsafe.md", False)):
+            with self.subTest(name=name):
+                self.assertEqual(package_server.valid_manifest_source_name(name), expected)
+                self.assertEqual(helper.valid_manifest_source_name(name), expected)
+
     def test_strict_actions_protocol_fields_and_canonical_ids(self):
         request_id = str(uuid.uuid4())
         good = {"protocol": 1, "request_id": request_id}
@@ -170,6 +187,22 @@ class FilesTests(unittest.TestCase):
         self.files.write("/opt/sovagrid-src/sovagrid-agent/LICENSE", b"tampered", mode=0o644)
         with self.assertRaises(helper.Refuse):
             source.verify()
+
+    def test_manifest_accepts_systemd_template_unit_and_rejects_empty_segments(self):
+        source, _ = self.source_fixture()
+        root = "/opt/sovagrid-src"
+        unit = "sovagrid-blueprint/deploy/sovagrid-external-agent-apply@.service"
+        self.files.write(root + "/" + unit, b"[Unit]\nDescription=fixture\n", mode=0o644)
+        manifest = json.loads(self.files.read(root + "/sovagrid-bundle.json"))
+        manifest["sha256"][unit] = helper.digest(b"[Unit]\nDescription=fixture\n")
+        manifest["components"]["sovagrid-blueprint"]["file_count"] += 1
+        self.files.write(root + "/sovagrid-bundle.json", helper.encode(manifest), mode=0o644)
+        source.verify()
+        manifest["sha256"][unit.replace("/deploy/", "//deploy/")] = manifest["sha256"].pop(unit)
+        self.files.write(root + "/sovagrid-bundle.json", helper.encode(manifest), mode=0o644)
+        with self.assertRaises(helper.Refuse) as error:
+            source.verify()
+        self.assertEqual(error.exception.code, "SOURCE_UNTRUSTED")
 
     def test_nested_match_include_changes_policy_snapshot(self):
         self.files.mkdir("/etc/ssh",0o755)

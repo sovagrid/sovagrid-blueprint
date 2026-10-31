@@ -72,6 +72,13 @@ def require(condition, code="INVALID_REQUEST"):
         raise Refuse(code)
 
 
+def valid_manifest_source_name(name):
+    """Use the same path grammar for packaging and installed source checks."""
+    return (isinstance(name, str) and len(name) <= 240
+            and re.fullmatch(r"[A-Za-z0-9_.@-]+(?:/[A-Za-z0-9_.@-]+)*", name) is not None
+            and all(part not in (".", "..") for part in name.split("/")))
+
+
 def unique_object(pairs):
     value = {}
     for key, item in pairs:
@@ -335,8 +342,7 @@ class Source:
         require(1 <= len(manifest["sha256"]) <= 4096, "SOURCE_UNTRUSTED")
         expanded = 0
         for name, expected in manifest["sha256"].items():
-            require(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_./-]{1,240}", name)
-                    and not name.startswith("/") and ".." not in name.split("/")
+            require(valid_manifest_source_name(name)
                     and name.split("/")[0] in COMPONENTS
                     and isinstance(expected, str) and SHA.fullmatch(expected), "SOURCE_UNTRUSTED")
             data = self.files.read(self.source + "/" + name, limit=32 * 1024**2)
