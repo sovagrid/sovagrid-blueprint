@@ -96,7 +96,7 @@ restore_target_empty() {
     inventory=$(docker ps -a --format '{{.Names}}') || die 'cannot inspect Docker containers'
     if printf '%s\n' "$inventory" | grep -Eq '^sovagrid([-_]|$)'; then die 'restore target has SovaGrid containers'; fi
     inventory=$(docker image ls -a --format '{{.Repository}}') || die 'cannot inspect Docker images'
-    if printf '%s\n' "$inventory" | grep -Eq '(^|/)sovagrid([-_]|$)'; then die 'restore target has SovaGrid images'; fi
+    if printf '%s\n' "$inventory" | grep -Eq '(^|/)sovagrid([-_/]|$)'; then die 'restore target has SovaGrid images'; fi
     inventory=$(docker network ls --format '{{.Name}}') || die 'cannot inspect Docker networks'
     if printf '%s\n' "$inventory" | grep -Eq '^sovagrid([-_]|$)'; then die 'restore target has SovaGrid networks'; fi
     inventory=$(docker volume ls --format '{{.Name}}') || die 'cannot inspect Docker volumes'
@@ -116,97 +116,102 @@ import stat
 import sys
 
 root, expected = Path(sys.argv[1]), sys.argv[2]
-components = frozenset(('sovagrid-blueprint', 'sovagrid-hub', 'sovagrid-web',
-                        'sovagrid-agent', 'sovagrid-vpn'))
 
 def reject(reason):
     raise SystemExit(reason)
 
-def checked_directory(path, *, exact_mode=None):
-    info = path.lstat()
-    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or
-            (exact_mode is not None and stat.S_IMODE(info.st_mode) != exact_mode) or
-            info.st_mode & 0o022):
-        reject('unsafe reviewed source directory')
+def verify_reviewed_source(root, expected, *, anchor=Path('/root'), owner_uid=0):
+    components = frozenset(('sovagrid-blueprint', 'sovagrid-hub', 'sovagrid-web',
+                            'sovagrid-agent', 'sovagrid-vpn'))
 
-checked_directory(Path('/'))
-checked_directory(Path('/root'), exact_mode=0o700)
-try:
-    parts = root.relative_to('/root').parts
-except ValueError:
-    reject('reviewed source must be under /root')
-if not parts:
-    reject('reviewed source root is missing')
-cursor = Path('/root')
-for part in parts:
-    cursor /= part
-    checked_directory(cursor)
+    def checked_directory(path, *, exact_mode=None, required_owner=None):
+        info = path.lstat()
+        owner = owner_uid if required_owner is None else required_owner
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != owner or
+                (exact_mode is not None and stat.S_IMODE(info.st_mode) != exact_mode) or
+                info.st_mode & 0o022):
+            reject('unsafe reviewed source directory')
 
-manifest_path = root / 'sovagrid-bundle.json'
-manifest_info = manifest_path.lstat()
-if (not stat.S_ISREG(manifest_info.st_mode) or manifest_info.st_uid != 0 or
-        manifest_info.st_nlink != 1 or stat.S_IMODE(manifest_info.st_mode) != 0o644 or
-        manifest_info.st_size > 512 * 1024):
-    reject('unsafe reviewed source manifest')
-raw = manifest_path.read_bytes()
-if hashlib.sha256(raw).hexdigest() != expected:
-    reject('reviewed source manifest changed')
+    checked_directory(Path('/'), required_owner=0)
+    checked_directory(anchor, exact_mode=0o700)
+    try:
+        parts = root.relative_to(anchor).parts
+    except ValueError:
+        reject('reviewed source must be under the private source anchor')
+    if not parts:
+        reject('reviewed source root is missing')
+    cursor = anchor
+    for part in parts:
+        cursor /= part
+        checked_directory(cursor)
 
-def unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            reject('duplicate reviewed source manifest field')
-        result[key] = value
-    return result
+    manifest_path = root / 'sovagrid-bundle.json'
+    manifest_info = manifest_path.lstat()
+    if (not stat.S_ISREG(manifest_info.st_mode) or manifest_info.st_uid != owner_uid or
+            manifest_info.st_nlink != 1 or stat.S_IMODE(manifest_info.st_mode) != 0o644 or
+            manifest_info.st_size > 512 * 1024):
+        reject('unsafe reviewed source manifest')
+    raw = manifest_path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected:
+        reject('reviewed source manifest changed')
 
-manifest = json.loads(raw, object_pairs_hook=unique_object)
-if (not isinstance(manifest, dict) or set(manifest) != {'format', 'components', 'sha256'} or
-        type(manifest['format']) is not int or manifest['format'] != 1 or
-        not isinstance(manifest['components'], dict) or
-        set(manifest['components']) != components or
-        not isinstance(manifest['sha256'], dict)):
-    reject('invalid reviewed source manifest')
-hashes = manifest['sha256']
-for relative, digest in hashes.items():
-    if (not isinstance(relative, str) or relative.startswith('/') or '\x00' in relative or
-            any(part in ('', '.', '..') for part in relative.split('/')) or
-            relative.split('/')[0] not in components or
-            not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest)):
-        reject('unsafe reviewed source path or hash')
-for component, record in manifest['components'].items():
-    if (not isinstance(record, dict) or set(record) != {'commit', 'file_count'} or
-            not isinstance(record['commit'], str) or
-            not re.fullmatch(r'[0-9a-f]{40}', record['commit']) or
-            type(record['file_count']) is not int or
-            record['file_count'] != sum(name.startswith(component + '/') for name in hashes)):
-        reject('invalid reviewed source component')
-if {entry.name for entry in root.iterdir()} != components | {'sovagrid-bundle.json'}:
-    reject('incomplete reviewed source tree')
-seen = set()
-for parent, directories, files in os.walk(root, followlinks=False):
-    for name in directories:
-        checked_directory(Path(parent) / name, exact_mode=0o755)
-    for name in files:
-        item = Path(parent) / name
-        info = item.lstat()
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or
-                stat.S_IMODE(info.st_mode) not in (0o644, 0o755)):
-            reject('unsafe reviewed source file')
-        relative = item.relative_to(root).as_posix()
-        if relative == 'sovagrid-bundle.json':
-            continue
-        if relative not in hashes:
-            reject('unexpected reviewed source file')
-        digest = hashlib.sha256()
-        with item.open('rb') as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b''):
-                digest.update(block)
-        if digest.hexdigest() != hashes[relative]:
-            reject('reviewed source file changed')
-        seen.add(relative)
-if seen != set(hashes):
-    reject('reviewed source file list mismatch')
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                reject('duplicate reviewed source manifest field')
+            result[key] = value
+        return result
+
+    manifest = json.loads(raw, object_pairs_hook=unique_object)
+    if (not isinstance(manifest, dict) or set(manifest) != {'format', 'components', 'sha256'} or
+            type(manifest['format']) is not int or manifest['format'] != 1 or
+            not isinstance(manifest['components'], dict) or
+            set(manifest['components']) != components or
+            not isinstance(manifest['sha256'], dict)):
+        reject('invalid reviewed source manifest')
+    hashes = manifest['sha256']
+    for relative, digest in hashes.items():
+        if (not isinstance(relative, str) or relative.startswith('/') or '\x00' in relative or
+                any(part in ('', '.', '..') for part in relative.split('/')) or
+                relative.split('/')[0] not in components or
+                not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest)):
+            reject('unsafe reviewed source path or hash')
+    for component, record in manifest['components'].items():
+        if (not isinstance(record, dict) or set(record) != {'commit', 'file_count'} or
+                not isinstance(record['commit'], str) or
+                not re.fullmatch(r'[0-9a-f]{40}', record['commit']) or
+                type(record['file_count']) is not int or
+                record['file_count'] != sum(name.startswith(component + '/') for name in hashes)):
+            reject('invalid reviewed source component')
+    if {entry.name for entry in root.iterdir()} != components | {'sovagrid-bundle.json'}:
+        reject('incomplete reviewed source tree')
+    seen = set()
+    for parent, directories, files in os.walk(root, followlinks=False):
+        for name in directories:
+            checked_directory(Path(parent) / name, exact_mode=0o755)
+        for name in files:
+            item = Path(parent) / name
+            info = item.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != owner_uid or info.st_nlink != 1 or
+                    stat.S_IMODE(info.st_mode) not in (0o644, 0o755)):
+                reject('unsafe reviewed source file')
+            relative = item.relative_to(root).as_posix()
+            if relative == 'sovagrid-bundle.json':
+                continue
+            if relative not in hashes:
+                reject('unexpected reviewed source file')
+            digest = hashlib.sha256()
+            with item.open('rb') as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(block)
+            if digest.hexdigest() != hashes[relative]:
+                reject('reviewed source file changed')
+            seen.add(relative)
+    if seen != set(hashes):
+        reject('reviewed source file list mismatch')
+
+verify_reviewed_source(root, expected)
 
 worker_path = root / 'sovagrid-blueprint/deploy/remote_update_worker.py'
 restore_path = root / 'sovagrid-blueprint/deploy/host_restore.py'
@@ -230,12 +235,12 @@ PY
 }
 
 restore_dependencies_only() {
-  local expected=$1 blueprint_dir source_root source_manifest actual_manifest
+  local expected=$1 blueprint_dir source_root source_manifest actual_manifest lock
   [[ ${VERSION_ID:-} == 22.04 || ${VERSION_ID:-} == 24.04 || ${VERSION_ID:-} == 26.04 ]] ||
     die 'restore dependency setup requires Ubuntu 22.04, 24.04 or 26.04'
   [[ -d /run/systemd/system ]] || die 'restore dependency setup requires systemd'
   [[ $expected =~ ^[0-9a-f]{64}$ ]] || die 'expected source manifest must be a SHA-256 digest'
-  for tool in sha256sum stat find flock getent grep cut; do
+  for tool in sha256sum stat find flock getent grep cut install; do
     command -v "$tool" >/dev/null 2>&1 || die "restore dependency setup requires $tool"
   done
   blueprint_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
@@ -260,8 +265,13 @@ restore_dependencies_only() {
     restore_source_and_target_verified "$source_root" "$expected"
   fi
 
-  # Lock a pre-existing read-only inode so this mode creates no SovaGrid paths.
-  exec 9< /etc/os-release
+  # This transient lock serializes dependency bootstraps on the target host.
+  lock=/run/sovagrid-restore-dependencies.lock
+  [[ ! -L $lock ]] || die 'restore dependency lock is unsafe'
+  if [[ ! -e $lock ]]; then install -o root -g root -m 0600 /dev/null "$lock"; fi
+  [[ -f $lock && $(stat -c '%u:%g:%a:%h' "$lock") == 0:0:600:1 ]] ||
+    die 'restore dependency lock is unsafe'
+  exec 9>>"$lock"
   flock -x -w 30 9 || die 'restore dependency setup is already running'
   restore_target_empty /
   install_core_dependencies

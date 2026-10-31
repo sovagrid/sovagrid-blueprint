@@ -70,7 +70,7 @@ for kind in containers images networks volumes; do
     networks) inventory=$(docker network ls --format '{{.Name}}') ;;
     volumes) inventory=$(docker volume ls --format '{{.Name}}') ;;
   esac
-  if printf '%s\n' "$inventory" | grep -Eq '(^|/)sovagrid([-_]|$)'; then
+  if printf '%s\n' "$inventory" | grep -Eq '(^|/)sovagrid([-_/]|$)'; then
     fail "SovaGrid Docker $kind were created"
   fi
 done

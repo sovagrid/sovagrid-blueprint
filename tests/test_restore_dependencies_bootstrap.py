@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import json
 import os
 from pathlib import Path
 import shlex
@@ -148,6 +151,77 @@ class RestoreDependencyBootstrapTest(unittest.TestCase):
         compile(verifier, "restore-source-verifier", "exec")
         self.assertLess(verifier.index("if seen != set(hashes):"),
                         verifier.index("spec.loader.exec_module(module)"))
+
+    def test_stdlib_verifier_refuses_tampered_candidate_without_import(self) -> None:
+        source = self.source
+        start = source.index("\n", source.index("python3 -B -I - \"$1\" \"$2\" <<'PY'")) + 1
+        end = source.index("\nPY\n", start)
+        module = ast.parse(source[start:end])
+        selected = [node for node in module.body
+                    if isinstance(node, (ast.Import, ast.ImportFrom)) or
+                    isinstance(node, ast.FunctionDef) and
+                    node.name in ("reject", "verify_reviewed_source")]
+        scope: dict[str, object] = {}
+        exec(compile(ast.Module(body=selected, type_ignores=[]),
+                     "restore-source-verifier", "exec"), scope)
+        verify = scope["verify_reviewed_source"]
+
+        anchor = Path(self.temporary.name) / "private"
+        anchor.mkdir(mode=0o700)
+        anchor.chmod(0o700)
+        bundle = anchor / "bundle"
+        bundle.mkdir(mode=0o755)
+        bundle.chmod(0o755)
+        components = ("sovagrid-blueprint", "sovagrid-hub", "sovagrid-web",
+                      "sovagrid-agent", "sovagrid-vpn")
+        files = {f"{component}/README": b"reviewed\n" for component in components}
+        worker_name = "sovagrid-blueprint/deploy/remote_update_worker.py"
+        files[worker_name] = b"raise RuntimeError('candidate code executed')\n"
+        for relative, content in files.items():
+            path = bundle / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.parent.chmod(0o755)
+            path.write_bytes(content)
+            path.chmod(0o644)
+        hashes = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
+        manifest = {
+            "format": 1,
+            "components": {component: {"commit": "a" * 40,
+                                       "file_count": sum(name.startswith(component + "/")
+                                                         for name in files)}
+                           for component in components},
+            "sha256": hashes,
+        }
+        raw = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
+        manifest_path = bundle / "sovagrid-bundle.json"
+        manifest_path.write_bytes(raw)
+        manifest_path.chmod(0o644)
+        digest = hashlib.sha256(raw).hexdigest()
+        verify(bundle, digest, anchor=anchor, owner_uid=os.getuid())
+
+        marker = Path(self.temporary.name) / "candidate-imported"
+        worker = bundle / worker_name
+        worker.write_text(f"open({str(marker)!r}, 'w').write('executed')\n", encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            verify(bundle, digest, anchor=anchor, owner_uid=os.getuid())
+        self.assertFalse(marker.exists())
+
+    def test_docker_image_guard_recognizes_namespace_repository(self) -> None:
+        line = next(line for line in self.source.splitlines()
+                    if "restore target has SovaGrid images" in line)
+        script = (
+            "die() { exit 1; }\n"
+            "inventory=$1\n"
+            f"{line}\n"
+        )
+        for repository in ("sovagrid", "sovagrid/hub", "registry.test/sovagrid_hub"):
+            with self.subTest(repository=repository):
+                result = subprocess.run(["bash", "-c", script, "sovagrid", repository],
+                                        capture_output=True, text=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+        result = subprocess.run(["bash", "-c", script, "sovagrid", "unrelated/image"],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":
