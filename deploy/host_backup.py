@@ -61,6 +61,7 @@ WEB_AGENT_UNIT_PATHS = tuple("/etc/systemd/system/" + unit
 WEB_AGENT_BUNDLE = re.compile(r"source-([0-9a-f]{64})\.tar\.gz\Z")
 WEB_AGENT_JOB = re.compile(r"[0-9a-f]{32}\.json\Z")
 WEB_AGENT_SOURCE_TEMP = re.compile(r"\.source-[A-Za-z0-9_]{6,31}\Z")
+WEB_AGENT_VPN_STAGE_TEMP = re.compile(r"\.vpn-stage-[0-9a-f]{32}\Z")
 WEB_AGENT_JOB_TEMP = re.compile(r"\.enrollment-[A-Za-z0-9_]{6,31}\Z")
 WEB_AGENT_MAX_BUNDLE = 64 * 1024**2
 WEB_AGENT_MAX_JOB = 32 * 1024
@@ -357,7 +358,7 @@ def _web_agent_source(path: str) -> Source | None:
                       gid=ROOT_GID)
     if path.startswith(WEB_AGENT_DIR + "/"):
         relative = path[len(WEB_AGENT_DIR) + 1:]
-        if (relative in (".bundle.lock", "completed-enrollments.jsonl") or
+        if (relative in (".bundle.lock", "completed-enrollments.jsonl", "vpn-source-stage.json") or
                 WEB_AGENT_BUNDLE.fullmatch(relative) or
                 relative in ("jobs/.lock", "jobs/.enrollment-web-mutation") or
                 relative.startswith("jobs/") and
@@ -378,6 +379,8 @@ def _web_agent_limit(path: str) -> int | None:
                 else WEB_AGENT_MAX_LOCK)
     if path == WEB_AGENT_DIR + "/.bundle.lock":
         return WEB_AGENT_MAX_LOCK
+    if path == WEB_AGENT_DIR + "/vpn-source-stage.json":
+        return 4096
     return None
 
 
@@ -393,6 +396,8 @@ def _skip_web_agent_temp(path: str, name: str, info: os.stat_result) -> bool:
     """Ignore only interrupted atomic writes that can never be journal state."""
     limit = (WEB_AGENT_MAX_BUNDLE if path == WEB_AGENT_DIR and
              WEB_AGENT_SOURCE_TEMP.fullmatch(name) else
+             4096 if path == WEB_AGENT_DIR and
+             WEB_AGENT_VPN_STAGE_TEMP.fullmatch(name) else
              WEB_AGENT_MAX_JOB if path == WEB_AGENT_JOBS and
              WEB_AGENT_JOB_TEMP.fullmatch(name) else None)
     if limit is None:
@@ -483,8 +488,9 @@ def _scan(sources: tuple[Source, ...], *, deadline: float) -> tuple[list[Entry],
                         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
                         if _skip_container_temp(path, name, info):
                             continue
-                    if path in (WEB_AGENT_DIR, WEB_AGENT_JOBS) and name.startswith(
-                            ".source-" if path == WEB_AGENT_DIR else ".enrollment-"):
+                    if path in (WEB_AGENT_DIR, WEB_AGENT_JOBS) and (
+                            name.startswith((".source-", ".vpn-stage-")) if path == WEB_AGENT_DIR
+                            else name.startswith(".enrollment-")):
                         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
                         if _skip_web_agent_temp(path, name, info):
                             continue

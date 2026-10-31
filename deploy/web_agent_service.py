@@ -26,7 +26,8 @@ import threading
 
 _DEPLOY = Path(__file__).resolve().parent
 _BEARER = re.compile(r"[A-Za-z0-9_-]{43}\Z")
-_ACTIONS = frozenset({"prepare", "apply", "resume", "cleanup", "interrupt", "status", "list"})
+_ACTIONS = frozenset({"prepare", "apply", "resume", "cleanup", "interrupt", "status", "list",
+                      "vpn-source-preview", "vpn-source-apply", "vpn-source-recover"})
 _MAX_REQUEST = 72 * 1024
 _MAX_REPLY = 32 * 1024 - 1  # Gateway's 32 KiB limit includes the newline.
 _GATEWAY_UID = 10003
@@ -52,6 +53,7 @@ _trusted_imports()
 from web_agent_local_rpc import LocalHubFacade, LocalHubRPC  # noqa: E402
 from web_agent_target_ssh import PinnedTargetSSH  # noqa: E402
 from web_agent_jobs import ControllerBinding, JobError, WebAgentJobs  # noqa: E402
+from web_vpn_source import VpnSourceError, VpnSourceJobs  # noqa: E402
 from sovagrid_connect.agent_enrollment import AgentEnrollment  # noqa: E402
 from sovagrid_connect.core import ConnectionOptions  # noqa: E402
 from sovagrid_connect.enrollment_api import EnrollmentAPI, EnrollmentAPIError  # noqa: E402
@@ -176,7 +178,8 @@ def _stable_public_web(*, expected_uid: int = 0, expected_gid: int = 0):
         os.close(descriptor)
 
 
-def dispatch(jobs: WebAgentJobs, request: object, *, authorize=_authorize) -> dict:
+def dispatch(jobs: WebAgentJobs, request: object, *, authorize=_authorize,
+             vpn_source: VpnSourceJobs | None = None) -> dict:
     if type(request) is not dict or set(request) != {"action", "session_token", "payload"}:
         raise RequestError("INVALID_INPUT")
     action, token, payload = request["action"], request["session_token"], request["payload"]
@@ -184,10 +187,25 @@ def dispatch(jobs: WebAgentJobs, request: object, *, authorize=_authorize) -> di
         raise RequestError("INVALID_INPUT")
     authorize(token)
     with _stable_public_web():
-        return _dispatch_authorized(jobs, action, token, payload)
+        return _dispatch_authorized(jobs, action, token, payload, vpn_source=vpn_source)
 
 
-def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: object) -> dict:
+def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: object,
+                         *, vpn_source: VpnSourceJobs | None = None) -> dict:
+    if action.startswith("vpn-source-"):
+        if vpn_source is None:
+            raise RequestError("RUNTIME_UNAVAILABLE")
+        _fields(payload, _LOGIN | ({"expected"} if action == "vpn-source-apply" else set()))
+        credential = Credential(payload)
+        try:
+            options = _options(payload)
+            return vpn_source.execute(action.removeprefix("vpn-source-"), options=options,
+                fingerprint=payload["fingerprint"], credential=credential,
+                expected=payload.get("expected"))
+        finally:
+            credential.wipe()
+            for key in ("password", "private_key", "passphrase"):
+                payload[key] = ""
     if action in ("prepare", "resume"):
         _fields(payload, _PREPARE if action == "prepare" else _RESUME)
         credential = Credential(payload)
@@ -232,7 +250,8 @@ def _reply(value: dict) -> bytes:
 
 
 def _handle(connection: socket.socket, jobs: WebAgentJobs,
-            *, peer_uid=None, authorize=_authorize) -> None:
+            *, peer_uid=None, authorize=_authorize,
+            vpn_source: VpnSourceJobs | None = None) -> None:
     with connection:
         connection.settimeout(30)
         raw = bytearray()
@@ -263,9 +282,9 @@ def _handle(connection: socket.socket, jobs: WebAgentJobs,
                 return value
 
             request = json.loads(raw, object_pairs_hook=unique)
-            result = dispatch(jobs, request, authorize=authorize)
+            result = dispatch(jobs, request, authorize=authorize, vpn_source=vpn_source)
             response = {"ok": True, "result": result}
-        except (JobError, RequestError) as error:
+        except (JobError, RequestError, VpnSourceError) as error:
             response = {"ok": False, "error": error.code}
             if getattr(error, "request_id", None) is not None:
                 response["request_id"] = error.request_id
@@ -294,7 +313,8 @@ def _systemd_socket() -> socket.socket:
     return listener
 
 
-def serve(listener: socket.socket, jobs: WebAgentJobs) -> None:
+def serve(listener: socket.socket, jobs: WebAgentJobs,
+          vpn_source: VpnSourceJobs | None = None) -> None:
     slots = threading.BoundedSemaphore(8)
     try:
         while True:
@@ -309,7 +329,7 @@ def serve(listener: socket.socket, jobs: WebAgentJobs) -> None:
 
             def work(sock):
                 try:
-                    _handle(sock, jobs)
+                    _handle(sock, jobs, vpn_source=vpn_source)
                 finally:
                     slots.release()
 
@@ -327,7 +347,7 @@ def main() -> int:
     jobs = WebAgentJobs(journal_root=Path("/var/lib/sovagrid/web-agent/jobs"),
                         bundle_path=bundle, bundle_sha256=digest,
                         controller_factory=_target_factory)
-    serve(_systemd_socket(), jobs)
+    serve(_systemd_socket(), jobs, VpnSourceJobs(jobs))
     return 0
 
 

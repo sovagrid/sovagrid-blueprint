@@ -61,6 +61,17 @@ class FakeJobs:
         return []
 
 
+class FakeVpnSource:
+    def __init__(self):
+        self.calls = []
+
+    def execute(self, action, **kwargs):
+        self.calls.append((action, kwargs))
+        return {"protocol": 1, "scope": "entered_target", "host": kwargs["options"].host,
+                "port": kwargs["options"].port,
+                "host_key_fingerprint": kwargs["fingerprint"]}
+
+
 def request(action, payload):
     return {"action": action, "session_token": TOKEN, "payload": payload}
 
@@ -125,6 +136,20 @@ class ServiceTests(unittest.TestCase):
                                           authorize=lambda token: None)["phase"], "prepared")
         self.assertEqual(service.dispatch(self.jobs, request("list", {}), authorize=lambda token: None), [])
         self.assertEqual(self.jobs.calls, [("apply", "id", 2), ("status", "id"), ("list",)])
+
+    def test_vpn_source_actions_require_exact_shape_and_wipe_credentials(self):
+        vpn = FakeVpnSource()
+        payload = login_payload()
+        result = service.dispatch(self.jobs, request("vpn-source-preview", payload),
+                                  authorize=lambda token: None, vpn_source=vpn)
+        self.assertEqual(result["scope"], "entered_target")
+        self.assertEqual(vpn.calls[0][0], "preview")
+        self.assertEqual(vpn.calls[0][1]["credential"].password, "")
+        self.assertEqual(payload["password"], "")
+        with self.assertRaises(service.RequestError):
+            service.dispatch(self.jobs, request("vpn-source-apply", login_payload()),
+                             authorize=lambda token: None, vpn_source=vpn)
+        self.assertEqual(len(vpn.calls), 1)
 
     def _socket_reply(self, payload: bytes, *, uid=service._GATEWAY_UID):
         client, server = socket.socketpair()

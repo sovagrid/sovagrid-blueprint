@@ -31,6 +31,7 @@ COMPONENTS = frozenset(("sovagrid-blueprint", "sovagrid-hub", "sovagrid-web",
                         "sovagrid-agent", "sovagrid-vpn"))
 REQUIRED = frozenset(("sovagrid-blueprint/run.sh", "sovagrid-blueprint/deploy/compose.yaml",
     "sovagrid-blueprint/deploy/remote_agent.py", "sovagrid-hub/Dockerfile",
+    "sovagrid-blueprint/deploy/vpn_source_install.py",
     "sovagrid-web/Dockerfile", "sovagrid-web/deploy/Caddyfile.container",
     "sovagrid-agent/deploy/sovagrid-agent.service",
     "sovagrid-vpn/deploy/sovagrid-vpn-status.service"))

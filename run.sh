@@ -353,7 +353,7 @@ for auto_file in auto_update.py remote_update_worker.py sovagrid-auto-update.ser
   [[ -f $source_root/sovagrid-blueprint/deploy/$auto_file && ! -L $source_root/sovagrid-blueprint/deploy/$auto_file ]] || die "auto-update source $auto_file is missing or a symlink"
 done
 for web_agent_file in web_agent_bundle.py web_agent_jobs.py web_agent_local_rpc.py web_agent_target_ssh.py \
-                      web_agent_service.py sovagrid-web-agent-control.socket \
+                      web_agent_service.py web_vpn_source.py vpn_source_install.py sovagrid-web-agent-control.socket \
                       sovagrid-web-agent-control.service compose.web-agent.yaml; do
   [[ -f $source_root/sovagrid-blueprint/deploy/$web_agent_file &&
      ! -L $source_root/sovagrid-blueprint/deploy/$web_agent_file ]] ||
