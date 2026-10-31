@@ -141,6 +141,41 @@ class WebVpnSourceTests(unittest.TestCase):
         self.assertFalse((self.directory / "vpn-source-stage.json").exists())
         self.assertEqual(FakeTransport.instances[1].rpc.cleaned, ["e" * 32, "e" * 32])
 
+    def test_jump_stage_recovery_requires_the_same_reviewed_route(self):
+        options = SimpleNamespace(host="target.example", port=2222, user="root",
+                                  jump_host="relay.example", jump_port=2200,
+                                  jump_user="relay")
+        jump = {"host": "relay.example", "port": 2200, "username": "relay",
+                "fingerprint": "SHA256:" + "E" * 43,
+                "method": "password", "password": "jump-only-secret",
+                "private_key": "", "passphrase": "",
+                "host_key_blob": "public-jump-blob"}
+        credential = SimpleNamespace(method="password", password="target-only-secret",
+                                     private_key="", passphrase="", jump=jump,
+                                     target_host_key_blob="public-target-blob")
+        FakeRPC.fail_cleanup_once = True
+        with self.assertRaisesRegex(module.VpnSourceError, "STAGE_CLEANUP_REQUIRED"):
+            self.bridge.execute("preview", options=options,
+                                fingerprint=FINGERPRINT, credential=credential)
+        record = self.bridge._read_stage()
+        self.assertEqual(record["identity"]["jump"], {
+            "host": "relay.example", "port": 2200, "username": "relay",
+            "fingerprint": jump["fingerprint"]})
+        self.assertNotIn("secret", self.bridge.path.read_text())
+        self.assertEqual(FakeTransport.instances[0].kwargs["jump"], jump)
+        self.assertEqual(FakeTransport.instances[0].kwargs["target_host_key_blob"],
+                         "public-target-blob")
+        changed = SimpleNamespace(**{**vars(credential),
+            "jump": {**jump, "fingerprint": "SHA256:" + "I" * 43}})
+        with self.assertRaisesRegex(module.VpnSourceError, "RECOVERY_REQUIRED"):
+            self.bridge.execute("preview", options=options,
+                                fingerprint=FINGERPRINT, credential=changed)
+        self.assertIsNotNone(self.bridge._read_stage())
+        result = self.bridge.execute("preview", options=options,
+                                     fingerprint=FINGERPRINT, credential=credential)
+        self.assertEqual(result["jump_host_key_fingerprint"], jump["fingerprint"])
+        self.assertFalse(self.bridge.path.exists())
+
     def test_apply_requires_reviewed_cas_before_ssh(self):
         with self.assertRaises(module.VpnSourceError) as error:
             self.bridge.execute("apply", options=self.options, fingerprint=FINGERPRINT,

@@ -96,6 +96,14 @@ def login_payload():
             "password": "test-only-secret", "private_key": "", "passphrase": ""}
 
 
+def jump_login_payload():
+    return {**login_payload(), "host_key_blob": "public-target-blob",
+            "jump": {"host": "relay.example", "port": 2200, "username": "relay",
+                     "method": "password", "fingerprint": "SHA256:" + "E" * 43,
+                     "password": "jump-only-secret", "private_key": "",
+                     "passphrase": "", "host_key_blob": "public-jump-blob"}}
+
+
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.jobs = FakeJobs()
@@ -196,6 +204,39 @@ class ServiceTests(unittest.TestCase):
             service.dispatch(self.jobs, request("vpn-source-apply", login_payload()),
                              authorize=lambda token: None, vpn_source=vpn)
         self.assertEqual(len(vpn.calls), 1)
+
+    def test_vpn_actions_bind_jump_route_and_wipe_both_secrets(self):
+        for action, bridge, extra in (
+            ("vpn-source-preview", FakeVpnSource(), {}),
+            ("wg-control-preview", FakeWireguardControl(), {}),
+            ("amnezia-provision-preview", FakeAmneziaProvision(),
+             {"listen_port": 49001, "subnet": "10.91.7.0/24", "route_mode": "full"}),
+        ):
+            with self.subTest(action=action):
+                payload = {**jump_login_payload(), **extra}
+                kwargs = {"vpn_source": bridge} if action.startswith("vpn-source") else \
+                         {"wg_control": bridge} if action.startswith("wg-control") else \
+                         {"amnezia_provision": bridge}
+                service.dispatch(self.jobs, request(action, payload),
+                                 authorize=lambda token: None, **kwargs)
+                options = bridge.calls[0][1]["options"]
+                credential = bridge.calls[0][1]["credential"]
+                self.assertEqual((options.jump_host, options.jump_user, options.jump_port),
+                                 ("relay.example", "relay", 2200))
+                self.assertEqual(credential.target_host_key_blob, "")
+                self.assertEqual(credential.password, "")
+                self.assertEqual(credential.jump["password"], "")
+                self.assertEqual(payload["password"], "")
+                self.assertEqual(payload["jump"]["password"], "")
+
+    def test_vpn_jump_rejects_extra_field_and_scrubs_secrets(self):
+        payload = jump_login_payload()
+        payload["jump"]["unexpected"] = "x"
+        with self.assertRaises(service.RequestError):
+            service.dispatch(self.jobs, request("vpn-source-preview", payload),
+                             authorize=lambda token: None, vpn_source=FakeVpnSource())
+        self.assertEqual(payload["password"], "")
+        self.assertEqual(payload["jump"]["password"], "")
 
     def test_wireguard_control_requires_fresh_admin_and_exact_confirmed_shape(self):
         wg = FakeWireguardControl()

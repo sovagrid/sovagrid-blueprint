@@ -132,6 +132,31 @@ class ProvisionBridgeTests(unittest.TestCase):
         self.assertIn('argv=["/bin/sh","' + module.CLI + '"', rpc.calls[1][1])
         compile(rpc.calls[1][1], "<remote-amnezia-provision>", "exec")
 
+    def test_preview_through_jump_uses_separate_credentials(self):
+        bridge, _rpc, transports, _jobs = self.bridge(preview())
+        options = SimpleNamespace(host="target.example", port=2222, user="root",
+                                  jump_host="relay.example", jump_port=2200,
+                                  jump_user="relay")
+        jump = {"host": "relay.example", "port": 2200, "username": "relay",
+                "fingerprint": "SHA256:" + "E" * 43,
+                "method": "password", "password": "jump-secret",
+                "private_key": "", "passphrase": "", "host_key_blob": "jump-blob"}
+        credential = SimpleNamespace(method="password", password="target-secret",
+                                     private_key="", passphrase="", jump=jump,
+                                     target_host_key_blob="target-blob")
+        result = bridge.execute("preview", options=options, fingerprint=FP,
+                                credential=credential, **PARAMS)
+        self.assertEqual(transports[0].kwargs["jump"], jump)
+        self.assertEqual(transports[0].kwargs["target_host_key_blob"], "target-blob")
+        self.assertEqual((result["jump_host"], result["jump_port"],
+                          result["jump_host_key_fingerprint"]),
+                         ("relay.example", 2200, jump["fingerprint"]))
+        with self.assertRaisesRegex(module.AmneziaProvisionError, "INVALID_REQUEST"):
+            bridge.execute("preview", options=SimpleNamespace(**{**vars(options),
+                "jump_host": "changed.example"}), fingerprint=FP,
+                credential=credential, **PARAMS)
+        self.assertEqual(len(transports), 1)
+
     def test_apply_requires_confirmation_and_revision_before_ssh(self):
         bridge, rpc, transports, jobs = self.bridge()
         for kwargs in (PARAMS | {"expected_state": STATE},

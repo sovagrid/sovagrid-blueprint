@@ -125,6 +125,30 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(transports[0].closed)
         self.assertEqual(jobs.entered, 1)
 
+    def test_preview_through_jump_passes_both_pins_to_transport(self):
+        bridge, _rpc, transports, _jobs = self.bridge(preview())
+        options = SimpleNamespace(host="example.test", port=22, user="operator",
+                                  jump_host="relay.test", jump_port=2200,
+                                  jump_user="relay")
+        jump = {"host": "relay.test", "port": 2200, "username": "relay",
+                "fingerprint": "SHA256:" + "E" * 43,
+                "method": "password", "password": "jump-secret",
+                "private_key": "", "passphrase": "", "host_key_blob": "jump-blob"}
+        credential = SimpleNamespace(method="password", password="target-secret",
+                                     private_key="", passphrase="", jump=jump,
+                                     target_host_key_blob="target-blob")
+        result = bridge.execute("preview", options=options, fingerprint=FP,
+                                credential=credential)
+        self.assertEqual(transports[0].kwargs["jump"], jump)
+        self.assertEqual(transports[0].kwargs["target_host_key_blob"], "target-blob")
+        self.assertEqual((result["jump_host"], result["jump_port"],
+                          result["jump_host_key_fingerprint"]),
+                         ("relay.test", 2200, jump["fingerprint"]))
+        with self.assertRaisesRegex(control.WireguardControlError, "INVALID_REQUEST"):
+            bridge.execute("preview", options=SimpleNamespace(**{**vars(options),
+                "jump_port": 2201}), fingerprint=FP, credential=credential)
+        self.assertEqual(len(transports), 1)
+
     def test_apply_needs_confirmation_and_both_exact_revisions(self):
         bridge, rpc, transports, jobs = self.bridge()
         for kwargs in ({"expected": {"state_revision": STATE, "source_revision": SOURCE}},

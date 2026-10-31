@@ -192,6 +192,26 @@ def _options(payload: dict) -> ConnectionOptions:
         raise RequestError("INVALID_INPUT") from None
 
 
+def _vpn_route_credential(payload: object, fields: frozenset[str]) -> RouteCredential:
+    jumped = type(payload) is dict and "jump" in payload
+    _fields(payload, fields | {"host_key_blob", "jump"} if jumped else fields)
+    if jumped:
+        _fields(payload["jump"], _JUMP_LOGIN)
+    return RouteCredential(payload)
+
+
+def _wipe_route_payload(payload: object) -> None:
+    if type(payload) is not dict:
+        return
+    for key in ("password", "private_key", "passphrase"):
+        if key in payload:
+            payload[key] = ""
+    if type(payload.get("jump")) is dict:
+        for key in ("password", "private_key", "passphrase"):
+            if key in payload["jump"]:
+                payload["jump"][key] = ""
+
+
 @contextmanager
 def _stable_public_web(*, expected_uid: int = 0, expected_gid: int = 0):
     """Keep direct run.sh from replacing the installed tree during a job.
@@ -251,8 +271,7 @@ def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: o
                 extra |= {"expected_state", "confirm"}
             elif operation == "recover":
                 extra = {"confirm"}
-            _fields(payload, _LOGIN | extra)
-            credential = Credential(payload)
+            credential = _vpn_route_credential(payload, _LOGIN | extra)
             try:
                 options = _options(payload)
                 return amnezia_provision.execute(operation, options=options,
@@ -263,10 +282,7 @@ def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: o
             finally:
                 credential.wipe()
         finally:
-            if type(payload) is dict:
-                for key in ("password", "private_key", "passphrase"):
-                    if key in payload:
-                        payload[key] = ""
+            _wipe_route_payload(payload)
     if action.startswith("wg-control-"):
         try:
             if wg_control is None:
@@ -274,8 +290,7 @@ def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: o
             operation = action.removeprefix("wg-control-")
             extra = {"expected", "confirm"} if operation == "apply" else \
                     {"confirm"} if operation == "recover" else set()
-            _fields(payload, _LOGIN | extra)
-            credential = Credential(payload)
+            credential = _vpn_route_credential(payload, _LOGIN | extra)
             try:
                 options = _options(payload)
                 return wg_control.execute(operation, options=options,
@@ -284,24 +299,22 @@ def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: o
             finally:
                 credential.wipe()
         finally:
-            if type(payload) is dict:
-                for key in ("password", "private_key", "passphrase"):
-                    if key in payload:
-                        payload[key] = ""
+            _wipe_route_payload(payload)
     if action.startswith("vpn-source-"):
-        if vpn_source is None:
-            raise RequestError("RUNTIME_UNAVAILABLE")
-        _fields(payload, _LOGIN | ({"expected"} if action == "vpn-source-apply" else set()))
-        credential = Credential(payload)
         try:
-            options = _options(payload)
-            return vpn_source.execute(action.removeprefix("vpn-source-"), options=options,
-                fingerprint=payload["fingerprint"], credential=credential,
-                expected=payload.get("expected"))
+            if vpn_source is None:
+                raise RequestError("RUNTIME_UNAVAILABLE")
+            credential = _vpn_route_credential(payload, _LOGIN | (
+                {"expected"} if action == "vpn-source-apply" else set()))
+            try:
+                options = _options(payload)
+                return vpn_source.execute(action.removeprefix("vpn-source-"), options=options,
+                    fingerprint=payload["fingerprint"], credential=credential,
+                    expected=payload.get("expected"))
+            finally:
+                credential.wipe()
         finally:
-            credential.wipe()
-            for key in ("password", "private_key", "passphrase"):
-                payload[key] = ""
+            _wipe_route_payload(payload)
     if action in ("prepare", "resume"):
         try:
             jumped = type(payload) is dict and "jump" in payload

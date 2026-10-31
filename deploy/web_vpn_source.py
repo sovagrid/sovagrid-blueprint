@@ -89,11 +89,21 @@ class VpnSourceJobs:
             value = json.loads(raw, object_pairs_hook=_unique)
             if (type(value) is not dict or set(value) != {"protocol", "identity", "stage"} or
                     value["protocol"] != 1 or type(value["identity"]) is not dict or
-                    set(value["identity"]) != {"host", "port", "username", "fingerprint"} or
+                    set(value["identity"]) not in (
+                        {"host", "port", "username", "fingerprint"},
+                        {"host", "port", "username", "fingerprint", "jump"}) or
                     type(value["identity"]["host"]) is not str or
                     type(value["identity"]["username"]) is not str or
                     type(value["identity"]["fingerprint"]) is not str or
                     type(value["identity"]["port"]) is not int or
+                    ("jump" in value["identity"] and
+                     (type(value["identity"]["jump"]) is not dict or
+                      set(value["identity"]["jump"]) !=
+                      {"host", "port", "username", "fingerprint"} or
+                      type(value["identity"]["jump"]["host"]) is not str or
+                      type(value["identity"]["jump"]["port"]) is not int or
+                      type(value["identity"]["jump"]["username"]) is not str or
+                      type(value["identity"]["jump"]["fingerprint"]) is not str)) or
                     type(value["stage"]) is not dict or
                     set(value["stage"]) != {"remote_dir", "sha256", "source_manifest_sha256",
                                             "helper_sha256", "stage_id"} or
@@ -224,12 +234,25 @@ class VpnSourceJobs:
             bundle = self.jobs._bundle()
             identity = {"host": options.host, "port": options.port,
                         "username": options.user, "fingerprint": fingerprint}
+            route_kwargs = {}
+            jump = getattr(credential, "jump", None)
+            if jump is not None:
+                if (options.jump_host != jump["host"] or
+                        options.jump_port != jump["port"] or
+                        options.jump_user != jump["username"]):
+                    raise VpnSourceError("INVALID_REQUEST")
+                identity["jump"] = {"host": options.jump_host,
+                                    "port": options.jump_port,
+                                    "username": options.jump_user,
+                                    "fingerprint": jump["fingerprint"]}
+                route_kwargs = {"jump": jump,
+                                "target_host_key_blob": credential.target_host_key_blob}
             try:
                 with self.transport_factory(host=options.host, port=options.port,
                         username=options.user, fingerprint=fingerprint,
                         method=credential.method, password=credential.password,
                         private_key=credential.private_key,
-                        passphrase=credential.passphrase) as transport:
+                        passphrase=credential.passphrase, **route_kwargs) as transport:
                     rpc = transport.target_rpc(transport.options)
                     self._cleanup_orphan(rpc, identity)
                     stage = None
@@ -257,6 +280,10 @@ class VpnSourceJobs:
                             raise VpnSourceError("SOURCE_CHANGED")
                         return {**result, "scope": "entered_target", "host": options.host,
                                 "port": options.port, "host_key_fingerprint": fingerprint,
+                                **({"jump_host": options.jump_host,
+                                    "jump_port": options.jump_port,
+                                    "jump_host_key_fingerprint": jump["fingerprint"]}
+                                   if jump is not None else {}),
                                 **({"temporary_writes": True, "activation_writes": False}
                                    if action == "preview" else {})}
                     finally:

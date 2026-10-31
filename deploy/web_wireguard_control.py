@@ -181,13 +181,22 @@ class WireguardControlJobs:
         elif expected is not None or (confirm is not None and (action != "recover" or confirm is not True)) or \
                 (action == "recover" and confirm is not True):
             raise WireguardControlError("INVALID_REQUEST")
+        jump = getattr(credential, "jump", None)
+        route_kwargs = {}
+        if jump is not None:
+            if (options.jump_host != jump["host"] or
+                    options.jump_port != jump["port"] or
+                    options.jump_user != jump["username"]):
+                raise WireguardControlError("INVALID_REQUEST")
+            route_kwargs = {"jump": jump,
+                            "target_host_key_blob": credential.target_host_key_blob}
         with self.jobs._exclusive():
             try:
                 with self.transport_factory(host=options.host, port=options.port,
                         username=options.user, fingerprint=fingerprint,
                         method=credential.method, password=credential.password,
                         private_key=credential.private_key,
-                        passphrase=credential.passphrase) as transport:
+                        passphrase=credential.passphrase, **route_kwargs) as transport:
                     rpc = transport.target_rpc(transport.options)
                     rpc.preflight()  # establishes root or sudo -n, never an interactive sudo prompt
                     if action == "apply":
@@ -212,7 +221,11 @@ class WireguardControlJobs:
                     if action == "apply" and result["source_revision"] != expected["source_revision"]:
                         raise WireguardControlError("APPLY_UNCERTAIN")
                     return {"protocol": 1, "scope": "entered_target", "host": options.host,
-                            "port": options.port, "host_key_fingerprint": fingerprint, **result}
+                            "port": options.port, "host_key_fingerprint": fingerprint,
+                            **({"jump_host": options.jump_host,
+                                "jump_port": options.jump_port,
+                                "jump_host_key_fingerprint": jump["fingerprint"]}
+                               if jump is not None else {}), **result}
             except WireguardControlError:
                 raise
             except RPCError as error:
