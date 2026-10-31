@@ -13,12 +13,10 @@ inert tunnel unit does not test real SSH forwarding.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import importlib.util
-import io
 import json
 import os
 from pathlib import Path
@@ -28,6 +26,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import ssl
 import stat
 import subprocess
@@ -50,10 +49,10 @@ SHA = re.compile(r"[0-9a-f]{64}\Z")
 AGENT_UNIT = "sovagrid-agent.service"
 BASELINE_AGENT_COMMIT = "1085a14a7c0c654a5a6ec16edd028dea1c543c8e"
 EXPECTED_TRIAL_COMPONENTS = {
-    "sovagrid-agent": "7b4dab289ca239266b77584a927f6976f375042c",
-    "sovagrid-hub": "ae8b2fc6075aa76b418ad202887515b78e9e63d1",
-    "sovagrid-web": "eb53324c7f2ef6186ad445fb729b6687acf65595",
-    "sovagrid-vpn": "e500d5a9a97ad329c33af6a06eb1d2f17a541897",
+    "sovagrid-agent": "abb00bb36489814593304d8e2055779d08e67eb9",
+    "sovagrid-hub": "cfaef4855e32245941e3a57a4393f93551e511d2",
+    "sovagrid-web": "ce740bb11ff47ffb226826e31c1b5e9d6b85a0b9",
+    "sovagrid-vpn": "5ccfd083c8a2fd26413beb0a0d46393890c62b20",
 }
 
 
@@ -65,6 +64,31 @@ def require(ok: bool, reason: str) -> None:
 def command(*args: str, timeout: int = 60) -> str:
     return subprocess.run(args, check=True, text=True, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, timeout=timeout).stdout.strip()
+
+
+def broker_request(payload: dict) -> dict:
+    """Use the real backup broker socket as the Hub's fixed unprivileged UID."""
+    script = ("import socket,sys\n"
+              "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n"
+              "s.settimeout(240)\n"
+              "s.connect('/run/sovagrid-hub-backup/control.sock')\n"
+              "s.sendall(sys.stdin.buffer.read())\n"
+              "data=bytearray()\n"
+              "while not data.endswith(b'\\n') and len(data)<65536:\n"
+              " item=s.recv(4096)\n"
+              " if not item: break\n"
+              " data.extend(item)\n"
+              "sys.stdout.buffer.write(data)\n")
+    result = subprocess.run(["runuser", "-u", "sovagrid-hub", "--",
+                             "/usr/bin/python3", "-I", "-c", script],
+                            input=encode(payload), capture_output=True,
+                            timeout=260, check=False)
+    require(result.returncode == 0 and result.stdout.endswith(b"\n") and
+            len(result.stdout) <= 65536, "backup broker socket unavailable")
+    value = json.loads(result.stdout)
+    require(isinstance(value, dict) and value.get("ok") is True,
+            "backup broker refused external Agent request")
+    return value
 
 
 def sha(data: bytes) -> str:
@@ -487,6 +511,12 @@ def killed_at_trial(archive_sha256: str) -> None:
 
 def run(archive_sha256: str) -> None:
     require(SHA.fullmatch(archive_sha256) is not None, "archive SHA required")
+    fixed_unit = Path("/etc/systemd/system/sovagrid-external-agent-apply@.service")
+    fixed_marker = Path("/etc/sovagrid/.external-agent-apply-managed-by-run-sh")
+    require(fixed_unit.is_file() and fixed_marker.is_file() and fixed_unit.read_bytes() ==
+            (ROOT / "deploy/sovagrid-external-agent-apply@.service").read_bytes() and
+            fixed_marker.read_bytes() == b"SOVAGRID_EXTERNAL_AGENT_APPLY_UNIT_V1\n",
+            "repeat Hub-only install did not install the fixed Agent writer")
     planner = installed_planner()
     candidate_root, _commits = planner.common.candidate_source(archive_sha256)
     _candidate_sha, candidate_manifest = planner._manifest(candidate_root)
@@ -543,115 +573,67 @@ def run(archive_sha256: str) -> None:
                 f"stale trial runtime remained after boot recovery: {path}")
     _wait_lease_expiry()
 
-    before = _hub_counters()
-    same_process: set[int] = set()
-    original_peer = planner._trial_peer
-
-    def recorded_peer(pid, uid, gid, **kwargs):
-        accepted = original_peer(pid, uid, gid, **kwargs)
-        if accepted and kwargs.get("full"):
-            same_process.add(pid)
-        return accepted
-
+    old_pid = _pid()
     current, old, review = _review(planner, archive_sha256)
-    trial_watch = []
-    trial_watch_errors = []
-    watch_gate_values = []
-    commit_gate_values = []
-    original_watch_init = planner.TrialWatchServer.__init__
-    original_watch_start = planner.TrialWatchServer.start
-    original_watch_handle = planner.TrialWatchServer._handle
-    original_commit_trial = planner.recovery.Recovery.commit_trial
-
-    def record_watch_init(watch, *args, **kwargs):
-        for name in ("journal_current", "lease_active", "agent_idle_proven",
-                     "agent_peer_allowed"):
-            callback = kwargs[name]
-
-            def recorded(*callback_args, _name=name, _callback=callback, **callback_kwargs):
-                try:
-                    result = _callback(*callback_args, **callback_kwargs)
-                except Exception as error:
-                    watch_gate_values.append((_name, type(error).__name__))
-                    raise
-                valid = (result == watch.journal_sha256 if _name == "journal_current"
-                         else result is True)
-                watch_gate_values.append((_name, valid))
-                return result
-
-            kwargs[name] = recorded
-        return original_watch_init(watch, *args, **kwargs)
-
-    def record_watch_start(watch):
-        result = original_watch_start(watch)
-        trial_watch.append(watch)
-        return result
-
-    def record_watch_error(watch, connection):
-        try:
-            return original_watch_handle(watch, connection)
-        except (OSError, ValueError, planner.Refused) as exc:
-            code = str(exc)
-            trial_watch_errors.append(code if re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", code)
-                                      else type(exc).__name__)
-            raise
-
-    def record_commit_gates(transaction, **gates):
-        def wrap(name, callback):
-            def checked():
-                result = callback()
-                commit_gate_values.append((name, result is True))
-                return result
-            return checked
-        return original_commit_trial(transaction, **{name: wrap(name, callback)
-                                                     for name, callback in gates.items()})
-
-    with mock.patch.object(planner, "_trial_peer", recorded_peer), \
-         mock.patch.object(planner.TrialWatchServer, "__init__", record_watch_init), \
-         mock.patch.object(planner.TrialWatchServer, "start", record_watch_start), \
-         mock.patch.object(planner.TrialWatchServer, "_handle", record_watch_error), \
-         mock.patch.object(planner.recovery.Recovery, "commit_trial", record_commit_gates):
-        try:
-            stdout, stderr = io.StringIO(), io.StringIO()
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                code = planner.main(["apply", archive_sha256, current, old, review])
-            if code != 0:
-                error = stderr.getvalue().strip().removeprefix(
-                    "SG_EXTERNAL_AGENT_UPDATE_REFUSE:")
-                raise planner.Refused(error if re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", error)
-                                      else "APPLY_FAILED")
-            result = json.loads(stdout.getvalue())
-        except planner.Refused as exc:
-            watch = trial_watch[-1] if trial_watch else None
-            journal = subprocess.run(["journalctl", "-u", AGENT_UNIT, "-n", "200",
-                                      "-o", "cat", "--no-pager"], check=False,
-                                     capture_output=True, text=True, timeout=10).stdout
-            debug = {"code": str(exc), "watch_created": watch is not None,
-                     "watch_ready": watch.ready.is_set() if watch else False,
-                     "promotion_sent": watch._promotion_sent if watch else False,
-                     "normal_ready": watch.normal_ready.is_set() if watch else False,
-                     "ping_count": watch.ping_count if watch else 0,
-                     "watch_errors": trial_watch_errors[-8:],
-                     "watch_gates": watch_gate_values[-24:],
-                     "commit_gates": commit_gate_values,
-                     "agent_cycle_failures": journal.count("Agent cycle failed; retrying"),
-                     "metrics": _hub_counters()["metrics"],
-                     "jobs": _hub_counters()["jobs"],
-                     "checks": _hub_counters()["checks"]}
-            print("VM_TRIAL_DIAGNOSTIC:" + json.dumps(debug, sort_keys=True), flush=True)
-            raise
-    require(result["applied"] is True and result["review_sha256"] == review,
-            "public apply CLI did not finish")
+    checked = broker_request({"action": "external_preflight",
+                              "archive_sha256": archive_sha256,
+                              "current_hub_manifest_sha256": current})["result"]
+    require(checked["review_sha256"] == review and
+            checked["external_agent_manifest_sha256"] == old,
+            "backup broker review differed from root CLI")
+    operations = Path("/var/lib/sovagrid/external-agent-operations")
+    template = Path("/etc/systemd/system/sovagrid-external-agent-apply@.service")
+    require(operations.is_dir() and not operations.is_symlink() and
+            stat.S_IMODE(operations.stat().st_mode) == 0o700 and
+            template.is_file() and not template.is_symlink(),
+            "fixed external Agent writer was not installed")
+    operation_id = str(uuid.uuid4())
+    accepted = broker_request({"action": "external_apply",
+                               "request_id": operation_id,
+                               "archive_sha256": archive_sha256,
+                               "current_hub_manifest_sha256": current,
+                               "external_agent_manifest_sha256": old,
+                               "review_sha256": review})["operation"]
+    require(accepted["request_id"] == operation_id and
+            accepted["phase"] in ("accepted", "running", "complete"),
+            "backup broker did not accept exact write")
+    folder = operations / operation_id
+    unit = "sovagrid-external-agent-apply@" + operation_id + ".service"
+    trial_pid = None
+    status = None
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        status = broker_request({"action": "external_operation_status",
+                                 "request_id": operation_id})["operation"]
+        require(status.get("request_id") == operation_id and
+                status.get("phase") in ("accepted", "running", "complete",
+                                         "failed", "uncertain"),
+                "fixed writer status was invalid")
+        if status["phase"] == "running":
+            pid_text = subprocess.run(["systemctl", "show", "-P", "MainPID", AGENT_UNIT],
+                                      capture_output=True, text=True,
+                                      timeout=10, check=False).stdout.strip()
+            if pid_text.isdecimal() and int(pid_text) > 1 and int(pid_text) != old_pid:
+                trial_pid = int(pid_text)
+        if status["phase"] in ("complete", "failed", "uncertain"):
+            break
+        time.sleep(0.5)
+    require(status is not None and status["phase"] == "complete",
+            "fixed writer did not complete: " + str(status.get("error") if status else "NO_STATUS"))
+    require(json.loads((folder / "status.json").read_bytes()) == status and
+            command("systemctl", "show", "-P", "Result", unit) == "success",
+            "fixed writer durable status or systemd unit failed")
     final_pid = _pid()
-    require(same_process == {final_pid}, "Agent PID changed between trial and normal dispatch")
+    require(trial_pid == final_pid, "Agent PID changed between trial and normal dispatch")
     final_sha, _manifest, _state = planner._external_snapshot()
     require(final_sha == current and
             Path("/var/lib/sovagrid-agent-enrollment/state.json").read_bytes() != old_state and
             Path("/var/lib/sovagrid-promotion/baseline.json").read_bytes() != old_baseline and
             Path("/var/lib/sovagrid-agent/external-sentinel").is_file(),
             "committed source/state/baseline or Agent data invalid")
-    _wait(lambda: _hub_counters()["jobs"] > before["jobs"] and
-          _hub_counters()["checks"] > before["checks"],
+    after_commit = _hub_counters()
+    _wait(lambda: _hub_counters()["jobs"] > after_commit["jobs"] and
+          _hub_counters()["checks"] > after_commit["checks"],
           "normal job and check dispatch", seconds=15)
     require(not Path(planner.recovery.JOURNAL).exists() and
             not Path(planner.recovery.TRIAL_DROPIN).exists() and
@@ -662,7 +644,7 @@ def run(archive_sha256: str) -> None:
                             planner.RECOVERY_UNIT], check=False).returncode != 0,
             "temporary trial guard or recovery dependency remained")
     print("Real systemd Agent apply passed: precommit rollback, SIGKILL boot recovery, "
-          "same-PID ACTIVE/DETACH, normal dispatch and exact cleanup")
+          "fixed-unit same-PID ACTIVE/DETACH, normal dispatch and exact cleanup")
 
 
 def main(argv: list[str]) -> None:

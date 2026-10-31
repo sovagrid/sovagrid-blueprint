@@ -78,10 +78,10 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.external_agent_apply }}
         env:
           OLD_AGENT_COMMIT: 1085a14a7c0c654a5a6ec16edd028dea1c543c8e
-          AGENT_COMMIT: 7b4dab289ca239266b77584a927f6976f375042c
-          HUB_COMMIT: ae8b2fc6075aa76b418ad202887515b78e9e63d1
-          WEB_COMMIT: eb53324c7f2ef6186ad445fb729b6687acf65595
-          VPN_COMMIT: e500d5a9a97ad329c33af6a06eb1d2f17a541897
+          AGENT_COMMIT: abb00bb36489814593304d8e2055779d08e67eb9
+          HUB_COMMIT: cfaef4855e32245941e3a57a4393f93551e511d2
+          WEB_COMMIT: ce740bb11ff47ffb226826e31c1b5e9d6b85a0b9
+          VPN_COMMIT: 5ccfd083c8a2fd26413beb0a0d46393890c62b20
         run: |
           set -o pipefail
           [[ "$OLD_AGENT_COMMIT" =~ ^[0-9a-f]{40}$ ]]

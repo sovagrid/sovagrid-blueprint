@@ -59,5 +59,20 @@ lease, unsafe socket, altered journal, wrong Agent peer, or failed health
 check causes refusal or rollback. The optional disposable Ubuntu VM test
 `tests/integrated_external_agent_apply_vm.py` exercises pre-commit rollback,
 SIGKILL boot recovery, same-PID release/detach, normal dispatch, and exact
-cleanup with real systemd. The production CLI still needs a controlled Hub
-broker and review UI before users can complete this flow without a console.
+cleanup with real systemd. The root CLI remains available independently of
+the optional Hub review route described below.
+
+The optional Hub route uses a **separate fixed systemd oneshot**, not the Hub
+backup broker's restricted mount namespace: atomic exchange between
+`/opt/sovagrid-agent` and the recovery journal under `/var/lib` must occur on
+the host filesystem. The broker accepts an exact UUID and four reviewed SHA-256
+values, durably records a root-only request and status in
+`/var/lib/sovagrid/external-agent-operations/<uuid>/`, then asks systemd to
+start only `sovagrid-external-agent-apply@<uuid>.service`. The worker accepts
+only an `accepted` request, marks it `running` under a file lock, calls the
+installed CLI, and writes `complete`, `failed`, or `uncertain`. The same UUID
+cannot start the update twice; after a lost response the UI reads status
+instead of sending another apply. A failed unit starts the existing recovery
+service, never the apply unit. The unit is installed by `run.sh --hub-only`
+only when the supervising updater can snapshot and restore its marker, unit
+file and operation ledger; an older updater defers first installation.

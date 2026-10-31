@@ -30,6 +30,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 
 # A first update may execute this helper directly from an immutable staged
 # candidate. Dynamic imports must not create __pycache__ beside signed files.
@@ -49,6 +50,9 @@ WEB_AGENT_MARKER = "/var/lib/sovagrid/.web-agent-installer-managed-by-run-sh"
 WEB_AGENT_DIR = "/var/lib/sovagrid/web-agent"
 WEB_AGENT_UNITS = ("sovagrid-web-agent-control.socket",
                    "sovagrid-web-agent-control.service")
+EXTERNAL_APPLY_MARKER = "/etc/sovagrid/.external-agent-apply-managed-by-run-sh"
+EXTERNAL_APPLY_UNIT = "/etc/systemd/system/sovagrid-external-agent-apply@.service"
+EXTERNAL_APPLY_LEDGER = "/var/lib/sovagrid/external-agent-operations"
 
 # These paths belong to the local Hub, including its private Web Agent job
 # journal. External Agent data and SSH transport remain outside this snapshot.
@@ -115,12 +119,15 @@ LOCAL_CONTAINERS_SNAPSHOT = LOCAL_WEB_SNAPSHOT + (
     "/etc/systemd/system/sovagrid-container-inventory-local.service",
     "/etc/systemd/system/sovagrid-container-inventory-local.timer",
 )
-SNAPSHOT = LOCAL_CONTAINERS_SNAPSHOT + (
+WEB_AGENT_SNAPSHOT = LOCAL_CONTAINERS_SNAPSHOT + (
     WEB_AGENT_MARKER,
     WEB_AGENT_DIR,
     *(f"/etc/systemd/system/{unit}" for unit in WEB_AGENT_UNITS),
     "/etc/sovagrid/.external-agent-recovery-managed-by-run-sh",
     "/etc/systemd/system/sovagrid-external-agent-recovery.service",
+)
+SNAPSHOT = WEB_AGENT_SNAPSHOT + (
+    EXTERNAL_APPLY_MARKER, EXTERNAL_APPLY_UNIT, EXTERNAL_APPLY_LEDGER,
 )
 LEGACY_UNITS = ("sovagrid-agent-local.service", "sovagrid-terminal-local-control.socket",
          "sovagrid-terminal-local-control.service", "sovagrid-vpn-status.service",
@@ -227,6 +234,69 @@ def _external_runtime() -> dict[str, dict]:
     return result
 
 
+def _external_apply_idle() -> None:
+    """An independent Agent writer cannot overlap a local Hub source swap."""
+    def active_state(name: str) -> str:
+        try:
+            result = subprocess.run(
+                ["systemctl", "show", "-P", "ActiveState", name],
+                capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            raise Refused("EXTERNAL_APPLY_BUSY") from None
+        need(result.returncode == 0 and result.stdout.strip() in
+             ("inactive", "failed", "active", "activating", "deactivating", "reloading"),
+             "EXTERNAL_APPLY_BUSY")
+        return result.stdout.strip()
+
+    marker, unit, ledger = (Path(EXTERNAL_APPLY_MARKER), Path(EXTERNAL_APPLY_UNIT),
+                            Path(EXTERNAL_APPLY_LEDGER))
+    if not marker.exists() and not marker.is_symlink():
+        need(not any(item.exists() or item.is_symlink() for item in (unit, ledger)),
+             "EXTERNAL_APPLY_STATE")
+        return
+    need(common.public_path(str(marker), private=True, limit=128) ==
+         b"SOVAGRID_EXTERNAL_AGENT_APPLY_UNIT_V1\n", "EXTERNAL_APPLY_STATE")
+    common.public_path(str(unit), limit=8192)
+    _private_dir(ledger)
+    need(active_state("sovagrid-external-agent-recovery.service") == "inactive",
+         "EXTERNAL_APPLY_BUSY")
+    entries = list(ledger.iterdir())
+    need(len(entries) <= 129, "EXTERNAL_APPLY_STATE")
+    for item in entries:
+        if item.name == ".lock":
+            info = item.lstat()
+            need(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_gid == 0 and
+                 stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                 info.st_size == 0, "EXTERNAL_APPLY_STATE")
+            continue
+        try:
+            request_id = str(uuid.UUID(item.name))
+        except (ValueError, AttributeError):
+            raise Refused("EXTERNAL_APPLY_STATE") from None
+        need(request_id == item.name, "EXTERNAL_APPLY_STATE")
+        _private_dir(item)
+        try:
+            raw = common.public_path(str(item / "status.json"), private=True, limit=1024)
+            status = json.loads(raw)
+        except (OSError, ValueError):
+            raise Refused("EXTERNAL_APPLY_STATE") from None
+        need(isinstance(status, dict) and set(status) == {
+             "format", "request_id", "phase", "created_at", "updated_at", "error"} and
+             raw == (json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n").encode() and
+             type(status["format"]) is int and status["format"] == 1 and
+             status["request_id"] == request_id and
+             status["phase"] in ("complete", "failed") and
+             type(status["created_at"]) is int and
+             type(status["updated_at"]) is int and
+             1 <= status["created_at"] <= status["updated_at"] <= 253402300799 and
+             (status["error"] is None if status["phase"] == "complete" else
+              isinstance(status["error"], str) and
+              re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", status["error"]) is not None),
+             "EXTERNAL_APPLY_BUSY")
+        need(active_state("sovagrid-external-agent-apply@" + request_id + ".service")
+             in ("inactive", "failed"), "EXTERNAL_APPLY_BUSY")
+
+
 def _check_external_runtime(expected: dict[str, dict]) -> None:
     """Require the same unit policy and liveness, allowing independent restarts.
 
@@ -323,6 +393,7 @@ def inspect() -> tuple[str, dict, dict[str, str], str]:
     if common.web_agent_managed():
         need(all(_unit_state(unit)["active"] for unit in WEB_AGENT_UNITS), "WEB_AGENT")
         common.web_agent_socket_ready()
+    _external_apply_idle()
     state = promotion.inspect()
     need(state.get("phase") == "activated" and state.get("external_agent_preserved") is True,
          "PROMOTION_STATE")
@@ -364,6 +435,12 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
                      "sovagrid-blueprint/deploy/sovagrid-hub-backup-control.socket",
                      "sovagrid-blueprint/deploy/sovagrid-hub-backup-control.service",
                      "sovagrid-hub/sovagrid_hub/backup_broker.py"):
+            need((source / name).is_file(), "CANDIDATE_INCOMPATIBLE")
+    if Path(EXTERNAL_APPLY_MARKER).is_file():
+        need(b"# SOVAGRID_EXTERNAL_AGENT_APPLY_UNIT_V1" in script,
+             "CANDIDATE_INCOMPATIBLE")
+        for name in ("sovagrid-blueprint/deploy/external_agent_operation.py",
+                     "sovagrid-blueprint/deploy/sovagrid-external-agent-apply@.service"):
             need((source / name).is_file(), "CANDIDATE_INCOMPATIBLE")
     if common.web_agent_managed():
         need(b"# SOVAGRID_WEB_AGENT_INSTALL_V1" in script,
@@ -490,7 +567,7 @@ def _restore(folder: Path, state: dict) -> bool:
     layout = state.get("snapshot_layout", "legacy")
     need(layout in ("legacy", "release_feed_v1", "service_control_v1", "routing_v1",
                     "hub_backup_broker_v1", "ssh_gateway_v1", "local_web_v1",
-                    "local_containers_v1", "web_agent_v1"), "TRANSACTION_STATE")
+                    "local_containers_v1", "web_agent_v1", "external_apply_v1"), "TRANSACTION_STATE")
     snapshot = (LEGACY_SNAPSHOT if layout == "legacy" else
                 RELEASE_FEED_SNAPSHOT if layout == "release_feed_v1" else
                 SERVICE_SNAPSHOT if layout == "service_control_v1" else
@@ -498,7 +575,8 @@ def _restore(folder: Path, state: dict) -> bool:
                 HUB_BACKUP_SNAPSHOT if layout == "hub_backup_broker_v1" else
                 SSH_GATEWAY_SNAPSHOT if layout == "ssh_gateway_v1" else
                 LOCAL_WEB_SNAPSHOT if layout == "local_web_v1" else
-                LOCAL_CONTAINERS_SNAPSHOT if layout == "local_containers_v1" else SNAPSHOT)
+                LOCAL_CONTAINERS_SNAPSHOT if layout == "local_containers_v1" else
+                WEB_AGENT_SNAPSHOT if layout == "web_agent_v1" else SNAPSHOT)
     units = (LEGACY_UNITS if layout == "legacy" else
              RELEASE_FEED_UNITS if layout == "release_feed_v1" else
              SERVICE_ALL_UNITS if layout == "service_control_v1" else
@@ -517,16 +595,16 @@ def _restore(folder: Path, state: dict) -> bool:
     except Exception as exc:
         errors.append("source: " + str(exc))
     try:
-        if layout == "web_agent_v1":
+        if layout in ("web_agent_v1", "external_apply_v1"):
             common.command(["systemctl", "stop", *reversed(WEB_AGENT_UNITS)], timeout=40,
                            check=False)
-        if layout in ("local_containers_v1", "web_agent_v1"):
+        if layout in ("local_containers_v1", "web_agent_v1", "external_apply_v1"):
             common.command(["systemctl", "stop", *LOCAL_CONTAINER_UNITS], timeout=40, check=False)
         if layout in ("hub_backup_broker_v1", "ssh_gateway_v1", "local_web_v1",
-                      "local_containers_v1", "web_agent_v1"):
+                      "local_containers_v1", "web_agent_v1", "external_apply_v1"):
             common.command(["systemctl", "stop", *BACKUP_BROKER_UNITS], timeout=40, check=False)
         if layout in ("service_control_v1", "routing_v1", "hub_backup_broker_v1",
-                      "ssh_gateway_v1", "local_web_v1", "local_containers_v1", "web_agent_v1"):
+                      "ssh_gateway_v1", "local_web_v1", "local_containers_v1", "web_agent_v1", "external_apply_v1"):
             common.command(["systemctl", "stop", *reversed(LOCAL_SERVICE_UNITS)],
                            timeout=40, check=False)
         common.command(["systemctl", "stop", "sovagrid-terminal-local-control.service",
@@ -536,7 +614,7 @@ def _restore(folder: Path, state: dict) -> bool:
         common.command(["systemctl", "stop", "sovagrid-agent-local.service"], timeout=40, check=False)
         args, env = common.rollback_stop_compose_args(SOURCE, folder, snapshot, state["phase"])
         common.command(args + ["stop"], timeout=120, check=False, env=env)
-        if (layout in ("ssh_gateway_v1", "local_web_v1", "local_containers_v1", "web_agent_v1") and state["phase"] != "preparing" and
+        if (layout in ("ssh_gateway_v1", "local_web_v1", "local_containers_v1", "web_agent_v1", "external_apply_v1") and state["phase"] != "preparing" and
                 common.SSH_GATEWAY_SERVICE not in state["images"] and
                 "gateway_before" in state):
             common.remove_new_gateway_on_rollback(state["gateway_before"]["container_ids"])
@@ -556,7 +634,7 @@ def _restore(folder: Path, state: dict) -> bool:
         for service in state["images"]:
             common.command(["docker", "image", "tag", state["images"][service],
                             "sovagrid-" + service + ":local"])
-        if (layout in ("ssh_gateway_v1", "local_web_v1", "local_containers_v1", "web_agent_v1") and state["phase"] != "preparing" and
+        if (layout in ("ssh_gateway_v1", "local_web_v1", "local_containers_v1", "web_agent_v1", "external_apply_v1") and state["phase"] != "preparing" and
                 common.SSH_GATEWAY_SERVICE not in state["images"] and
                 "gateway_before" in state):
             old_gateway_image = state["gateway_before"]["image"]
@@ -573,13 +651,13 @@ def _restore(folder: Path, state: dict) -> bool:
             common.command(["systemctl", "enable" if old["enabled"] else "disable", unit],
                            timeout=30, check=bool(old["enabled"]))
         if layout in ("hub_backup_broker_v1", "ssh_gateway_v1", "local_web_v1",
-                      "local_containers_v1", "web_agent_v1") and common.backup_broker_enabled() and \
+                      "local_containers_v1", "web_agent_v1", "external_apply_v1") and common.backup_broker_enabled() and \
                 state["units"][BACKUP_BROKER_UNITS[0]]["active"]:
             common.command(["systemctl", "start", BACKUP_BROKER_UNITS[0]], timeout=30)
         if layout in ("hub_backup_broker_v1", "ssh_gateway_v1", "local_web_v1",
-                      "local_containers_v1", "web_agent_v1"):
+                      "local_containers_v1", "web_agent_v1", "external_apply_v1"):
             common.backup_broker_socket_ready()
-        if (layout == "web_agent_v1" and common.web_agent_managed() and
+        if (layout in ("web_agent_v1", "external_apply_v1") and common.web_agent_managed() and
                 state["units"][WEB_AGENT_UNITS[0]]["active"]):
             common.command(["systemctl", "start", WEB_AGENT_UNITS[0]], timeout=30)
             common.web_agent_socket_ready()
@@ -603,7 +681,7 @@ def _restore(folder: Path, state: dict) -> bool:
                 common.command(["systemctl", "reset-failed", unit], timeout=10)
             common.command(["systemctl", "restart" if old["active"] else "stop", unit],
                            timeout=60, check=bool(old["active"]))
-        if layout in ("local_containers_v1", "web_agent_v1") and state["units"][LOCAL_CONTAINER_UNITS[1]]["active"]:
+        if layout in ("local_containers_v1", "web_agent_v1", "external_apply_v1") and state["units"][LOCAL_CONTAINER_UNITS[1]]["active"]:
             common.command(["systemctl", "start", LOCAL_CONTAINER_UNITS[0]], timeout=40)
         manifest, _promotion, _commits, baseline_sha = inspect()
         need(manifest == state["old_manifest"] and baseline_sha == state["baseline_sha256"],
@@ -698,7 +776,8 @@ def _recover_pending() -> None:
                           SERVICE_ALL_UNITS if layout == "service_control_v1" else
                           ROUTING_ALL_UNITS if layout == "routing_v1" else
                           LOCAL_WEB_UNITS if layout in ("hub_backup_broker_v1",
-                                                        "ssh_gateway_v1", "local_web_v1") else UNITS)
+                                                        "ssh_gateway_v1", "local_web_v1") else
+                          LOCAL_CONTAINERS_ALL_UNITS if layout == "local_containers_v1" else UNITS)
         required = {"phase", "old_manifest", "candidate", "images", "units", "baseline_sha256",
                     "local_record_sha256", "local_config_sha256", "local_server_id",
                     "external_runtime"}
@@ -711,12 +790,13 @@ def _recover_pending() -> None:
              isinstance(state["images"], dict) and
              set(state["images"]) in ({"hub", "web"}, {"hub", "web", "ssh-gateway"}) and
              ("ssh-gateway" not in state["images"] or layout in
-              ("ssh_gateway_v1", "local_web_v1", "local_containers_v1")) and
+              ("ssh_gateway_v1", "local_web_v1", "local_containers_v1",
+               "web_agent_v1", "external_apply_v1")) and
              all(isinstance(value, str) and SHA.fullmatch(value.removeprefix("sha256:")) is not None
                  for value in state["images"].values()) and
              layout in ("legacy", "release_feed_v1", "service_control_v1", "routing_v1",
                         "hub_backup_broker_v1", "ssh_gateway_v1", "local_web_v1",
-                        "local_containers_v1") and
+                        "local_containers_v1", "web_agent_v1", "external_apply_v1") and
              isinstance(state["units"], dict) and set(state["units"]) == set(expected_units) and
              all(isinstance(item, dict) and set(item) == {"active", "enabled"} and
                  type(item["active"]) is bool and type(item["enabled"]) is bool
@@ -793,7 +873,7 @@ def apply(archive_sha: str, current_manifest: str, *, automatic: bool = False) -
             folder.mkdir(mode=0o700)
             created = True
             state = {"phase": "preparing", "old_manifest": manifest, "candidate": archive_sha,
-                     "snapshot_layout": "web_agent_v1",
+                     "snapshot_layout": "external_apply_v1",
                      "images": images, "gateway_before": gateway_before,
                      "units": units, "baseline_sha256": baseline_sha,
                      "local_server_id": state_before["local_server_id"],
@@ -867,6 +947,7 @@ def apply(archive_sha: str, current_manifest: str, *, automatic: bool = False) -
                 install_env.update(SOVAGRID_PUBLIC_WEB_LOCK_HELD="1", SOVAGRID_UPDATER_TIMER_SNAPSHOT="1",
                                    SOVAGRID_RELEASE_FEED_SNAPSHOT="1",
                                    SOVAGRID_HUB_BACKUP_BROKER_SNAPSHOT="1",
+                                   SOVAGRID_EXTERNAL_APPLY_UNIT_SNAPSHOT="1",
                                    SOVAGRID_SSH_GATEWAY_SNAPSHOT="1",
                                    SOVAGRID_WEB_AGENT_SNAPSHOT="1")
                 common.command(["bash", str(SOURCE / "sovagrid-blueprint/run.sh"), "--hub-only"],

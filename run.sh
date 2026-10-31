@@ -9,6 +9,7 @@
 # SOVAGRID_LOCAL_WEB_V1
 # SOVAGRID_RELEASE_FEED_UNITS_V1
 # SOVAGRID_HUB_BACKUP_BROKER_V1
+# SOVAGRID_EXTERNAL_AGENT_APPLY_UNIT_V1
 # SOVAGRID_SSH_GATEWAY_INSTALL_V1
 # SOVAGRID_WEB_AGENT_INSTALL_V1
 set -euo pipefail
@@ -42,6 +43,19 @@ if [[ ${SOVAGRID_PUBLIC_WEB_LOCK_HELD:-0} == 1 && -f /var/lib/sovagrid/.managed-
                      /etc/systemd/system/sovagrid-hub-backup-control.service \
                      /var/lib/sovagrid/backups/.broker-requests; do
     [[ ! -e $backup_path && ! -L $backup_path ]] || die 'the supervising updater cannot snapshot the Hub backup broker'
+  done
+fi
+# Older Hub-only updaters cannot restore the dedicated external-Agent writer
+# or its operation ledger after a failed source switch. Defer first install.
+external_apply_marker=/etc/sovagrid/.external-agent-apply-managed-by-run-sh
+external_apply_unit=/etc/systemd/system/sovagrid-external-agent-apply@.service
+external_apply_ledger=/var/lib/sovagrid/external-agent-operations
+external_apply_deferred=0
+if [[ ${SOVAGRID_PUBLIC_WEB_LOCK_HELD:-0} == 1 && -f /var/lib/sovagrid/.managed-by-run-sh &&
+      ${SOVAGRID_EXTERNAL_APPLY_UNIT_SNAPSHOT:-0} != 1 ]]; then
+  external_apply_deferred=1
+  for external_path in "$external_apply_marker" "$external_apply_unit" "$external_apply_ledger"; do
+    [[ ! -e $external_path && ! -L $external_path ]] || die 'the supervising updater cannot snapshot the external Agent writer'
   done
 fi
 # A previous worker can deliver this release but cannot restore feed units or
@@ -208,6 +222,19 @@ for backup_unit in sovagrid-hub-backup-control.service sovagrid-hub-backup-contr
        $(stat -c '%U:%G:%a:%h' "$backup_destination") == root:root:644:1 ]] || die "unmanaged or unsafe Hub backup unit: $backup_unit"
   fi
 done
+if [[ -e $external_apply_marker || -L $external_apply_marker ]]; then
+  [[ -f $external_apply_marker && ! -L $external_apply_marker &&
+     $(stat -c '%U:%G:%a:%h' "$external_apply_marker") == root:root:600:1 ]] || die 'external Agent writer marker is unsafe'
+  cmp -s -- "$external_apply_marker" <(printf 'SOVAGRID_EXTERNAL_AGENT_APPLY_UNIT_V1\n') || die 'external Agent writer marker is invalid'
+fi
+if [[ -e $external_apply_unit || -L $external_apply_unit ]]; then
+  [[ -f $external_apply_unit && ! -L $external_apply_unit && -f $external_apply_marker &&
+     $(stat -c '%U:%G:%a:%h' "$external_apply_unit") == root:root:644:1 ]] || die 'external Agent writer unit is unmanaged or unsafe'
+fi
+if [[ -e $external_apply_ledger || -L $external_apply_ledger ]]; then
+  [[ -d $external_apply_ledger && ! -L $external_apply_ledger && -f $external_apply_marker &&
+     $(stat -c '%U:%G:%a' "$external_apply_ledger") == root:root:700 ]] || die 'external Agent writer ledger is unmanaged or unsafe'
+fi
 for web_agent_unit in sovagrid-web-agent-control.service sovagrid-web-agent-control.socket; do
   destination=/etc/systemd/system/$web_agent_unit
   if [[ -e $destination || -L $destination ]]; then
@@ -354,7 +381,8 @@ fi
   die 'managed WireGuard installer source is missing or a symlink'
 for auto_file in auto_update.py remote_update_worker.py sovagrid-auto-update.service sovagrid-auto-update.timer \
                  release_feed.py sovagrid-release-feed.service sovagrid-release-feed.timer \
-                 sovagrid-hub-backup-control.socket sovagrid-hub-backup-control.service compose.backup.yaml; do
+                 sovagrid-hub-backup-control.socket sovagrid-hub-backup-control.service compose.backup.yaml \
+                 external_agent_operation.py sovagrid-external-agent-apply@.service; do
   [[ -f $source_root/sovagrid-blueprint/deploy/$auto_file && ! -L $source_root/sovagrid-blueprint/deploy/$auto_file ]] || die "auto-update source $auto_file is missing or a symlink"
 done
 for web_agent_file in web_agent_bundle.py web_agent_jobs.py web_agent_local_rpc.py web_agent_target_ssh.py \
@@ -1148,6 +1176,35 @@ if (( hub_only )); then
   fi
   install -o root -g root -m 0600 /dev/null "$recovery_marker"
   systemctl daemon-reload
+  if (( ! external_apply_deferred )); then
+    external_apply_source="$source_root/sovagrid-blueprint/deploy/sovagrid-external-agent-apply@.service"
+    systemd-analyze verify "$external_apply_source" || die 'external Agent writer unit is invalid'
+    # Publish the ownership marker before the unit. An interrupted first
+    # install can then be repaired by a normal repeat of this installer.
+    external_apply_marker_temporary=$(mktemp "$external_apply_marker.XXXXXXXX")
+    if ! printf 'SOVAGRID_EXTERNAL_AGENT_APPLY_UNIT_V1\n' > "$external_apply_marker_temporary" ||
+       ! chown root:root "$external_apply_marker_temporary" ||
+       ! chmod 0600 "$external_apply_marker_temporary" ||
+       ! mv -Tf -- "$external_apply_marker_temporary" "$external_apply_marker"; then
+      rm -f -- "$external_apply_marker_temporary"
+      die 'external Agent writer marker could not be installed'
+    fi
+    [[ -d /var/lib/sovagrid && ! -L /var/lib/sovagrid &&
+       $(stat -c '%u' /var/lib/sovagrid) == 0 &&
+       -z $(find /var/lib/sovagrid -maxdepth 0 -perm /022 -print -quit) ]] || die 'external Agent writer state parent is unsafe'
+    if [[ ! -e $external_apply_ledger && ! -L $external_apply_ledger ]]; then
+      install -d -o root -g root -m 0700 "$external_apply_ledger"
+    fi
+    [[ -d $external_apply_ledger && ! -L $external_apply_ledger &&
+       $(stat -c '%U:%G:%a' "$external_apply_ledger") == root:root:700 ]] || die 'external Agent writer ledger is unsafe'
+    external_apply_temporary=$(mktemp "$external_apply_unit.XXXXXXXX")
+    if ! install -o root -g root -m 0644 "$external_apply_source" "$external_apply_temporary" ||
+       ! mv -Tf -- "$external_apply_temporary" "$external_apply_unit"; then
+      rm -f -- "$external_apply_temporary"
+      die 'external Agent writer unit could not be installed'
+    fi
+    systemctl daemon-reload
+  fi
   install_release_feed_units
   say 'Agent was skipped by --hub-only. Re-run without it to enroll the host.'
   exit 0

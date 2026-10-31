@@ -193,6 +193,59 @@ class HubOnlyUpdatePolicy(unittest.TestCase):
         self.assertNotIn("sovagrid-agent.service", update.UNITS)
         self.assertNotIn("sovagrid-agent-tunnel.service", update.UNITS)
 
+    def test_external_writer_snapshot_is_versioned_without_external_agent_tree(self) -> None:
+        self.assertNotIn(update.EXTERNAL_APPLY_UNIT, update.WEB_AGENT_SNAPSHOT)
+        self.assertNotIn(update.EXTERNAL_APPLY_LEDGER, update.WEB_AGENT_SNAPSHOT)
+        for path in (update.EXTERNAL_APPLY_MARKER, update.EXTERNAL_APPLY_UNIT,
+                     update.EXTERNAL_APPLY_LEDGER):
+            self.assertIn(path, update.SNAPSHOT)
+        self.assertNotIn("/opt/sovagrid-agent", update.SNAPSHOT)
+        self.assertNotIn("sovagrid-external-agent-apply@.service", update.UNITS)
+
+    def test_writer_unit_keeps_atomic_exchange_paths_on_same_filesystem(self) -> None:
+        unit = (DEPLOY / "sovagrid-external-agent-apply@.service").read_text()
+        self.assertIn("ProtectSystem=full", unit)
+        self.assertIn("ReadWritePaths=/etc/systemd/system", unit)
+        self.assertNotIn("ReadWritePaths=/opt/sovagrid-agent", unit)
+        self.assertNotIn("ReadWritePaths=/var/lib/sovagrid-external-agent-update", unit)
+        self.assertIn("OnFailure=sovagrid-external-agent-recovery.service", unit)
+
+    def test_hub_update_refuses_a_pending_external_agent_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker, unit, ledger = root / "marker", root / "unit", root / "operations"
+            marker.write_text("SOVAGRID_EXTERNAL_AGENT_APPLY_UNIT_V1\n")
+            unit.write_text("fixed unit\n")
+            ledger.mkdir()
+            request_id = "9c941101-2acb-4e59-877c-136d3f43f1d8"
+            operation = ledger / request_id
+            operation.mkdir()
+            status = {"format": 1, "request_id": request_id, "phase": "running",
+                      "created_at": 1, "updated_at": 1, "error": None}
+            (operation / "status.json").write_text(
+                json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n")
+            def public_path(path, **_kwargs):
+                return Path(path).read_bytes()
+            apply_state = ["activating"]
+            def systemctl_show(command, **_kwargs):
+                state = "inactive" if "-recovery.service" in command[-1] else apply_state[0]
+                return subprocess.CompletedProcess(command, 0, state + "\n", "")
+            with mock.patch.object(update, "EXTERNAL_APPLY_MARKER", str(marker)), \
+                 mock.patch.object(update, "EXTERNAL_APPLY_UNIT", str(unit)), \
+                 mock.patch.object(update, "EXTERNAL_APPLY_LEDGER", str(ledger)), \
+                 mock.patch.object(update, "_private_dir"), \
+                 mock.patch.object(update.common, "public_path", side_effect=public_path), \
+                 mock.patch.object(update.subprocess, "run", side_effect=systemctl_show):
+                with self.assertRaisesRegex(update.Refused, "EXTERNAL_APPLY_BUSY"):
+                    update._external_apply_idle()
+                status["phase"] = "complete"
+                (operation / "status.json").write_text(
+                    json.dumps(status, sort_keys=True, separators=(",", ":")) + "\n")
+                with self.assertRaisesRegex(update.Refused, "EXTERNAL_APPLY_BUSY"):
+                    update._external_apply_idle()
+                apply_state[0] = "inactive"
+                update._external_apply_idle()
+
     @staticmethod
     def external_runtime(pid: int = 101) -> dict[str, dict]:
         return {unit: {"active": True, "enabled": True, "pid": pid}
