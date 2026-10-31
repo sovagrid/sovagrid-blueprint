@@ -14,6 +14,7 @@ import json
 import re
 
 from sovagrid_connect.agent_rpc import RPCError
+from sovagrid_connect.core import ConnectionOptions
 from web_agent_target_ssh import PinnedTargetSSH, TargetSSHError
 
 
@@ -184,9 +185,14 @@ class WireguardControlJobs:
         jump = getattr(credential, "jump", None)
         route_kwargs = {}
         if jump is not None:
-            if (options.jump_host != jump["host"] or
-                    options.jump_port != jump["port"] or
-                    options.jump_user != jump["username"]):
+            try:
+                reviewed_jump = ConnectionOptions(host=jump["host"],
+                    port=jump["port"], user=jump["username"]).validated()
+            except (ValueError, TypeError, KeyError):
+                raise WireguardControlError("INVALID_REQUEST") from None
+            if (options.jump_host != reviewed_jump.host or
+                    options.jump_port != reviewed_jump.port or
+                    options.jump_user != reviewed_jump.user):
                 raise WireguardControlError("INVALID_REQUEST")
             route_kwargs = {"jump": jump,
                             "target_host_key_blob": credential.target_host_key_blob}
