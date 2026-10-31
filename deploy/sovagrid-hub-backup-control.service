@@ -29,7 +29,9 @@ AmbientCapabilities=
 # directory in /var/lib/sovagrid; writable child paths alone cannot rename
 # entries in their read-only parent under ProtectSystem=strict.
 ReadWritePaths=/var/lib/sovagrid /opt/sovagrid-candidates /var/lib/sovagrid-host-backup-operations /etc/sovagrid /etc/sovagrid-hub
-ReadWritePaths=/run/sovagrid-installation.lock /run/sovagrid-promotion.lock
+# Ignore absent locks while preparing ExecStartPre's namespace. The fixed
+# initializer creates and verifies them before the main process mounts them.
+ReadWritePaths=-/run/sovagrid-installation.lock -/run/sovagrid-promotion.lock
 # Docker Compose validates and recreates the Web container inside this unit.
 # On hosts with many CPU cores its Go runtime needs more than 32 threads.
 TasksMax=128

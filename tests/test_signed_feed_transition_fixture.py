@@ -20,8 +20,8 @@ class SandboxFixtureTests(unittest.TestCase):
         self.assertIn("/var/lib/sovagrid", writable)
         self.assertIn("/opt/sovagrid-candidates", writable)
         self.assertIn("/etc/sovagrid-hub", writable)
-        self.assertIn("/run/sovagrid-installation.lock", writable)
-        self.assertIn("/run/sovagrid-promotion.lock", writable)
+        self.assertIn("-/run/sovagrid-installation.lock", writable)
+        self.assertIn("-/run/sovagrid-promotion.lock", writable)
         self.assertNotIn("/run", writable)
         self.assertEqual(properties["ProtectSystem"], "strict")
         self.assertEqual(properties["NoNewPrivileges"], "true")
@@ -41,6 +41,8 @@ ReadWritePaths=/run/sovagrid-installation.lock /run/sovagrid-promotion.lock
         text = (ROOT / "deploy/sovagrid-hub-backup-control.service").read_text()
         for changed in (text.replace("ProtectSystem=strict", "ProtectSystem=false"),
                         text.replace("/etc/sovagrid-hub", ""),
-                        text + "\nReadWritePaths=/run\n"):
+                        text + "\nReadWritePaths=/run\n",
+                        text + "\nReadWritePaths=-/run\n",
+                        text + "\nReadWritePaths=-/\n"):
             with self.subTest(changed=changed[-80:]), self.assertRaises(SystemExit):
                 fixture.sandbox_properties(changed)

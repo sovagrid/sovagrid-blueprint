@@ -142,7 +142,8 @@ def sandbox_properties(text: str) -> dict[str, str]:
              "ProtectHome", "ProtectKernelTunables", "ProtectControlGroups", "RestrictAddressFamilies",
              "CapabilityBoundingSet", "AmbientCapabilities", "ReadWritePaths", "TasksMax", "MemoryMax", "KillMode")
     need(service.get("ProtectSystem") == "strict", "broker sandbox is missing")
-    paths = service.get("ReadWritePaths", "").split()
+    paths = [path[1:] if path.startswith("-") else path
+             for path in service.get("ReadWritePaths", "").split()]
     for path in ("/etc/sovagrid-hub", "/run/sovagrid-installation.lock", "/run/sovagrid-promotion.lock"):
         need(path in paths, "broker sandbox is missing an exact Hub-only write path")
     need("/run" not in paths and "/" not in paths, "broker sandbox has an overly broad write path")

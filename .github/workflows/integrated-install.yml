@@ -254,6 +254,11 @@ jobs:
           SOVAGRID_PORTABLE_RESTORE_DISPOSABLE=1
           SOVAGRID_RESTORE_EXPECTED_MANIFEST="$SOVAGRID_RESTORE_EXPECTED_MANIFEST"
           python3 sovagrid-blueprint/tests/portable_restore_apply_vm.py
+      - name: Show fixed service diagnostics after a failed gate
+        if: failure()
+        run: |
+          sudo -n systemctl status --no-pager --lines=12 sovagrid-hub-backup-control.service || true
+          sudo -n journalctl --no-pager -n 40 -u sovagrid-hub-backup-control.service || true
       - name: Remove disposable server and SSH identities
         if: always()
         run: >-
