@@ -58,21 +58,21 @@ jobs:
           sudo -n docker compose version
           test ! -e /opt/sovagrid-src
           test ! -e /etc/sovagrid
-      - name: Verify published 0.3.9 baseline bundle and build candidate
+      - name: Verify published server-v0.11.0 baseline bundle and build candidate
         env:
-          RELEASE_URL: https://github.com/sovagrid/sovagrid-blueprint/releases/download/v0.3.9-preview/SovaGrid-server-source-0.3.9.tar.gz
+          RELEASE_URL: https://github.com/sovagrid/sovagrid-blueprint/releases/download/server-v0.11.0/SovaGrid-server-source.tar.gz
         run: |
           curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --silent --show-error \
-            "$RELEASE_URL" -o "$RUNNER_TEMP/sovagrid-0.3.9-published.tar.gz"
+            "$RELEASE_URL" -o "$RUNNER_TEMP/sovagrid-0.11.0-published.tar.gz"
           printf '%s  %s\n' \
-            'a812024d044f1b4746b8302ecae2e7d36f1af355586a763a4839a3c09a47c41a' \
-            "$RUNNER_TEMP/sovagrid-0.3.9-published.tar.gz" | sha256sum --check -
+            '10abb18ca39d789d3a9cc8bd04d36126f6dd624a81e48219bd814fb6a15ab766' \
+            "$RUNNER_TEMP/sovagrid-0.11.0-published.tar.gz" | sha256sum --check -
           python3 tests/hub_only_candidate.py \
-            "$RUNNER_TEMP/sovagrid-0.3.9-published.tar.gz" \
+            "$RUNNER_TEMP/sovagrid-0.11.0-published.tar.gz" \
             "$GITHUB_WORKSPACE" "$RUNNER_TEMP/sovagrid-candidate-workspace" \
             "$RUNNER_TEMP/sovagrid-candidate.tar.gz"
           mkdir "$RUNNER_TEMP/sovagrid-published-source"
-          tar -xzf "$RUNNER_TEMP/sovagrid-0.3.9-published.tar.gz" \
+          tar -xzf "$RUNNER_TEMP/sovagrid-0.11.0-published.tar.gz" \
             -C "$RUNNER_TEMP/sovagrid-published-source" --no-same-owner
       - name: Build an opt-in candidate from one reviewed server component set
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.external_agent_apply }}
@@ -127,7 +127,7 @@ jobs:
           sudo python3 "$RUNNER_TEMP/sovagrid-published-source/sovagrid-blueprint/deploy/promote_agent_only.py" \
             prepare --manifest-sha256 "$old_manifest"
           sudo install -d -o root -g root -m 0755 /opt/sovagrid-src
-          sudo tar -xzf "$RUNNER_TEMP/sovagrid-0.3.9-published.tar.gz" \
+          sudo tar -xzf "$RUNNER_TEMP/sovagrid-0.11.0-published.tar.gz" \
             -C /opt/sovagrid-src --no-same-owner
           sudo /opt/sovagrid-src/sovagrid-blueprint/run.sh --hub-only
           sudo python3 /opt/sovagrid-src/sovagrid-blueprint/deploy/promote_agent_only.py \
