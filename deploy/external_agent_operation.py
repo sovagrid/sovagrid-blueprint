@@ -227,11 +227,14 @@ def _apply(request_id: str) -> int:
     # Only checks completed before the transaction writer can touch the Agent
     # tree are definitely failed. A generic rollback refusal can also follow
     # a durable commit with a later health failure, so its outcome is unknown.
-    phase = "failed" if code in {"REVIEW_CHANGED", "PROMOTION_CHANGED",
+    phase = "failed" if code in {"LOCK_UNAVAILABLE", "LOCK_UNSAFE",
+                                  "REVIEW_CHANGED", "PROMOTION_CHANGED",
                                   "CANDIDATE_NOT_LOCAL_HUB", "TRIAL_CAPABILITY_MISSING",
                                   "EXTERNAL_CHANGED"} else "uncertain"
-    _transition(path, request_id, frozenset(("running",)), phase,
-                code if phase == "failed" else "APPLY_UNCERTAIN")
+    # The updater prints only a fixed uppercase refusal code on stderr.
+    # Preserve that code even when the outcome is uncertain, so status remains
+    # useful without exposing command output, paths, credentials or journals.
+    _transition(path, request_id, frozenset(("running",)), phase, code)
     return 40
 
 

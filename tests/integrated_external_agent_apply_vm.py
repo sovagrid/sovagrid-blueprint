@@ -91,6 +91,36 @@ def broker_request(payload: dict) -> dict:
     return value
 
 
+def fixed_writer_diagnostic(unit: str) -> None:
+    """Print only bounded systemd state and fixed uppercase refusal codes."""
+    values = []
+    for prop, allowed in (("ActiveState", {"inactive", "failed", "active", "activating",
+                                          "deactivating", "reloading"}),
+                          ("Result", {"success", "exit-code", "timeout", "signal",
+                                      "core-dump", "oom-kill", "resources", "protocol"}),
+                          ("ExecMainStatus", None)):
+        try:
+            result = subprocess.run(["systemctl", "show", "-P", prop, unit],
+                                    capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        value = result.stdout.strip()
+        if result.returncode == 0 and (value in allowed if allowed is not None else
+                                       value.isdecimal() and int(value) <= 255):
+            values.append(prop + "=" + value)
+    try:
+        journal = subprocess.run(["journalctl", "--no-pager", "-o", "cat", "-u", unit,
+                                  "-n", "80"], capture_output=True, text=True,
+                                 timeout=10, check=False)
+        codes = sorted(set(re.findall(
+            r"SG_EXTERNAL_AGENT_(?:UPDATE|OPERATION)_REFUSE:[A-Z][A-Z0-9_]{1,63}",
+            journal.stdout)))[:8] if journal.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired):
+        codes = []
+    print("Fixed writer diagnostic: " + ",".join(values) + " codes=" + ",".join(codes),
+          flush=True)
+
+
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -618,6 +648,8 @@ def run(archive_sha256: str) -> None:
         if status["phase"] in ("complete", "failed", "uncertain"):
             break
         time.sleep(0.5)
+    if status is None or status["phase"] != "complete":
+        fixed_writer_diagnostic(unit)
     require(status is not None and status["phase"] == "complete",
             "fixed writer did not complete: " + str(status.get("error") if status else "NO_STATUS"))
     require(json.loads((folder / "status.json").read_bytes()) == status and

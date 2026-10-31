@@ -206,6 +206,10 @@ class HubOnlyUpdatePolicy(unittest.TestCase):
         unit = (DEPLOY / "sovagrid-external-agent-apply@.service").read_text()
         self.assertIn("ProtectSystem=full", unit)
         self.assertIn("ReadWritePaths=/etc/systemd/system", unit)
+        self.assertIn("ReadOnlyPaths=/opt/sovagrid-src\n", unit)
+        self.assertNotIn("/opt/sovagrid-candidates",
+                         [word for line in unit.splitlines() if line.startswith("ReadOnlyPaths=")
+                          for word in line.removeprefix("ReadOnlyPaths=").split()])
         self.assertNotIn("ReadWritePaths=/opt/sovagrid-agent", unit)
         self.assertNotIn("ReadWritePaths=/var/lib/sovagrid-external-agent-update", unit)
         self.assertIn("OnFailure=sovagrid-external-agent-recovery.service", unit)
