@@ -216,7 +216,7 @@ def _member_path(member: tarfile.TarInfo) -> tuple[str, bool]:
     except UnicodeError as exc:
         raise Refused("INVALID_ARCHIVE") from exc
     parts = name.split("/")
-    if (not name or name.startswith("/") or len(raw) > 4096 or
+    if (not name or name.startswith("/") or len(raw) > 4096 or len(parts) > 64 or
             any(part in ("", ".", "..") or len(part.encode("utf-8")) > 255
                 for part in parts)):
         raise Refused("INVALID_ARCHIVE")
@@ -438,6 +438,40 @@ def _identity_conflicts(identities: dict[str, dict[str, int]]) -> int:
     return collisions
 
 
+def _expected_stage_digest(files: dict[str, tuple[int, bytes]],
+                           directories: set[str]) -> str:
+    """Hash the private tree that extraction must create, including parents.
+
+    All stage items have root ownership and private modes; the original tar
+    metadata remains bound by the archive SHA. Paths and file digests here are
+    derived from a fully validated archive, never from a directory listing.
+    """
+    children: dict[str, list[str]] = {}
+    leaves: dict[str, list[str]] = {}
+    if len(directories) + len(files) > backup.MAX_FILES * 32:
+        raise Refused("FILE_LIMIT")
+    for directory in directories:
+        parent = directory.rsplit("/", 1)[0] if "/" in directory else ""
+        children.setdefault(parent, []).append(directory)
+    for file in files:
+        parent = file.rsplit("/", 1)[0] if "/" in file else ""
+        leaves.setdefault(parent, []).append(file)
+    digest = hashlib.sha256()
+
+    pending = [""]
+    while pending:
+        parent = pending.pop()
+        subdirs = sorted(children.get(parent, []))
+        for directory in subdirs:
+            digest.update(b"D\0" + directory.encode("utf-8") + b"\0")
+        for file in sorted(leaves.get(parent, [])):
+            size, file_digest = files[file]
+            digest.update(b"F\0" + file.encode("utf-8") + b"\0" +
+                          str(size).encode("ascii") + b"\0" + file_digest)
+        pending.extend(reversed(subdirs))
+    return digest.hexdigest()
+
+
 def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) -> dict:
     os.lseek(fd, 0, os.SEEK_SET)
     seen: set[str] = set()
@@ -453,6 +487,8 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
     vpn_contents: dict[str, bytes] = {}
     vpn_capture_bytes = 0
     vpn_unverified = False
+    staged_files: dict[str, tuple[int, bytes]] = {}
+    staged_dirs: set[str] = set()
     try:
         with os.fdopen(os.dup(fd), "rb") as archive_file:
             with tarfile.open(fileobj=archive_file, mode="r|gz") as archive:
@@ -463,6 +499,11 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
                     if path in seen or count >= backup.MAX_FILES:
                         raise Refused("INVALID_ARCHIVE")
                     _check_member(path, member, directory, sources, directories)
+                    components = path.lstrip("/").split("/")
+                    staged_dirs.update("/".join(components[:depth])
+                                       for depth in range(1, len(components)))
+                    if len(staged_dirs) + len(staged_files) > backup.MAX_FILES * 32:
+                        raise Refused("FILE_LIMIT")
                     if path in DYNAMIC_GROUP_PATHS:
                         dynamic_gids[path] = member.gid
                     vpn_parts = (path[len(VPN_STATE_ROOT) + 1:].split("/")
@@ -492,6 +533,7 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
                     count += 1
                     if directory:
                         directories.add(path)
+                        staged_dirs.add(path.lstrip("/"))
                         if path.startswith("/opt/sovagrid-src/"):
                             source_directories.add(path[len("/opt/sovagrid-src/"):])
                         continue
@@ -538,6 +580,7 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
                         if capture is not None:
                             capture.extend(block)
                         remaining -= len(block)
+                    staged_files[path.lstrip("/")] = (member.size, digest.digest())
                     if capture is not None:
                         if vpn_capture:
                             vpn_contents[path] = bytes(capture)
@@ -576,6 +619,8 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
     return {"archive": backup._summary(manifest), "source_manifest_sha256": manifest[
                 "source_manifest_sha256"], "uncompressed_bytes": total,
             "entries": count, "generated_bytecode_files": len(generated),
+            "materialized_tree_sha256": _expected_stage_digest(staged_files,
+                                                                 staged_dirs),
             "identities": _identities(seen, dynamic_gids),
             "vpn_udp_ports": vpn_ports, "vpn_ports_verified": vpn_ports_verified}
 
@@ -750,6 +795,58 @@ def _portable_export_module():
     return _sibling("host_image_export.py", "_sovagrid_restore_portable_export")
 
 
+def _portable_metadata_hashes(exporter: Any, identity: str) -> dict[str, str]:
+    """Hash the exact root-owned metadata beside the already bounded image tar.
+
+    The image tar digest alone does not bind the operator's service activation
+    receipt. In particular, a second valid receipt can name different units.
+    """
+    _folder, directory_fd, tar_fd, _record = exporter._artifact(identity)
+    try:
+        result = {}
+        for name, limit, key in (("manifest.json", exporter.MAX_IMAGE_MANIFEST,
+                                  "image_manifest_sha256"),
+                                 ("receipt.json", exporter.MAX_PORTABLE_RECEIPT,
+                                  "portable_receipt_sha256")):
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             dir_fd=directory_fd)
+            except FileNotFoundError as exc:
+                raise Refused("RECEIPT_NOT_FOUND" if name == "receipt.json" else
+                              "INVALID_MANIFEST") from exc
+            try:
+                info = os.fstat(fd)
+                if (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (
+                        backup.ROOT_UID, backup.ROOT_GID, 0o600):
+                    raise Refused("UNSAFE_IMAGE_METADATA")
+                raw = exporter._read_exact(fd, limit)
+                result[key] = hashlib.sha256(raw).hexdigest()
+            finally:
+                os.close(fd)
+        return result
+    finally:
+        os.close(tar_fd)
+        os.close(directory_fd)
+
+
+def _verified_portable_pair(exporter: Any, identity: str) -> tuple[dict, dict[str, str]]:
+    """Verify contents while preventing the exporter from replacing metadata."""
+    _folder, root_fd = exporter._output(create=False)
+    try:
+        try:
+            fcntl.flock(root_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise Refused("BUSY") from exc
+        before = _portable_metadata_hashes(exporter, identity)
+        artifact = exporter.verify(identity, require_receipt=True)
+        after = _portable_metadata_hashes(exporter, identity)
+        if before != after:
+            raise Refused("IMAGE_METADATA_CHANGED")
+        return artifact, after
+    finally:
+        os.close(root_fd)
+
+
 def _read_command(args: list[str], *, limit: int = MAX_DOCKER_OUTPUT) -> str | None:
     """Run one bounded local inventory command; no shell or Docker mutation."""
     try:
@@ -867,7 +964,7 @@ def portable_clean_plan(identity: str) -> dict:
     except (RuntimeError, ImportError, OSError) as exc:
         raise Refused("IMAGE_PAIR_UNAVAILABLE") from exc
     try:
-        artifact = exporter.verify(identity, require_receipt=True)
+        artifact, metadata_hashes = _verified_portable_pair(exporter, identity)
     except (exporter.Refused, exporter.backup.Refused, exporter.restore.Refused,
             OSError, ValueError, TypeError, AttributeError) as exc:
         code = str(exc) if isinstance(exc, exporter.Refused) else "IMAGE_PAIR_INVALID"
@@ -932,6 +1029,7 @@ def portable_clean_plan(identity: str) -> dict:
     result = {**clean, "portable_verified": True,
             "host_archive_sha256": receipt["host_archive_sha256"],
             "images_sha256": receipt["images_sha256"],
+            **metadata_hashes,
             "image_count": artifact["image_count"], "image_bytes": artifact["bytes"],
             "image_platforms": artifact["platforms"],
             "target_docker_available": docker["available"],
@@ -959,6 +1057,8 @@ def _portable_review_sha256(identity: str, plan_result: dict) -> str:
               "archive_sha256": plan_result["host_archive_sha256"],
               "source_manifest_sha256": plan_result["source_manifest_sha256"],
               "images_sha256": plan_result["images_sha256"],
+              "image_manifest_sha256": plan_result["image_manifest_sha256"],
+              "portable_receipt_sha256": plan_result["portable_receipt_sha256"],
               "image_bytes": plan_result["image_bytes"],
               "image_platforms": plan_result["image_platforms"],
               "target_docker_architecture": plan_result["target_docker_architecture"],
@@ -1258,7 +1358,8 @@ def stage_status(identity: str) -> dict:
             raise Refused("STAGE_CHANGED")
         if _stage_tree_digest(backup._host(STAGING) / identity,
                               deadline=time.monotonic() + backup.MAX_SECONDS) != receipt[
-                                  "tree_sha256"]:
+                                  "tree_sha256"] or receipt["tree_sha256"] != verified[
+                                      "materialized_tree_sha256"]:
             raise Refused("STAGE_CHANGED")
         return {"ok": True, "protocol": STAGE_PROTOCOL, "id": identity,
                 "staged": True, "verified": True, "entries": receipt["entries"],
@@ -1311,6 +1412,8 @@ def stage(identity: str) -> dict:
                 if _fingerprint(os.fstat(archive_fd)) != before:
                     raise Refused("ARCHIVE_CHANGED")
                 tree_sha = _stage_tree_digest(temporary, deadline=deadline)
+                if tree_sha != inspected["materialized_tree_sha256"]:
+                    raise Refused("STAGE_CHANGED")
                 receipt = {"protocol": STAGE_PROTOCOL, "id": identity,
                            "archive_sha256": manifest["sha256"],
                            "source_manifest_sha256": manifest["source_manifest_sha256"],
@@ -1383,10 +1486,12 @@ def _read_portable_marker(root_fd: int, identity: str) -> dict:
     except (Refused, ValueError, UnicodeError) as exc:
         raise Refused("INVALID_PORTABLE_STAGE") from exc
     digests = ("review_sha256", "archive_sha256", "source_manifest_sha256",
-               "images_sha256", "tree_sha256")
+               "images_sha256", "image_manifest_sha256",
+               "portable_receipt_sha256", "tree_sha256")
     if (not isinstance(receipt, dict) or set(receipt) !=
             {"protocol", "id", "review_sha256", "archive_sha256",
-             "source_manifest_sha256", "images_sha256", "image_bytes",
+             "source_manifest_sha256", "images_sha256",
+             "image_manifest_sha256", "portable_receipt_sha256", "image_bytes",
              "tree_sha256", "created_at"} or
             receipt["protocol"] != PORTABLE_STAGE_PROTOCOL or
             receipt["id"] != identity or
@@ -1419,6 +1524,49 @@ def _rename_noreplace(root_fd: int, temporary: str, final: str) -> None:
         raise Refused("IO_ERROR")
 
 
+def _verify_staged_units(identity: str, receipt: dict) -> list[str]:
+    """Bind activation names in the portable receipt to exact staged bytes."""
+    units = receipt.get("active_units")
+    hashes = receipt.get("unit_hashes")
+    allowed = (backup.WRITERS["full"] | backup.WRITERS["hub-only"] |
+               backup.AMNEZIA_WRITERS)
+    if (not isinstance(units, list) or len(units) > 32 or
+            any(not isinstance(unit, str) for unit in units) or
+            len(set(units)) != len(units) or
+            not isinstance(hashes, dict) or set(hashes) != set(units) or
+            any(not isinstance(unit, str) or unit not in allowed or
+                not isinstance(hashes[unit], str) or
+                SHA.fullmatch(hashes[unit]) is None for unit in units)):
+        raise Refused("PORTABLE_STAGE_CHANGED")
+    for unit in units:
+        path = STAGING / identity / "etc/systemd/system" / unit
+        try:
+            fd = backup._safe_open(path)
+        except (OSError, backup.Refused) as exc:
+            raise Refused("PORTABLE_STAGE_CHANGED") from exc
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+                    not 0 < info.st_size <= 128 * 1024 or
+                    (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) !=
+                    (backup.ROOT_UID, backup.ROOT_GID, 0o600)):
+                raise Refused("PORTABLE_STAGE_CHANGED")
+            digest = hashlib.sha256()
+            remaining = info.st_size
+            while remaining:
+                block = os.read(fd, min(65536, remaining))
+                if not block:
+                    raise Refused("PORTABLE_STAGE_CHANGED")
+                digest.update(block)
+                remaining -= len(block)
+            if (digest.hexdigest() != hashes[unit] or
+                    _fingerprint(os.fstat(fd)) != _fingerprint(info)):
+                raise Refused("PORTABLE_STAGE_CHANGED")
+        finally:
+            os.close(fd)
+    return sorted(units)
+
+
 def portable_stage_status(identity: str) -> dict:
     """Recheck the sealed host tree and exact image pair without applying it."""
     _require_root()
@@ -1441,7 +1589,7 @@ def portable_stage_status(identity: str) -> dict:
     except (RuntimeError, ImportError, OSError) as exc:
         raise Refused("IMAGE_PAIR_UNAVAILABLE") from exc
     try:
-        artifact = exporter.verify(identity, require_receipt=True)
+        artifact, metadata_hashes = _verified_portable_pair(exporter, identity)
     except (exporter.Refused, exporter.backup.Refused,
             exporter.restore.Refused) as exc:
         raise Refused(str(exc)) from None
@@ -1452,15 +1600,21 @@ def portable_stage_status(identity: str) -> dict:
             marker["archive_sha256"] != receipt.get("host_archive_sha256") or
             marker["source_manifest_sha256"] != receipt.get("source_manifest_sha256") or
             marker["images_sha256"] != receipt.get("images_sha256") or
+            marker["image_manifest_sha256"] != metadata_hashes["image_manifest_sha256"] or
+            marker["portable_receipt_sha256"] != metadata_hashes["portable_receipt_sha256"] or
             marker["image_bytes"] != artifact.get("bytes") or
             marker["tree_sha256"] != stage_result["tree_sha256"]):
         raise Refused("PORTABLE_STAGE_CHANGED")
+    active_units = _verify_staged_units(identity, receipt)
     return {"ok": True, "protocol": PORTABLE_STAGE_PROTOCOL, "id": identity,
             "staged": True, "verified": True,
+            "active_units": active_units,
             "review_sha256": marker["review_sha256"],
             "tree_sha256": marker["tree_sha256"],
             "host_archive_sha256": marker["archive_sha256"],
             "images_sha256": marker["images_sha256"],
+            "image_manifest_sha256": marker["image_manifest_sha256"],
+            "portable_receipt_sha256": marker["portable_receipt_sha256"],
             "image_bytes": marker["image_bytes"],
             "apply_available": False, "blockers": ["APPLY_NOT_IMPLEMENTED"]}
 
@@ -1495,6 +1649,8 @@ def portable_stage(identity: str, expected_review_sha256: str) -> dict:
               "archive_sha256": preview["host_archive_sha256"],
               "source_manifest_sha256": preview["source_manifest_sha256"],
               "images_sha256": preview["images_sha256"],
+              "image_manifest_sha256": preview["image_manifest_sha256"],
+              "portable_receipt_sha256": preview["portable_receipt_sha256"],
               "image_bytes": preview["image_bytes"],
               "tree_sha256": staged["tree_sha256"],
               "created_at": datetime.now(timezone.utc).isoformat()}
@@ -1550,17 +1706,70 @@ def portable_stage(identity: str, expected_review_sha256: str) -> dict:
     return portable_stage_status(identity)
 
 
+def portable_apply_preview(identity: str) -> dict:
+    """Recheck a sealed pair and fresh target state; issue an apply-phase CAS.
+
+    There is deliberately no command that consumes this digest yet. It gives
+    the operator a stable description of the exact staged generation and
+    currently observed target before any future destructive transaction.
+    """
+    _require_root()
+    identity = _id(identity)
+    staged = portable_stage_status(identity)
+    target = portable_clean_plan(identity)
+    blockers = [code for code in target["blockers"]
+                if code != "APPLY_NOT_IMPLEMENTED"]
+    if not target["target_empty"]:
+        blockers.append("TARGET_NOT_CLEAN")
+    if staged["review_sha256"] != target["review_sha256"]:
+        blockers.append("STALE_REVIEW")
+    bounded = list(dict.fromkeys(blockers))
+    record = {"protocol": "sovagrid-portable-restore-apply-review-v1",
+              "id": identity,
+              "stage_review_sha256": staged["review_sha256"],
+              "target_review_sha256": target["review_sha256"],
+              "tree_sha256": staged["tree_sha256"],
+              "host_archive_sha256": staged["host_archive_sha256"],
+              "images_sha256": staged["images_sha256"],
+              "image_manifest_sha256": staged["image_manifest_sha256"],
+              "portable_receipt_sha256": staged["portable_receipt_sha256"],
+              "active_units": staged["active_units"],
+              "blockers": bounded}
+    digest = hashlib.sha256(json.dumps(record, sort_keys=True,
+                                       separators=(",", ":")).encode("ascii")).hexdigest()
+    return {"ok": True, "protocol": record["protocol"], "id": identity,
+            "verified": True, "staged": True,
+            "apply_review_sha256": digest,
+            "stage_review_sha256": staged["review_sha256"],
+            "target_review_sha256": target["review_sha256"],
+            "active_units": staged["active_units"],
+            "target_ready": not bounded,
+            "target_empty": target["target_empty"],
+            "target_conflicts": target["target_conflicts"],
+            "target_unsafe_paths": target["target_unsafe_paths"],
+            "target_identity_conflicts": target["target_identity_conflicts"],
+            "target_docker_conflicts": target["target_docker_conflicts"],
+            "target_ports_in_use": target["target_ports_in_use"],
+            "target_vpn_ports_in_use": target["target_vpn_ports_in_use"],
+            "target_free_bytes": target["target_free_bytes"],
+            "required_free_bytes": target["required_free_bytes"],
+            "apply_available": False,
+            "blockers": ["APPLY_NOT_IMPLEMENTED", *bounded]}
+
+
 def main(argv: list[str]) -> int:
     try:
         if ((len(argv) != 2 or argv[0] not in
              ("verify", "plan", "clean-plan", "portable-clean-plan",
-              "stage", "stage-status", "portable-stage-status")) and
+              "stage", "stage-status", "portable-stage-status",
+              "portable-apply-preview")) and
             (len(argv) != 3 or argv[0] != "portable-stage")):
             raise Refused("USAGE")
         result = (verify(argv[1]) if argv[0] == "verify" else
                   clean_plan(argv[1]) if argv[0] == "clean-plan" else
                   portable_clean_plan(argv[1]) if argv[0] == "portable-clean-plan" else
                   portable_stage(argv[1], argv[2]) if argv[0] == "portable-stage" else
+                  portable_apply_preview(argv[1]) if argv[0] == "portable-apply-preview" else
                   portable_stage_status(argv[1]) if argv[0] == "portable-stage-status" else
                   stage(argv[1]) if argv[0] == "stage" else
                   stage_status(argv[1]) if argv[0] == "stage-status" else plan(argv[1]))
