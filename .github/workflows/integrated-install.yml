@@ -143,6 +143,7 @@ jobs:
         if: inputs.release_validation
         run: >-
           sudo -n env SOVAGRID_DISPOSABLE_VM=1
+          GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
           python3 /root/sovagrid-reviewed-dependencies/sovagrid-blueprint/tests/vpn_source_maintenance_vm.py
           /root/sovagrid-reviewed-dependencies
       - name: Place the reviewed initial source on the disposable host

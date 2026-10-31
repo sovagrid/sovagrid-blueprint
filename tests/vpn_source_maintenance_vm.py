@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -35,6 +36,9 @@ def run(*args, accepted=(0,)):
 def main():
     require(os.geteuid() == 0 and os.environ.get("SOVAGRID_DISPOSABLE_VM") == "1",
             "explicit disposable-VM acknowledgement and root are required")
+    require(os.environ.get("GITHUB_ACTIONS") == "true" and
+            os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted" and
+            os.environ.get("RUNNER_OS") == "Linux", "a fresh GitHub-hosted Linux VM is required")
     require(len(sys.argv) == 2, "provide the reviewed bundle root")
     bundle = Path(sys.argv[1]).resolve()
     require(bundle.is_relative_to("/root") and bundle != Path("/root"), "unpack the reviewed bundle under /root")
@@ -59,7 +63,25 @@ def main():
     baseline = hashlib.sha256(manifest_raw).hexdigest()
     installer = Installer()
     cleanup_allowed = False
+    parent_permissions = []
     try:
+        # Hosted images make some /usr/local tool directories writable to the
+        # runner. Give the real broker its production parent-directory contract
+        # in this explicitly disposable VM, and restore that fixture change.
+        for directory in ("/usr/local", "/usr/local/bin", "/usr/local/libexec",
+                          "/etc/systemd/system"):
+            if not os.path.lexists(directory):
+                continue
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                info = os.fstat(fd)
+                require(stat.S_ISDIR(info.st_mode), "fixed broker parent is not a directory")
+                parent_permissions.append((directory, info.st_dev, info.st_ino,
+                                           info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)))
+                os.fchown(fd, 0, 0)
+                os.fchmod(fd, 0o755)
+            finally:
+                os.close(fd)
         run("/usr/sbin/useradd", "--system", "--user-group", "--no-create-home",
             "--home-dir", "/var/lib/sovagrid-agent", "--shell", "/usr/sbin/nologin", "sovagrid")
         cleanup_allowed = True
@@ -130,8 +152,10 @@ def main():
             # A failure retains the disposable VM's files for diagnosis rather
             # than deleting an incomplete transaction or an external edit.
             if not Path(JOURNAL).exists():
-                run("/usr/bin/systemctl", "disable", "--now", "sovagrid-amnezia-control.socket")
-                run("/usr/bin/systemctl", "stop", "sovagrid-amnezia-control.service")
+                if Path("/etc/systemd/system/sovagrid-amnezia-control.socket").exists():
+                    run("/usr/bin/systemctl", "disable", "--now", "sovagrid-amnezia-control.socket")
+                if Path("/etc/systemd/system/sovagrid-amnezia-control.service").exists():
+                    run("/usr/bin/systemctl", "stop", "sovagrid-amnezia-control.service")
                 for _, absolute, _ in AMNEZIA:
                     Path(absolute).unlink(missing_ok=True)
                 run("/usr/bin/systemctl", "daemon-reload")
@@ -139,6 +163,17 @@ def main():
                     if Path(absolute).exists(): shutil.rmtree(absolute)
                 run("/usr/sbin/userdel", "sovagrid")
                 run("/usr/sbin/groupdel", "sovagrid", accepted=(0, 6))
+                for directory, dev, ino, uid, gid, mode in reversed(parent_permissions):
+                    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    try:
+                        info = os.fstat(fd)
+                        require((info.st_dev, info.st_ino, info.st_uid, info.st_gid,
+                                 stat.S_IMODE(info.st_mode)) == (dev, ino, 0, 0, 0o755),
+                                "fixed broker parent changed during fixture")
+                        os.fchown(fd, uid, gid)
+                        os.fchmod(fd, mode)
+                    finally:
+                        os.close(fd)
 
 
 if __name__ == "__main__":
