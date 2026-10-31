@@ -419,6 +419,10 @@ def seed(candidate: Path, old_agent_source: Path) -> None:
             "hub_host_key": ssh_public_key,
             "hub_ca_pem": HUB_CERT.read_text()}}
     replace_root_file(state_path, encode(state), mode=0o600)
+    # The promotion seed provides a placeholder enrollment state, but never
+    # invokes the enrollment helper that normally creates this private lock.
+    # Snapshot verification must use the same read-only lock as production.
+    write_root_file(state_path.parent / "lock", b"", mode=0o600)
     service = ("[Unit]\nDescription=Disposable SovaGrid external apply test Hub\n"
                "[Service]\nType=simple\nUser=root\nGroup=root\n"
                f"ExecStart=/usr/bin/python3 -I {Path(__file__).resolve()} serve\n"
