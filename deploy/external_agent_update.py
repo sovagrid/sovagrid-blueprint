@@ -34,6 +34,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -594,6 +595,88 @@ def _candidate_agent_files(root: Path, manifest: dict) -> dict[str, str]:
     need(projection.get(remote.TARGET_HELPER) == manifest["sha256"].get(remote.SELF_NAME),
          "CANDIDATE_INVALID")
     return projection
+
+
+@contextlib.contextmanager
+def _projected_candidate_tree(candidate_root: Path, new_tree: dict[str, str],
+                              transaction: recovery.Recovery, *,
+                              staging_parent: Path | None = None,
+                              owner: int = 0, group: int = 0):
+    """Present exactly the Agent's installable files to Recovery.prepare.
+
+    The signed bundle also contains tests and documentation, while Recovery's
+    tree exchange accepts only the installed Agent projection. Keep the copy
+    inside the root-only candidate area and discard it as soon as prepare has
+    durably copied its own validated snapshot. A supervisor killed during
+    prepare may leave an inert private directory; it is never executable.
+    """
+    parent = update.CANDIDATES if staging_parent is None else Path(staging_parent)
+    try:
+        info = parent.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == owner and
+             info.st_gid == group and stat.S_IMODE(info.st_mode) == 0o700,
+             "PROJECTION_STAGING_UNSAFE")
+    except OSError:
+        raise Refused("PROJECTION_STAGING_UNSAFE") from None
+    need(isinstance(new_tree, dict) and 1 <= len(new_tree) <= MAX_CHANGES and
+         all(isinstance(name, str) and recovery.RELATIVE.fullmatch(name) is not None and
+             all(part not in (".", "..") for part in name.split("/")) and
+             isinstance(digest, str) and SHA.fullmatch(digest) is not None
+             for name, digest in new_tree.items()), "PROJECTION_INVALID")
+    total = 0
+    with tempfile.TemporaryDirectory(prefix=".external-agent-projection-",
+                                     dir=parent) as temporary:
+        root = Path(temporary)
+        created: set[Path] = set()
+        for relative, expected in sorted(new_tree.items()):
+            source = candidate_root / "sovagrid-agent" / relative
+            try:
+                current_source = candidate_root
+                for part in ("sovagrid-agent", *Path(relative).parts[:-1]):
+                    directory = current_source.lstat()
+                    need(stat.S_ISDIR(directory.st_mode) and directory.st_uid == owner and
+                         not directory.st_mode & 0o022, "CANDIDATE_CHANGED")
+                    current_source /= part
+                directory = current_source.lstat()
+                need(stat.S_ISDIR(directory.st_mode) and directory.st_uid == owner and
+                     not directory.st_mode & 0o022, "CANDIDATE_CHANGED")
+                before = source.lstat()
+                need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
+                     before.st_uid == owner and not before.st_mode & 0o022 and
+                     0 < before.st_size <= 32 * 1024**2, "CANDIDATE_CHANGED")
+                fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    opened = os.fstat(fd)
+                    need((opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino) and
+                         stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1 and
+                         opened.st_uid == owner and not opened.st_mode & 0o022,
+                         "CANDIDATE_CHANGED")
+                    data = os.read(fd, 32 * 1024**2 + 1)
+                finally:
+                    os.close(fd)
+            except OSError:
+                raise Refused("CANDIDATE_CHANGED") from None
+            total += len(data)
+            need(len(data) == before.st_size and total <= 256 * 1024**2 and
+                 hashlib.sha256(data).hexdigest() == expected, "CANDIDATE_CHANGED")
+            destination = root / relative
+            current = root
+            for part in Path(relative).parts[:-1]:
+                current /= part
+                if current not in created:
+                    current.mkdir(mode=0o755)
+                    current.chmod(0o755)
+                    created.add(current)
+            fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600)
+            with os.fdopen(fd, "wb") as output:
+                output.write(data)
+                output.flush()
+                os.fchmod(output.fileno(), 0o644)
+                os.fsync(output.fileno())
+        root.chmod(0o755)
+        transaction._tree(str(root), new_tree)
+        yield root
 
 
 def _installed_agent_tree(projection: dict[str, str], *, root: Path | None = None,
@@ -2024,9 +2107,11 @@ def apply(archive_sha256: str, current_manifest_sha256: str,
                     _enable_recovery_unit()
                     lease.assert_held(fresh=True)
                     idle.assert_held()
-                    transaction.prepare(candidate_tree=str(candidate_root / "sovagrid-agent"),
-                                        old_tree=old_tree, new_tree=new_tree,
-                                        new_meta=new_meta)
+                    with _projected_candidate_tree(candidate_root, new_tree,
+                                                   transaction) as prepared_tree:
+                        transaction.prepare(candidate_tree=str(prepared_tree),
+                                            old_tree=old_tree, new_tree=new_tree,
+                                            new_meta=new_meta)
                     _systemctl("daemon-reload")
                     need(_systemd_trial_guard_loaded(), "TRIAL_GUARD_UNAVAILABLE")
                     lease.assert_held(fresh=True)

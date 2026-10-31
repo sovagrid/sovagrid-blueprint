@@ -207,6 +207,7 @@ jobs:
             /var/lib/sovagrid/.release-feed-units-managed-by-run-sh \
             /var/lib/sovagrid/release-feed-state.json > "$RUNNER_TEMP/release-feed-before-failure.sha256"
       - name: Build a valid candidate that fails after Hub installation
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.external_agent_apply }}
         run: |
           cp -a "$RUNNER_TEMP/sovagrid-candidate-workspace" "$RUNNER_TEMP/sovagrid-failure-workspace"
           python3 - "$RUNNER_TEMP/sovagrid-failure-workspace/sovagrid-blueprint/run.sh" \
@@ -244,6 +245,7 @@ jobs:
           printf '%s\n' "$candidate_sha" | sudo tee "/opt/sovagrid-candidates/$candidate_sha/.ready" >/dev/null
           sudo chmod 0600 "/opt/sovagrid-candidates/$candidate_sha/.ready"
       - name: Arm one candidate and prove timer rollback and invariants
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.external_agent_apply }}
         run: |
           candidate_sha=$(sha256sum "$RUNNER_TEMP/sovagrid-failure-candidate.tar.gz" | cut -d ' ' -f1)
           current_manifest=$(sha256sum /opt/sovagrid-src/sovagrid-bundle.json | cut -d ' ' -f1)
