@@ -50,8 +50,10 @@ def _sibling(filename: str, name: str):
 
 backup = _sibling("host_backup.py", "_sovagrid_host_backup")
 update = _sibling("remote_update_worker.py", "_sovagrid_backup_compose")
+images = _sibling("host_image_export.py", "_sovagrid_backup_images")
 
 PROTOCOL = "sovagrid-host-backup-operation-v1"
+PORTABLE_RECEIPT = "sovagrid-portable-host-receipt-v1"
 DEFAULT_STATE_DIR = Path("/var/lib/sovagrid-host-backup-operations")
 STATE_DIR = DEFAULT_STATE_DIR
 SOURCE = Path("/opt/sovagrid-src")
@@ -64,7 +66,7 @@ PHASES = frozenset(("accepted", "stopping", "archiving", "restarting",
 FINAL = frozenset(("complete", "recovered", "failed"))
 MAX_OPERATIONS = 10_000
 LIST_LIMIT = 100
-MAX_STATE = 8192
+MAX_STATE = 16_384
 MAX_COMMAND_SECONDS = 120
 TRANSIENT_WRITERS = frozenset((
     "sovagrid-vpn-status.service", "sovagrid-auto-update.service",
@@ -181,7 +183,9 @@ def _record(identity: str) -> dict[str, Any]:
     keys = {"protocol", "request_id", "phase", "created_at", "updated_at",
             "expected_manifest_sha256", "layout", "active_units", "running_containers",
             "container_ids", "unit_hashes", "archive_id", "archive", "error"}
-    if (not isinstance(value, dict) or set(value) != keys or value["protocol"] != PROTOCOL or
+    portable_keys = keys | {"portable_images", "image_receipt"}
+    if (not isinstance(value, dict) or set(value) not in (keys, portable_keys) or
+            value["protocol"] != PROTOCOL or
             value["request_id"] != identity or not isinstance(value["phase"], str) or
             value["phase"] not in PHASES or
             not isinstance(value["created_at"], str) or len(value["created_at"]) > 40 or
@@ -218,7 +222,54 @@ def _record(identity: str) -> dict[str, Any]:
             (value["error"] is not None and (not isinstance(value["error"], str) or
              re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", value["error"]) is None))):
         raise Refused("INVALID_STATE")
+    if set(value) == portable_keys:
+        installed = value["portable_images"]
+        receipt = value["image_receipt"]
+        if (not isinstance(installed, dict) or
+                set(installed) != set(value["running_containers"]) or
+                set(installed) not in ({"hub", "web"},
+                                       {"hub", "web", "ssh-gateway"}) or
+                any(not isinstance(item, dict) or
+                    set(item) != {"container_id", "image_id", "rootfs_sha256"} or
+                    item["container_id"] != value["container_ids"][service] or
+                    not isinstance(item["image_id"], str) or
+                    images.IMAGE_ID.fullmatch(item["image_id"]) is None or
+                    not isinstance(item["rootfs_sha256"], str) or
+                    SHA.fullmatch(item["rootfs_sha256"]) is None
+                    for service, item in installed.items()) or
+                len({item["image_id"] for item in installed.values()}) != len(installed) or
+                (value["phase"] == "complete") != (receipt is not None) or
+                (receipt is not None and not _valid_image_receipt(receipt, value))):
+            raise Refused("INVALID_STATE")
     return value
+
+
+def _valid_image_receipt(receipt: Any, value: dict[str, Any]) -> bool:
+    if not isinstance(receipt, dict) or set(receipt) != {
+            "protocol", "host_archive_id", "host_archive_sha256",
+            "source_manifest_sha256", "images_sha256", "images", "container_ids",
+            "exported_configs", "rootfs_sha256", "active_units", "unit_hashes"}:
+        return False
+    return (value["archive"] is not None and value["error"] is None and
+            receipt["protocol"] == PORTABLE_RECEIPT and
+            receipt["host_archive_id"] == value["archive_id"] and
+            isinstance(receipt["host_archive_sha256"], str) and
+            SHA.fullmatch(receipt["host_archive_sha256"]) is not None and
+            receipt["source_manifest_sha256"] == value["expected_manifest_sha256"] and
+            isinstance(receipt["images_sha256"], str) and
+            SHA.fullmatch(receipt["images_sha256"]) is not None and
+            receipt["images"] == {service: item["image_id"]
+                                  for service, item in value["portable_images"].items()} and
+            receipt["container_ids"] == value["container_ids"] and
+            isinstance(receipt["exported_configs"], dict) and
+            set(receipt["exported_configs"]) == set(value["portable_images"]) and
+            all(isinstance(item, str) and images.IMAGE_ID.fullmatch(item) is not None
+                for item in receipt["exported_configs"].values()) and
+            receipt["rootfs_sha256"] == {
+                service: item["rootfs_sha256"]
+                for service, item in value["portable_images"].items()} and
+            receipt["active_units"] == value["active_units"] and
+            receipt["unit_hashes"] == value["unit_hashes"])
 
 
 def _valid_archive(value: Any) -> bool:
@@ -510,6 +561,49 @@ def _reconcile_archive(value: dict[str, Any]) -> dict[str, Any] | None:
     return backup.verify(identity)["archive"]
 
 
+def _portable_images(value: dict[str, Any]) -> dict[str, dict[str, str]]:
+    try:
+        installed = images._installed_images(value["layout"])
+    except (images.Refused, images.backup.Refused, OSError,
+            subprocess.TimeoutExpired):
+        raise Refused("IMAGE_UNAVAILABLE") from None
+    if (set(installed) != set(value["running_containers"]) or
+            {service: item["container_id"] for service, item in installed.items()}
+            != value["container_ids"] or
+            len({item["image_id"] for item in installed.values()}) != len(installed)):
+        raise Refused("IMAGE_CHANGED")
+    return installed
+
+
+def _portable_receipt(value: dict[str, Any], artifact: dict[str, Any]) -> dict[str, Any]:
+    host = backup._record(value["archive_id"])
+    if (artifact["id"] != value["archive_id"] or
+            artifact["host_archive_sha256"] != host["sha256"] or
+            artifact["source_manifest_sha256"] != value["expected_manifest_sha256"] or
+            artifact["layout"] != value["layout"] or
+            artifact["images"] != {service: item["image_id"]
+                                   for service, item in value["portable_images"].items()} or
+            artifact["rootfs_sha256"] != {
+                service: item["rootfs_sha256"]
+                for service, item in value["portable_images"].items()} or
+            artifact["container_ids"] != value["container_ids"]):
+        raise Refused("IMAGE_CHANGED")
+    receipt = {"protocol": PORTABLE_RECEIPT,
+               "host_archive_id": value["archive_id"],
+               "host_archive_sha256": host["sha256"],
+               "source_manifest_sha256": value["expected_manifest_sha256"],
+               "images_sha256": artifact["sha256"],
+               "images": artifact["images"],
+               "container_ids": value["container_ids"],
+               "exported_configs": artifact["exported_configs"],
+               "rootfs_sha256": artifact["rootfs_sha256"],
+               "active_units": value["active_units"],
+               "unit_hashes": value["unit_hashes"]}
+    if not _valid_image_receipt(receipt, value):
+        raise Refused("IMAGE_CHANGED")
+    return receipt
+
+
 def _worker(identity: str, *, recovery: bool) -> None:
     with _global_lock(wait=True), _promotion_lock(identity):
         value = _record(identity)
@@ -561,6 +655,14 @@ def _worker(identity: str, *, recovery: bool) -> None:
                 _phase(value, "failed", error="STATE_CHANGED")
                 _clear_active(identity)
                 return
+            if "portable_images" in value:
+                try:
+                    if _portable_images(value) != value["portable_images"]:
+                        raise Refused("IMAGE_CHANGED")
+                except (Refused, images.Refused, OSError):
+                    _phase(value, "failed", error="IMAGE_CHANGED")
+                    _clear_active(identity)
+                    return
             error = None
             try:
                 _phase(value, "stopping")
@@ -588,6 +690,15 @@ def _worker(identity: str, *, recovery: bool) -> None:
                 _phase(value, "recovery_required", error="RESTART_INCOMPLETE",
                        archive=value["archive"])
                 return
+            if error is None and "portable_images" in value:
+                try:
+                    artifact = images._create_locked(
+                        value["archive_id"], expected_installed=value["portable_images"])
+                    receipt = _portable_receipt(value, artifact)
+                    images._publish_portable_receipt_locked(value["archive_id"], receipt)
+                    value["image_receipt"] = receipt
+                except Exception:
+                    error = "IMAGES_FAILED"
             _phase(value, "complete" if error is None else "failed", error=error,
                    archive=value["archive"])
             _clear_active(identity)
@@ -595,11 +706,12 @@ def _worker(identity: str, *, recovery: bool) -> None:
             locks.close()
 
 
-def _spawn(action: str, identity: str) -> None:
+def _spawn(action: str, identity: str, *, portable: bool = False) -> None:
     unit = ("sg-host-backup-recover-" if action == "recover-run" else
             "sg-host-backup-") + identity
     args = ["systemd-run", "--quiet", "--collect", "--unit=" + unit,
-            "--property=Type=exec", "--property=RuntimeMaxSec=900",
+            "--property=Type=exec",
+            "--property=RuntimeMaxSec=" + ("2700" if portable else "900"),
             "/usr/bin/python3", "-I", str(SCRIPT), action, identity]
     try:
         result = subprocess.run(args, stdin=subprocess.DEVNULL,
@@ -611,7 +723,7 @@ def _spawn(action: str, identity: str) -> None:
         raise Refused("SPAWN_FAILED")
 
 
-def start(identity: str, expected_manifest: str) -> dict[str, Any]:
+def start(identity: str, expected_manifest: str, *, portable: bool = False) -> dict[str, Any]:
     _require_root()
     identity, expected_manifest = _id(identity), _hash(expected_manifest)
     with _global_lock():
@@ -624,7 +736,8 @@ def start(identity: str, expected_manifest: str) -> dict[str, Any]:
                 raise Refused("BUSY")
         if (_state_dir(create=True) / (identity + ".json")).exists():
             value = _record(identity)
-            if value["expected_manifest_sha256"] != expected_manifest:
+            if (value["expected_manifest_sha256"] != expected_manifest or
+                    ("portable_images" in value) != portable):
                 raise Refused("ID_CONFLICT")
             return _public(value)
         if len(list(_state_dir(create=True).glob("*.json"))) >= MAX_OPERATIONS:
@@ -637,6 +750,9 @@ def start(identity: str, expected_manifest: str) -> dict[str, Any]:
             raise Refused("BUSY")
         if tuple(containers) not in RUNNING_STACKS:
             raise Refused("DEGRADED_CONTAINERS")
+        if portable and tuple(containers) not in (
+                backup.COMPOSE_SERVICES[:2], backup.COMPOSE_SERVICES):
+            raise Refused("STACK_NOT_READY")
         backup.list_archives()  # Refuse incomplete or foreign files before downtime.
         value = {"protocol": PROTOCOL, "request_id": identity,
                  "phase": "accepted", "created_at": _utc(), "updated_at": _utc(),
@@ -646,10 +762,16 @@ def start(identity: str, expected_manifest: str) -> dict[str, Any]:
                  "unit_hashes": _unit_hashes(plan["active_units"]),
                  "archive_id": uuid.uuid4().hex,
                  "archive": None, "error": None}
+        if portable:
+            value["portable_images"] = _portable_images(value)
+            value["image_receipt"] = None
         _write_record(value)
         _set_active(identity)
         try:
-            _spawn("run", identity)
+            if portable:
+                _spawn("run", identity, portable=True)
+            else:
+                _spawn("run", identity)
         except Refused as exc:
             if str(exc) == "SPAWN_FAILED":
                 _phase(value, "failed", error="SPAWN_FAILED")
@@ -662,6 +784,14 @@ def start(identity: str, expected_manifest: str) -> dict[str, Any]:
 def status(identity: str) -> dict[str, Any]:
     _require_root()
     return _public(_record(_id(identity)))
+
+
+def portable_status(identity: str) -> dict[str, Any]:
+    _require_root()
+    value = _record(_id(identity))
+    if "portable_images" not in value:
+        raise Refused("NOT_PORTABLE")
+    return {**_public(value), "image_receipt": value["image_receipt"]}
 
 
 def list_operations() -> dict[str, Any]:
@@ -713,10 +843,14 @@ def main(argv: list[str]) -> int:
     try:
         if len(argv) == 3 and argv[0] == "start":
             result = start(argv[1], argv[2])
+        elif len(argv) == 3 and argv[0] == "start-portable":
+            result = start(argv[1], argv[2], portable=True)
         elif argv == ["list"]:
             result = list_operations()
         elif len(argv) == 2 and argv[0] == "status":
             result = status(argv[1])
+        elif len(argv) == 2 and argv[0] == "portable-status":
+            result = portable_status(argv[1])
         elif len(argv) == 2 and argv[0] == "recover":
             result = recover(argv[1])
         elif len(argv) == 2 and argv[0] in ("run", "recover-run"):

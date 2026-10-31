@@ -24,6 +24,12 @@ PLAN = {"ok": True, "protocol": "sovagrid-host-backup-v1", "layout": "full",
         "offline_ready": False}
 GATEWAY_PLAN = {**PLAN, "running_containers": ["hub", "web", "ssh-gateway"]}
 GATEWAY_IDS = {"hub": "c" * 64, "web": "d" * 64, "ssh-gateway": "f" * 64}
+PORTABLE_IMAGES = {
+    "hub": {"container_id": "c" * 64, "image_id": "sha256:" + "1" * 64,
+            "rootfs_sha256": "5" * 64},
+    "web": {"container_id": "d" * 64, "image_id": "sha256:" + "2" * 64,
+            "rootfs_sha256": "6" * 64},
+}
 
 
 class OrchestratorTests(unittest.TestCase):
@@ -89,6 +95,142 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(operation.status(REQUEST)["phase"], "complete")
         self.assertEqual(operation.status(REQUEST)["archive"], archive)
         self.assertIsNone(operation._active())
+
+    def test_portable_operation_pairs_pinned_archive_and_exact_images(self):
+        with patch.object(operation, "_portable_images", return_value=PORTABLE_IMAGES):
+            accepted = operation.start(REQUEST, MANIFEST, portable=True)
+            self.assertEqual(accepted["phase"], "accepted")
+            self.assertEqual(operation.start(REQUEST, MANIFEST, portable=True), accepted)
+            with self.assertRaisesRegex(operation.Refused, "ID_CONFLICT"):
+                operation.start(REQUEST, MANIFEST)
+            self.assertNotIn("image_receipt", accepted)  # Legacy status shape.
+            archive_id = operation._record(REQUEST)["archive_id"]
+            archive = {"id": archive_id, "created_at": "2026-10-27T00:00:00+00:00",
+                       "layout": "full", "bytes": 512, "files": 3}
+            artifact = {"id": archive_id, "host_archive_sha256": "3" * 64,
+                        "source_manifest_sha256": MANIFEST, "layout": "full",
+                        "sha256": "4" * 64,
+                        "images": {key: item["image_id"]
+                                   for key, item in PORTABLE_IMAGES.items()},
+                        "container_ids": {"hub": "c" * 64, "web": "d" * 64},
+                        "exported_configs": {"hub": "sha256:" + "7" * 64,
+                                             "web": "sha256:" + "8" * 64},
+                        "rootfs_sha256": {key: item["rootfs_sha256"]
+                                           for key, item in PORTABLE_IMAGES.items()}}
+            with patch.object(operation, "_stop"), patch.object(operation, "_restart"), \
+                 patch.object(operation.backup, "_create_locked",
+                              return_value={"archive": archive}), \
+                 patch.object(operation.backup, "_record",
+                              return_value={"sha256": "3" * 64}), \
+                 patch.object(operation.images, "_create_locked",
+                              return_value=artifact) as export, \
+                 patch.object(operation.images, "_publish_portable_receipt_locked") as publish:
+                operation._worker(REQUEST, recovery=False)
+        export.assert_called_once_with(archive_id, expected_installed=PORTABLE_IMAGES)
+        publish.assert_called_once()
+        self.assertEqual(publish.call_args.args[0], archive_id)
+        self.assertEqual(publish.call_args.args[1]["images_sha256"], "4" * 64)
+        self.assertEqual(operation.status(REQUEST)["phase"], "complete")
+        receipt = operation.portable_status(REQUEST)["image_receipt"]
+        self.assertEqual(receipt["host_archive_sha256"], "3" * 64)
+        self.assertEqual(receipt["images_sha256"], "4" * 64)
+        self.assertEqual(receipt["container_ids"], artifact["container_ids"])
+        self.assertEqual(receipt["rootfs_sha256"], artifact["rootfs_sha256"])
+        self.assertEqual(receipt["exported_configs"], artifact["exported_configs"])
+        damaged = operation._record(REQUEST)
+        damaged["image_receipt"] = None
+        operation._private_write(operation._record_path(REQUEST),
+                                 (json.dumps(damaged) + "\n").encode())
+        with self.assertRaisesRegex(operation.Refused, "INVALID_STATE"):
+            operation.portable_status(REQUEST)
+        self.assertIsNone(operation._active())
+
+    def test_portable_export_failure_never_reports_complete(self):
+        with patch.object(operation, "_portable_images", return_value=PORTABLE_IMAGES):
+            operation.start(REQUEST, MANIFEST, portable=True)
+            archive_id = operation._record(REQUEST)["archive_id"]
+            archive = {"id": archive_id, "created_at": "2026-10-27T00:00:00+00:00",
+                       "layout": "full", "bytes": 512, "files": 3}
+            with patch.object(operation, "_stop"), patch.object(operation, "_restart") as restart, \
+                 patch.object(operation.backup, "_create_locked",
+                              return_value={"archive": archive}), \
+                 patch.object(operation.images, "_create_locked",
+                              side_effect=RuntimeError("private docker error")):
+                operation._worker(REQUEST, recovery=False)
+        restart.assert_called_once()
+        state = operation.portable_status(REQUEST)
+        self.assertEqual((state["phase"], state["error"]), ("failed", "IMAGES_FAILED"))
+        self.assertIsNone(state["image_receipt"])
+        self.assertNotIn("private docker error", str(state))
+
+    def test_portable_receipt_write_failure_never_reports_complete(self):
+        with patch.object(operation, "_portable_images", return_value=PORTABLE_IMAGES):
+            operation.start(REQUEST, MANIFEST, portable=True)
+            archive_id = operation._record(REQUEST)["archive_id"]
+            archive = {"id": archive_id, "created_at": "2026-10-27T00:00:00+00:00",
+                       "layout": "full", "bytes": 512, "files": 3}
+            artifact = {"id": archive_id, "host_archive_sha256": "3" * 64,
+                        "source_manifest_sha256": MANIFEST, "layout": "full",
+                        "sha256": "4" * 64,
+                        "images": {key: item["image_id"]
+                                   for key, item in PORTABLE_IMAGES.items()},
+                        "container_ids": {"hub": "c" * 64, "web": "d" * 64},
+                        "exported_configs": {"hub": "sha256:" + "7" * 64,
+                                             "web": "sha256:" + "8" * 64},
+                        "rootfs_sha256": {key: item["rootfs_sha256"]
+                                           for key, item in PORTABLE_IMAGES.items()}}
+            with patch.object(operation, "_stop"), patch.object(operation, "_restart"), \
+                 patch.object(operation.backup, "_create_locked",
+                              return_value={"archive": archive}), \
+                 patch.object(operation.backup, "_record",
+                              return_value={"sha256": "3" * 64}), \
+                 patch.object(operation.images, "_create_locked", return_value=artifact), \
+                 patch.object(operation.images, "_publish_portable_receipt_locked",
+                              side_effect=OSError("private disk path")):
+                operation._worker(REQUEST, recovery=False)
+        state = operation.portable_status(REQUEST)
+        self.assertEqual((state["phase"], state["error"]), ("failed", "IMAGES_FAILED"))
+        self.assertIsNone(state["image_receipt"])
+        self.assertNotIn("private disk path", str(state))
+
+    def test_portable_image_drift_blocks_stop(self):
+        with patch.object(operation, "_portable_images", return_value=PORTABLE_IMAGES):
+            operation.start(REQUEST, MANIFEST, portable=True)
+        changed = {**PORTABLE_IMAGES, "web": {**PORTABLE_IMAGES["web"],
+                                            "rootfs_sha256": "9" * 64}}
+        with patch.object(operation, "_portable_images", return_value=changed), \
+             patch.object(operation, "_stop") as stop, \
+             patch.object(operation.images, "_create_locked") as export:
+            operation._worker(REQUEST, recovery=False)
+        stop.assert_not_called()
+        export.assert_not_called()
+        self.assertEqual(operation.portable_status(REQUEST)["error"], "IMAGE_CHANGED")
+
+    def test_portable_recovery_never_reexports_images(self):
+        with patch.object(operation, "_portable_images", return_value=PORTABLE_IMAGES):
+            operation.start(REQUEST, MANIFEST, portable=True)
+        value = operation._record(REQUEST)
+        operation._phase(value, "restarting")
+        with patch.object(operation.subprocess, "run") as run:
+            run.return_value.returncode = 3
+            operation.recover(REQUEST)
+        with patch.object(operation, "_reconcile_archive", return_value=None), \
+             patch.object(operation, "_restart"), \
+             patch.object(operation.images, "_create_locked") as export:
+            operation._worker(REQUEST, recovery=True)
+        export.assert_not_called()
+        state = operation.portable_status(REQUEST)
+        self.assertEqual(state["phase"], "recovered")
+        self.assertIsNone(state["image_receipt"])
+
+    def test_portable_start_requires_running_managed_stack(self):
+        with patch.object(operation.backup, "plan", return_value={
+                **PLAN, "running_containers": []}), patch.object(
+                operation, "_portable_images") as inspect:
+            with self.assertRaisesRegex(operation.Refused, "STACK_NOT_READY"):
+                operation.start(REQUEST, MANIFEST, portable=True)
+        inspect.assert_not_called()
+        self.assertEqual(operation.list_operations()["operations"], [])
 
     def test_worker_holds_enrollment_lock_while_stopping_and_archiving(self):
         self._start()
@@ -368,6 +510,8 @@ class OrchestratorTests(unittest.TestCase):
             REAL_SPAWN("recover-run", REQUEST)
             recovery_unit = run.call_args.args[0][3]
             self.assertEqual(recovery_unit, "--unit=sg-host-backup-recover-" + REQUEST)
+            REAL_SPAWN("run", REQUEST, portable=True)
+            self.assertIn("--property=RuntimeMaxSec=2700", run.call_args.args[0])
 
 
 if __name__ == "__main__":
