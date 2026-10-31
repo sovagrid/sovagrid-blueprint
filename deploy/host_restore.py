@@ -124,6 +124,11 @@ DYNAMIC_GROUPS = (
 DYNAMIC_GROUP_PATHS = frozenset().union(*DYNAMIC_GROUPS)
 MAX_BUNDLE_MANIFEST = 512 * 1024
 MAX_BUNDLE_FILES = backup.MAX_FILES
+VPN_STATE_ROOT = "/var/lib/sovagrid-vpn"
+VPN_INSTANCE = re.compile(r"[a-z][a-z0-9-]{1,31}\Z")
+MAX_VPN_STATE = 256 * 1024
+MAX_VPN_CONFIG = 256 * 1024
+VPN_LISTEN_PORT = re.compile(r"\s*ListenPort\s*=\s*([0-9]{1,5})\s*\Z")
 
 
 class Refused(RuntimeError):
@@ -439,6 +444,9 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
     total = 0
     count = 0
     dynamic_gids: dict[str, int] = {}
+    vpn_members: set[str] = set()
+    vpn_contents: dict[str, bytes] = {}
+    vpn_oversized = False
     try:
         with os.fdopen(os.dup(fd), "rb") as archive_file:
             with tarfile.open(fileobj=archive_file, mode="r|gz") as archive:
@@ -451,6 +459,8 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
                     _check_member(path, member, directory, sources, directories)
                     if path in DYNAMIC_GROUP_PATHS:
                         dynamic_gids[path] = member.gid
+                    if path.startswith(VPN_STATE_ROOT + "/"):
+                        vpn_members.add(path)
                     seen.add(path)
                     count += 1
                     if directory:
@@ -469,8 +479,15 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
                     bundle_path = "/opt/sovagrid-src/sovagrid-bundle.json"
                     marker_path = backup.SSH_GATEWAY_MARKER
                     web_marker_path = backup.WEB_AGENT_MARKER
+                    vpn_capture = (path.startswith(VPN_STATE_ROOT + "/") and
+                                   path.rsplit("/", 1)[-1] in ("state.json", "server.conf"))
+                    vpn_limit = (MAX_VPN_STATE if path.endswith("/state.json") else
+                                 MAX_VPN_CONFIG)
+                    if vpn_capture and member.size > vpn_limit:
+                        vpn_oversized = True
                     capture = (bytearray() if path in
-                               (bundle_path, marker_path, web_marker_path) else None)
+                               (bundle_path, marker_path, web_marker_path) or
+                               (vpn_capture and member.size <= vpn_limit) else None)
                     if path == bundle_path and member.size > MAX_BUNDLE_MANIFEST:
                         raise Refused("INVALID_BUNDLE")
                     if path == marker_path and member.size != len(
@@ -490,7 +507,9 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
                             capture.extend(block)
                         remaining -= len(block)
                     if capture is not None:
-                        if path == marker_path:
+                        if vpn_capture:
+                            vpn_contents[path] = bytes(capture)
+                        elif path == marker_path:
                             if bytes(capture) != backup.SSH_GATEWAY_MARKER_CONTENT:
                                 raise Refused("INVALID_ARCHIVE")
                         elif path == web_marker_path:
@@ -519,10 +538,64 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
             "source_manifest_sha256"]:
         raise Refused("INVALID_BUNDLE")
     _bundle(bundle_raw, source_hashes, generated, source_directories)
+    vpn_ports, vpn_ports_verified = _archived_vpn_ports(
+        vpn_members, vpn_contents, oversized=vpn_oversized)
     return {"archive": backup._summary(manifest), "source_manifest_sha256": manifest[
                 "source_manifest_sha256"], "uncompressed_bytes": total,
             "entries": count, "generated_bytecode_files": len(generated),
-            "identities": _identities(seen, dynamic_gids)}
+            "identities": _identities(seen, dynamic_gids),
+            "vpn_udp_ports": vpn_ports, "vpn_ports_verified": vpn_ports_verified}
+
+
+def _archived_vpn_ports(members: set[str], contents: dict[str, bytes],
+                        *, oversized: bool) -> tuple[list[int], bool]:
+    """Extract public UDP ports without returning archived keys or configuration."""
+    instances: set[str] = set()
+    unverified = oversized
+    for path in members:
+        remainder = path[len(VPN_STATE_ROOT) + 1:]
+        instance = remainder.split("/", 1)[0]
+        if instance == "amnezia-provision":
+            # Its external container/config is outside the host archive.
+            unverified = True
+        elif VPN_INSTANCE.fullmatch(instance):
+            instances.add(instance)
+        elif instance != ".lock":
+            unverified = True
+    ports: set[int] = set()
+    for instance in instances:
+        prefix = f"{VPN_STATE_ROOT}/{instance}/"
+        state_raw = contents.get(prefix + "state.json")
+        config_raw = contents.get(prefix + "server.conf")
+        if state_raw is None or config_raw is None:
+            unverified = True
+            continue
+        try:
+            state = json.loads(state_raw, object_pairs_hook=_unique)
+            config = config_raw.decode("ascii")
+        except (UnicodeError, ValueError):
+            unverified = True
+            continue
+        if (not isinstance(state, dict) or type(state.get("schema_version")) is not int or
+                state["schema_version"] != 1 or
+                state.get("name") != instance or type(state.get("port")) is not int or
+                not 1024 <= state["port"] <= 65535):
+            unverified = True
+            continue
+        if not config.startswith(
+                "# SovaGrid managed; edit with sovagrid_vpn.manage only\n[Interface]\n"):
+            unverified = True
+            continue
+        listen_lines = [line for line in config.splitlines()
+                        if line.lstrip().startswith("ListenPort")]
+        declared = ([int(match.group(1))] if len(listen_lines) == 1 and
+                    (match := VPN_LISTEN_PORT.fullmatch(listen_lines[0])) is not None
+                    else [])
+        if len(declared) != 1 or declared[0] != state["port"] or state["port"] in ports:
+            unverified = True
+            continue
+        ports.add(state["port"])
+    return sorted(ports), not unverified
 
 
 def verify(identity: str) -> dict:
@@ -711,7 +784,8 @@ def _docker_target() -> dict:
     images, containers, networks, volumes = inventories
     conflicts = (sum(re.match(r"^(?:(?:docker\.io/)?library/)?sovagrid-", name)
                      is not None for name in images) +
-                 sum(name.startswith("sovagrid-") for name in containers) +
+                 sum(name.startswith(("sovagrid_", "sovagrid-"))
+                     for name in containers) +
                  sum(name.startswith(("sovagrid_", "sovagrid-")) for name in networks) +
                  sum(name.startswith(("sovagrid_", "sovagrid-")) for name in volumes))
     try:
@@ -736,6 +810,28 @@ def _occupied_restore_ports() -> int | None:
             raise Refused("PORT_CHECK_UNAVAILABLE")
         port = int(match.group(1))
         if port in RESTORE_PORTS:
+            occupied.add(port)
+    return len(occupied)
+
+
+def _occupied_vpn_ports(ports: list[int]) -> int | None:
+    """Count archived WireGuard UDP ports held by any local UDP socket."""
+    if not ports:
+        return 0
+    raw = _read_command(["/usr/bin/ss", "-H", "-aun"])
+    if raw is None:
+        return None
+    occupied = set()
+    expected = set(ports)
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            raise Refused("PORT_CHECK_UNAVAILABLE")
+        match = re.search(r":([0-9]{1,5})\Z", fields[3])
+        if match is None or int(match.group(1)) > 65535:
+            raise Refused("PORT_CHECK_UNAVAILABLE")
+        port = int(match.group(1))
+        if port in expected:
             occupied.add(port)
     return len(occupied)
 
@@ -781,6 +877,8 @@ def portable_clean_plan(identity: str) -> dict:
         raise Refused("IMAGE_PAIR_INVALID")
     docker = _docker_target()
     ports = _occupied_restore_ports()
+    vpn_ports = (_occupied_vpn_ports(clean.get("vpn_udp_ports", []))
+                 if clean.get("vpn_ports_verified", True) else None)
     try:
         root_free = shutil.disk_usage(backup.ROOT).free
     except OSError as exc:
@@ -803,6 +901,12 @@ def portable_clean_plan(identity: str) -> dict:
         blockers.append("PORT_CHECK_UNAVAILABLE")
     elif ports:
         blockers.append("PORT_IN_USE")
+    if not clean.get("vpn_ports_verified", True):
+        blockers.append("VPN_PORT_UNVERIFIED")
+    elif vpn_ports is None:
+        blockers.append("PORT_CHECK_UNAVAILABLE")
+    elif vpn_ports:
+        blockers.append("PORT_IN_USE")
     if root_free < required_free or (docker["root_free_bytes"] is not None and
                                     docker["root_free_bytes"] < 4 * artifact["bytes"] +
                                     MIN_RESTORE_FREE):
@@ -815,11 +919,13 @@ def portable_clean_plan(identity: str) -> dict:
             "target_docker_available": docker["available"],
             "target_docker_architecture": docker["architecture"],
             "target_docker_conflicts": docker["conflicts"],
-            "target_ports_in_use": ports, "target_free_bytes": root_free,
+            "target_ports_in_use": ports, "target_vpn_ports_in_use": vpn_ports,
+            "target_free_bytes": root_free,
             "required_free_bytes": required_free,
             "target_empty": clean["target_empty"] and not docker["conflicts"] and
-                            ports == 0,
-            "apply_available": False, "blockers": blockers}
+                            ports == 0 and vpn_ports == 0 and
+                            clean.get("vpn_ports_verified", True),
+            "apply_available": False, "blockers": list(dict.fromkeys(blockers))}
 
 
 def _staging_root() -> tuple[Path, int]:

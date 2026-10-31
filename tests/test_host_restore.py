@@ -109,6 +109,41 @@ class RestoreInspectionTest(unittest.TestCase):
         self.assertEqual(result["entries"], len(self.entries))
         self.assertEqual(result["generated_bytecode_files"], 0)
         self.assertEqual(result["source_manifest_sha256"], self.source_sha)
+        self.assertEqual(result["vpn_udp_ports"], [])
+        self.assertTrue(result["vpn_ports_verified"])
+
+    def test_managed_vpn_port_is_bound_to_verified_state_and_server_config(self):
+        self.sources += (restore.backup.Source("/var/lib/sovagrid-vpn", kind="dir",
+                                              private=True, exact_mode=0o700, gid=0),)
+        state = json.dumps({"schema_version": 1, "name": "work", "port": 51820}).encode()
+        entries = self.entries + [
+            ("var/lib/sovagrid-vpn", "dir", b"", 0, 0, 0o700),
+            ("var/lib/sovagrid-vpn/work", "dir", b"", 0, 0, 0o700),
+            ("var/lib/sovagrid-vpn/work/state.json", "file", state, 0, 0, 0o600),
+            ("var/lib/sovagrid-vpn/work/server.conf", "file",
+             b"# SovaGrid managed; edit with sovagrid_vpn.manage only\n"
+             b"[Interface]\nListenPort = 51820\nPrivateKey = secret\n", 0, 0, 0o600),
+        ]
+        result = self.inspect(entries)
+        self.assertEqual(result["vpn_udp_ports"], [51820])
+        self.assertTrue(result["vpn_ports_verified"])
+        mismatch = [(*entry[:2], b"ListenPort = 51821\n", *entry[3:])
+                    if entry[0].endswith("server.conf") else entry for entry in entries]
+        result = self.inspect(mismatch)
+        self.assertEqual(result["vpn_udp_ports"], [])
+        self.assertFalse(result["vpn_ports_verified"])
+        missing = [entry for entry in entries if not entry[0].endswith("server.conf")]
+        self.assertFalse(self.inspect(missing)["vpn_ports_verified"])
+
+    def test_external_vpn_state_cannot_claim_port_preflight_complete(self):
+        self.sources += (restore.backup.Source("/var/lib/sovagrid-vpn", kind="dir",
+                                              private=True, exact_mode=0o700, gid=0),)
+        entries = self.entries + [
+            ("var/lib/sovagrid-vpn", "dir", b"", 0, 0, 0o700),
+            ("var/lib/sovagrid-vpn/amnezia-provision", "dir", b"", 0, 0, 0o700),
+            ("var/lib/sovagrid-vpn/amnezia-provision/state.json", "file", b"{}", 0, 0, 0o600),
+        ]
+        self.assertFalse(self.inspect(entries)["vpn_ports_verified"])
 
     def test_digest_of_archive_alone_cannot_authorize_unsafe_member(self):
         attacks = (
@@ -572,6 +607,18 @@ class RestoreInspectionTest(unittest.TestCase):
             self.assertEqual(result["blockers"], ["APPLY_NOT_IMPLEMENTED"])
             self.assertEqual(result["image_count"], 1)
             self.assertEqual(result["images_sha256"], "d" * 64)
+            clean["vpn_udp_ports"] = [51820]
+            clean["vpn_ports_verified"] = True
+            with patch.object(restore, "_occupied_vpn_ports", return_value=1):
+                vpn_blocked = restore.portable_clean_plan(identity)
+            self.assertFalse(vpn_blocked["target_empty"])
+            self.assertEqual(vpn_blocked["target_vpn_ports_in_use"], 1)
+            self.assertIn("PORT_IN_USE", vpn_blocked["blockers"])
+            clean["vpn_ports_verified"] = False
+            unverified = restore.portable_clean_plan(identity)
+            self.assertFalse(unverified["target_empty"])
+            self.assertIn("VPN_PORT_UNVERIFIED", unverified["blockers"])
+            clean["vpn_ports_verified"] = True
             docker["architecture"] = "arm64"
             docker["conflicts"] = 2
             with patch.object(restore, "_occupied_restore_ports", return_value=1):
@@ -614,6 +661,20 @@ class RestoreInspectionTest(unittest.TestCase):
                 "LISTEN 0 128 [::]:443 [::]:*\n"
                 "LISTEN 0 128 127.0.0.1:22 0.0.0.0:*\n")):
             self.assertEqual(restore._occupied_restore_ports(), 2)
+        with patch.object(restore, "_read_command", return_value=(
+                "UNCONN 0 0 0.0.0.0:51820 0.0.0.0:*\n"
+                "ESTAB 0 0 [::]:6000 [::]:7777\n")):
+            self.assertEqual(restore._occupied_vpn_ports([51820, 51821]), 1)
+        with patch.object(restore, "_read_command", return_value="UNCONN invalid\n"):
+            with self.assertRaisesRegex(restore.Refused, "PORT_CHECK_UNAVAILABLE"):
+                restore._occupied_vpn_ports([51820])
+        outputs = iter(("linux|x86_64|/var/lib/docker\n", "", "sovagrid_hub_1\n",
+                        "", ""))
+        with (patch.object(restore, "_read_command", side_effect=lambda *args, **kwargs:
+                           next(outputs)),
+              patch.object(restore.shutil, "disk_usage",
+                           return_value=SimpleNamespace(free=123456))):
+            self.assertEqual(restore._docker_target()["conflicts"], 1)
 
     def test_identity_plan_uses_archived_dynamic_gid_and_checks_nss(self):
         present = {"/etc/sovagrid/agent.json", "/etc/sovagrid/agent.token",
