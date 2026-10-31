@@ -34,6 +34,7 @@ MAX_TOTAL = 256 * 1024 * 1024
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 NAME = re.compile(r"[A-Za-z0-9_.-]+\Z")
 STAGE = re.compile(r"/opt/\.sovagrid-vpn-source-[0-9a-f]{32}\Z")
+BYTECODE = re.compile(r"(?:[A-Za-z0-9_.-]+/)*__pycache__/[A-Za-z0-9_.-]+\.cpython-[0-9]+\.pyc\Z")
 SOURCE_DEST = "/opt/sovagrid-src/sovagrid-vpn"
 PACKAGE_DEST = "/opt/sovagrid-vpn/sovagrid_vpn"
 STATE_DIR = "/var/lib/sovagrid/vpn-source"
@@ -176,17 +177,21 @@ class Installer:
         base = self.at(absolute)
         hashes = {}
         total = 0
+        visited = 0
         for parent, dirs, files in os.walk(base, followlinks=False):
             for name in dirs:
                 relative = (Path(parent) / name).relative_to(self.root).as_posix()
                 self._inspect("/" + relative, directory=True)
             for name in files:
                 relative = (Path(parent) / name).relative_to(base).as_posix()
-                need(len(hashes) < MAX_FILES and all(NAME.fullmatch(part) for part in relative.split("/")),
+                visited += 1
+                need(visited <= MAX_FILES and all(NAME.fullmatch(part) for part in relative.split("/")),
                      "STATE_CONFLICT")
                 raw = self._read(absolute + "/" + relative)
                 total += len(raw)
                 need(total <= MAX_TOTAL, "STATE_CONFLICT")
+                if BYTECODE.fullmatch(relative):
+                    continue  # Python's own cache is neither source nor a managed file.
                 hashes[relative] = digest(raw)
         return hashes
 

@@ -138,6 +138,18 @@ class SourceInstallTests(unittest.TestCase):
             self.installer.preview("b" * 64, source, {"amnezia_install.py": b"new module\n"})
         self.assertEqual(error.exception.code, "CONTROL_ACTIVE")
 
+    def test_python_bytecode_does_not_change_managed_source_hash(self):
+        self._install()
+        cache = self.root / "opt/sovagrid-vpn/sovagrid_vpn/__pycache__"
+        cache.mkdir()
+        (cache / "amnezia_install.cpython-311.pyc").write_bytes(b"compiled cache")
+        self.assertEqual(self.installer.preview("a" * 64, self.source,
+                                                self.package)["change"], "current")
+        (cache / "foreign.txt").write_text("foreign", encoding="utf-8")
+        with self.assertRaises(Refuse) as error:
+            self.installer.preview("a" * 64, self.source, self.package)
+        self.assertEqual(error.exception.code, "STATE_CONFLICT")
+
 
 if __name__ == "__main__":
     unittest.main()
