@@ -14,7 +14,6 @@ from pathlib import Path
 import pwd
 import re
 import select
-import shutil
 import subprocess
 import sys
 import time
@@ -56,14 +55,25 @@ def require(value: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
-def child_command(epoch: str) -> list[str]:
-    runuser = shutil.which("runuser")
-    require(runuser is not None, "runuser is unavailable")
-    return [runuser, "-u", "sovagrid", "--", "/usr/bin/env",
-            f"PYTHONPATH={SOURCE / 'sovagrid-agent'}",
-            "SOVAGRID_EXTERNAL_TRIAL_GATE=1",
-            f"SOVAGRID_EXTERNAL_TRIAL_EPOCH={epoch}",
-            "/usr/bin/python3", "-c", CHILD]
+def agent_environment(*, epoch: str | None = None) -> dict[str, str]:
+    service_user = pwd.getpwnam("sovagrid")
+    env = os.environ.copy()
+    env.update(HOME=service_user.pw_dir, USER=service_user.pw_name,
+               LOGNAME=service_user.pw_name, SHELL=service_user.pw_shell)
+    env["PYTHONPATH"] = str(SOURCE / "sovagrid-agent")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.pop("SOVAGRID_EXTERNAL_TRIAL_GATE", None)
+    env.pop("SOVAGRID_EXTERNAL_TRIAL_EPOCH", None)
+    if epoch is not None:
+        env["SOVAGRID_EXTERNAL_TRIAL_GATE"] = "1"
+        env["SOVAGRID_EXTERNAL_TRIAL_EPOCH"] = epoch
+    return env
+
+
+def agent_process_identity(uid: int, gid: int) -> dict:
+    # subprocess drops credentials directly before exec. Unlike runuser, this
+    # does not open a PAM/logind session on the busy disposable CI host.
+    return {"user": uid, "group": gid, "extra_groups": []}
 
 
 def main() -> None:
@@ -77,13 +87,14 @@ def main() -> None:
     uid, gid = pwd.getpwnam("sovagrid").pw_uid, grp.getgrnam("sovagrid").gr_gid
     require(not TRIAL_DIR.exists() and not TRIAL_DIR.is_symlink(),
             "A trial directory already exists on the disposable host")
-    runuser = shutil.which("runuser")
-    require(runuser is not None, "runuser is unavailable")
+    identity = agent_process_identity(uid, gid)
     imported = subprocess.run(
-        [runuser, "-u", "sovagrid", "--", "/usr/bin/env",
-         f"PYTHONPATH={SOURCE / 'sovagrid-agent'}", "/usr/bin/python3", "-c",
-         "from sovagrid_agent.trial_gate import ExternalTrialGate; print('TRIAL_CLIENT_IMPORT_OK')"],
-        capture_output=True, timeout=8, check=False)
+        ["/usr/bin/python3", "-B", "-c",
+         "import os; from sovagrid_agent.trial_gate import ExternalTrialGate; "
+         f"assert (os.geteuid(), os.getegid()) == ({uid}, {gid}); "
+         "assert 0 not in os.getgroups(); print('TRIAL_CLIENT_IMPORT_OK')"],
+        capture_output=True, timeout=12, check=False,
+        env=agent_environment(), **identity)
     require(imported.returncode == 0 and imported.stdout == b"TRIAL_CLIENT_IMPORT_OK\n",
             "Cannot import the pinned Agent trial client as its service user")
     # Importing verified source as root must not add an unmanifested .pyc.
@@ -96,8 +107,9 @@ def main() -> None:
 
     # A systemd ExecStart after a dead supervisor must fail before the Agent
     # creates HubClient. The child calls the same startup gate as __main__.
-    absent = subprocess.run(child_command("0" * 32), capture_output=True,
-                            timeout=8, check=False)
+    absent = subprocess.run(["/usr/bin/python3", "-B", "-c", CHILD], capture_output=True,
+                            timeout=8, check=False,
+                            env=agent_environment(epoch="0" * 32), **identity)
     require(absent.returncode != 0 and b"AGENT_TRIAL_READY" not in absent.stdout,
             "Agent started without a live trial supervisor")
 
@@ -116,8 +128,10 @@ def main() -> None:
     child = None
     try:
         server.start()
-        child = subprocess.Popen(child_command(server.epoch), stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        child = subprocess.Popen(["/usr/bin/python3", "-B", "-c", CHILD],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,
+                                 env=agent_environment(epoch=server.epoch), **identity)
         assert child.stdout is not None
         ready, _, _ = select.select([child.stdout], [], [], 7)
         require(bool(ready) and child.stdout.readline() == b"AGENT_TRIAL_READY\n",
