@@ -67,11 +67,12 @@ def check(mode: str) -> None:
     require(report["enabled"] is False and report["key_id"] is None and
             report["timer_installed"] is (mode == "installed") and
             report["timer_enabled"] is False and report["timer_active"] is False and
-            report["available_keys"] == {} and
+            report["available_keys"] == {
+                "sovagrid-2026-10": "abb6ed34e70fc1dd33d393987fb6067b4a69120eb3a5e00681f209e3666444bf"} and
             report["installed_manifest_sha256"] == hashlib.sha256(
                 Path("/opt/sovagrid-src/sovagrid-bundle.json").read_bytes()).hexdigest() and
             re.fullmatch(r"[0-9a-f]{64}", report["state_revision"]),
-            "status promised an active or trusted feed")
+            "status reported an active subscription or wrong pinned trust anchor")
     again = subprocess.run(["python3", "-I", str(SCRIPT), "status"],
                            check=True, capture_output=True, text=True, timeout=20)
     require(json.loads(again.stdout)["state_revision"] == report["state_revision"] and
