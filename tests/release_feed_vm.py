@@ -125,10 +125,11 @@ def legacy_guard(source: Path, outcome: str) -> None:
     preflight += "if (( release_feed_deferred )); then printf 'SG_VM_FEED_DEFERRED\\n'; fi\n"
     env = os.environ.copy()
     # Exercise the feed guard itself. Updater protections for the backup
-    # broker and SSH gateway precede it or follow it in run.sh; after those
-    # features are installed they must not mask this specific refusal.
+    # broker, SSH gateway and external Agent writer precede it or follow it
+    # in run.sh; installed features must not mask this specific refusal.
     env.update(SOVAGRID_PUBLIC_WEB_LOCK_HELD="1", SOVAGRID_UPDATER_TIMER_SNAPSHOT="1",
-               SOVAGRID_HUB_BACKUP_BROKER_SNAPSHOT="1", SOVAGRID_SSH_GATEWAY_SNAPSHOT="1")
+               SOVAGRID_HUB_BACKUP_BROKER_SNAPSHOT="1", SOVAGRID_SSH_GATEWAY_SNAPSHOT="1",
+               SOVAGRID_EXTERNAL_APPLY_UNIT_SNAPSHOT="1")
     env.pop("SOVAGRID_RELEASE_FEED_SNAPSHOT", None)
     result = subprocess.run(["bash", "-c", preflight], env=env, capture_output=True,
                             text=True, check=False, timeout=20)
