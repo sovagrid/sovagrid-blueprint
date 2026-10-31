@@ -179,6 +179,28 @@ def export_machine(state_dir: Path, state: dict, name: str, port: int) -> Path:
     require(not authorized.exists() and not authorized.is_symlink(), "Unexpected fixture root key")
     authorized.write_text(state["auth_line"] + "\n", encoding="ascii")
     authorized.chmod(0o600)
+    # Noble enables ssh.socket with a RequiredBy=ssh.service link. Masking the
+    # socket before disabling it leaves ssh.service dependent on a masked unit.
+    # Switch this disposable guest to the standalone service first.
+    command("systemctl", "--root=" + str(root), "disable", "ssh.socket")
+    socket_dependency = root / "etc/systemd/system/ssh.service.requires/ssh.socket"
+    require(not socket_dependency.exists() and not socket_dependency.is_symlink(),
+            "Ubuntu SSH service still requires the disabled socket")
+    for relative in ("ssh.service.d/00-socket.conf", "ssh.socket.d/addresses.conf"):
+        socket_dropin = root / "etc/systemd/system" / relative
+        if socket_dropin.exists() or socket_dropin.is_symlink():
+            require(socket_dropin.is_file() or socket_dropin.is_symlink(),
+                    "Unexpected Ubuntu SSH socket drop-in")
+            socket_dropin.unlink()
+    # nspawn mounts a fresh /run, so the directory created while building the
+    # Docker image is not guaranteed to exist when this service starts.
+    ssh_runtime_dropin = root / "etc/systemd/system/ssh.service.d/05-sovagrid-ci-runtime.conf"
+    require(not ssh_runtime_dropin.exists() and not ssh_runtime_dropin.is_symlink(),
+            "Unexpected disposable SSH runtime drop-in")
+    ssh_runtime_dropin.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    ssh_runtime_dropin.write_text("[Service]\nRuntimeDirectory=sshd\nRuntimeDirectoryMode=0755\n",
+                                  encoding="ascii")
+    ssh_runtime_dropin.chmod(0o644)
     # nspawn intentionally shares the runner network namespace so Docker's
     # private bridge reaches both SSH listeners. Guest boot services must not
     # manage its interfaces, DNS, kernel sysctls, modules or clock.
@@ -238,13 +260,23 @@ def start_machine(name: str, port: int) -> None:
         time.sleep(1)
     journal = command("journalctl", "-u", unit, "-n", "24", "--no-pager",
                       "--output=cat", check=False).stdout
+    registered = command("machinectl", "show", name, check=False).returncode == 0
+    ssh_status = (machine_command(name, "/usr/bin/systemctl", "status", "ssh.service",
+                                  "--no-pager", check=False) if registered else None)
+    ssh_dependencies = (machine_command(name, "/usr/bin/systemctl", "list-dependencies",
+                                        "ssh.service", "--no-pager", "--plain",
+                                        check=False) if registered else None)
     details = {
         "unit": command("systemctl", "show", unit,
                         "--property=ActiveState,SubState,Result,ExecMainStatus",
                         check=False).stdout.splitlines()[:8],
-        "registered": command("machinectl", "show", name, check=False).returncode == 0,
+        "registered": registered,
         "ssh_listener": command("ss", "-H", "-ltn", "sport = :" + str(port),
                                 check=False).stdout.splitlines()[:4],
+        "ssh_status": ((ssh_status.stdout + ssh_status.stderr)[-2200:].splitlines()[-16:]
+                       if ssh_status else []),
+        "ssh_dependencies": ((ssh_dependencies.stdout + ssh_dependencies.stderr)[-1200:].splitlines()[-12:]
+                             if ssh_dependencies else []),
         "boot_log": [line[-500:] for line in journal.splitlines()[-16:]],
     }
     print("INTEGRATED_NSPAWN_BOOT_DIAGNOSTIC " + json.dumps(details, sort_keys=True), flush=True)
