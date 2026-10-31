@@ -23,6 +23,13 @@ jobs:
           test -d /opt && test ! -L /opt
           sudo -n chown root:root /opt
           sudo -n chmod 0755 /opt
+          for directory in /usr/local /usr/local/bin; do
+            test -d "$directory" && test ! -L "$directory"
+            sudo -n chown root:root "$directory"
+            sudo -n chmod 0755 "$directory"
+          done
+          test ! -L /usr/local/libexec
+          sudo -n install -d -o root -g root -m 0755 /usr/local/libexec
           sudo -n systemctl start docker
       - uses: actions/checkout@v6
         with:
