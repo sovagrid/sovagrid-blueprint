@@ -552,9 +552,48 @@ def run(archive_sha256: str) -> None:
         return accepted
 
     current, old, review = _review(planner, archive_sha256)
+    trial_watch = []
+    trial_watch_errors = []
+    original_watch_start = planner.TrialWatchServer.start
+    original_watch_handle = planner.TrialWatchServer._handle
+
+    def record_watch_start(watch):
+        result = original_watch_start(watch)
+        trial_watch.append(watch)
+        return result
+
+    def record_watch_error(watch, connection):
+        try:
+            return original_watch_handle(watch, connection)
+        except (OSError, ValueError, planner.Refused) as exc:
+            code = str(exc)
+            trial_watch_errors.append(code if re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", code)
+                                      else type(exc).__name__)
+            raise
+
     with mock.patch.object(planner, "_normal_activation_ready", return_value=True), \
-         mock.patch.object(planner, "_trial_peer", recorded_peer):
-        result = planner.apply(archive_sha256, current, old, review)
+         mock.patch.object(planner, "_trial_peer", recorded_peer), \
+         mock.patch.object(planner.TrialWatchServer, "start", record_watch_start), \
+         mock.patch.object(planner.TrialWatchServer, "_handle", record_watch_error):
+        try:
+            result = planner.apply(archive_sha256, current, old, review)
+        except planner.Refused as exc:
+            watch = trial_watch[-1] if trial_watch else None
+            journal = subprocess.run(["journalctl", "-u", AGENT_UNIT, "-n", "200",
+                                      "-o", "cat", "--no-pager"], check=False,
+                                     capture_output=True, text=True, timeout=10).stdout
+            debug = {"code": str(exc), "watch_created": watch is not None,
+                     "watch_ready": watch.ready.is_set() if watch else False,
+                     "promotion_sent": watch._promotion_sent if watch else False,
+                     "normal_ready": watch.normal_ready.is_set() if watch else False,
+                     "ping_count": watch.ping_count if watch else 0,
+                     "watch_errors": trial_watch_errors[-8:],
+                     "agent_cycle_failures": journal.count("Agent cycle failed; retrying"),
+                     "metrics": _hub_counters()["metrics"],
+                     "jobs": _hub_counters()["jobs"],
+                     "checks": _hub_counters()["checks"]}
+            print("VM_TRIAL_DIAGNOSTIC:" + json.dumps(debug, sort_keys=True), flush=True)
+            raise
     require(result["applied"] is True and result["review_sha256"] == review,
             "internal apply did not finish")
     final_pid = _pid()
