@@ -279,7 +279,7 @@ def panel_probe(port: int) -> dict[str, str]:
     """Report only fixed route/status categories; never response or SSH data."""
     checks = (("health", "/healthz", 512),
               ("location", "/api/v1/panel-location", 512),
-              ("page", "/sovagrid/monitoring/", 16384),
+              ("page", "/sovagrid/monitoring/", 262144),
               ("manifest", "/sovagrid/monitoring/manifest.webmanifest", 8192))
     opener = build_opener(ProxyHandler({}), NoRedirect())
     result = {}

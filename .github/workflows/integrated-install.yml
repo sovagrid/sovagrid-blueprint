@@ -134,7 +134,7 @@ jobs:
           sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
           RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
           SOVAGRID_EXPECTED_MANIFEST="$SOVAGRID_EXPECTED_MANIFEST"
-          python3 sovagrid-blueprint/tests/integrated_external_agent_trial.py
+          python3 -B sovagrid-blueprint/tests/integrated_external_agent_trial.py
       - name: Enroll the second server through pinned Connect and verify continuing metrics
         env:
           CONNECT_REF: ${{ inputs.connect_ref }}

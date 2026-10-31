@@ -16,6 +16,7 @@ import re
 import select
 import shutil
 import subprocess
+import sys
 import time
 
 
@@ -85,6 +86,8 @@ def main() -> None:
         capture_output=True, timeout=8, check=False)
     require(imported.returncode == 0 and imported.stdout == b"TRIAL_CLIENT_IMPORT_OK\n",
             "Cannot import the pinned Agent trial client as its service user")
+    # Importing verified source as root must not add an unmanifested .pyc.
+    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location(
         "sovagrid_trial_integration", SOURCE / "sovagrid-blueprint/deploy/external_agent_update.py")
     assert spec and spec.loader
