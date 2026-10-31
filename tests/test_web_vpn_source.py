@@ -41,6 +41,7 @@ class FakeJobs:
 
 class FakeRPC:
     fail_cleanup_once = False
+    fail_stage_code = None
 
     def __init__(self):
         self._owner = object()
@@ -48,6 +49,8 @@ class FakeRPC:
         self.cleaned = []
 
     def stage_target(self, bundle, digest, *, checkpoint):
+        if type(self).fail_stage_code:
+            raise module.RPCError(type(self).fail_stage_code)
         stage = module.Stage("/var/tmp/sovagrid-agent-enroll." + "e" * 32,
                              SHA, MANIFEST, "d" * 64, "e" * 32, self._owner)
         self._stages[stage.stage_id] = stage
@@ -109,6 +112,7 @@ class WebVpnSourceTests(unittest.TestCase):
                                           private_key="", passphrase="")
         FakeTransport.instances.clear()
         FakeRPC.fail_cleanup_once = False
+        FakeRPC.fail_stage_code = None
 
     def _preview(self):
         return self.bridge.execute("preview", options=self.options,
@@ -142,6 +146,15 @@ class WebVpnSourceTests(unittest.TestCase):
                                 credential=self.credential, expected={})
         self.assertEqual(error.exception.code, "INVALID_REQUEST")
         self.assertEqual(FakeTransport.instances, [])
+
+    def test_safe_preflight_errors_keep_specific_guidance(self):
+        for code in ("ROOT_REQUIRED", "SOURCE_UNTRUSTED", "OWNERSHIP_CONFLICT", "BUSY"):
+            with self.subTest(code=code):
+                FakeRPC.fail_stage_code = code
+                with self.assertRaises(module.VpnSourceError) as error:
+                    self._preview()
+                self.assertEqual(error.exception.code, code)
+                self.assertFalse((self.directory / "vpn-source-stage.json").exists())
 
     def test_backup_accepts_only_bounded_private_stage_journal(self):
         path = host_backup.WEB_AGENT_DIR + "/vpn-source-stage.json"

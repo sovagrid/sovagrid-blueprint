@@ -254,5 +254,13 @@ class VpnSourceJobs:
                                 raise VpnSourceError("STAGE_CLEANUP_REQUIRED") from None
             except VpnSourceError:
                 raise
-            except (RPCError, TargetSSHError, OSError, ValueError, TypeError):
+            except RPCError as error:
+                if error.code in ("ROOT_REQUIRED", "SOURCE_UNTRUSTED", "OWNERSHIP_CONFLICT", "BUSY"):
+                    raise VpnSourceError(error.code) from None
+                if error.code == "STAGE_BUSY":
+                    raise VpnSourceError("BUSY") from None
+                if error.code in ("CLEANUP_REQUIRED", "STAGE_INCOMPLETE"):
+                    raise VpnSourceError("STAGE_CLEANUP_REQUIRED") from None
+                raise VpnSourceError("SSH_UNAVAILABLE") from None
+            except (TargetSSHError, OSError, ValueError, TypeError):
                 raise VpnSourceError("SSH_UNAVAILABLE") from None
