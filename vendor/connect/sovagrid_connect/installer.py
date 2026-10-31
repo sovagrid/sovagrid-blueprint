@@ -802,6 +802,10 @@ _STAGE_UPDATE_SCRIPT = _EXISTING_CHECKS + _STAGE_CANDIDATE_BODY
 
 
 class ServerInstaller:
+    # The embedded updater has no Hub writer/Agent quiescence barrier for
+    # unattended apply. Server-side signed updates use a separate worker.
+    automatic_apply_supported = False
+
     def __init__(
         self, options: ConnectionOptions, *,
         popen: Callable[..., subprocess.Popen] = subprocess.Popen,
@@ -1095,8 +1099,8 @@ class ServerInstaller:
         self._apply_update(prepared, expected_current_manifest=expected_current_manifest, mode="apply")
 
     def apply_automatic_update(self, prepared: PreparedUpdate, *, expected_current_manifest: str) -> None:
-        """Apply an approved pin only if the remote updater's idle gate passes."""
-        self._apply_update(prepared, expected_current_manifest=expected_current_manifest, mode="apply-auto")
+        """Refuse unattended local apply until the transaction barrier is complete."""
+        raise InstallError("Применение при простое через Connect пока недоступно; обновите сервер вручную или включите серверную подписку")
 
     def _apply_update(self, prepared: PreparedUpdate, *, expected_current_manifest: str, mode: str) -> None:
         if mode not in ("apply", "apply-auto"):

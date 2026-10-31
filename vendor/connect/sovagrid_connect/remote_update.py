@@ -81,11 +81,18 @@ ROUTING_UNIT = 'sovagrid-vpn-routing.service'
 ROUTING_ALL_UNITS = SERVICE_ALL_UNITS + (ROUTING_UNIT,)
 BACKUP_BROKER_UNITS = ('sovagrid-hub-backup-control.socket',
                        'sovagrid-hub-backup-control.service')
-UNITS = ROUTING_ALL_UNITS + BACKUP_BROKER_UNITS
+SSH_GATEWAY_UNITS = ROUTING_ALL_UNITS + BACKUP_BROKER_UNITS
+WEB_AGENT_UNITS = ('sovagrid-web-agent-control.socket',
+                   'sovagrid-web-agent-control.service')
+UNITS = SSH_GATEWAY_UNITS + WEB_AGENT_UNITS
 BACKUP_BROKER_MARKER = '/var/lib/sovagrid/.hub-backup-broker-managed-by-run-sh'
 BACKUP_BROKER_LEDGER = '/var/lib/sovagrid/backups/.broker-requests'
 SSH_GATEWAY_MARKER = '/var/lib/sovagrid/.ssh-gateway-managed-by-run-sh'
 SSH_GATEWAY_MARKER_CONTENT = b'SOVAGRID_SSH_GATEWAY_V1\n'
+WEB_AGENT_MARKER = '/var/lib/sovagrid/.web-agent-installer-managed-by-run-sh'
+WEB_AGENT_DIR = '/var/lib/sovagrid/web-agent'
+WEB_AGENT_JOURNAL = WEB_AGENT_DIR + '/jobs'
+WEB_AGENT_MARKER_CONTENT = b'SOVAGRID_WEB_AGENT_INSTALL_V1\n'
 BASE_COMPOSE_SERVICES = ('hub', 'web')
 SSH_GATEWAY_SERVICE = 'ssh-gateway'
 RELEASE_FEED_SNAPSHOT = BLUEPRINT_LEGACY_SNAPSHOT + (
@@ -109,15 +116,14 @@ HUB_BACKUP_SNAPSHOT = ROUTING_SNAPSHOT + (
     BACKUP_BROKER_LEDGER,
     *(f'/etc/systemd/system/{unit}' for unit in BACKUP_BROKER_UNITS),
 )
-SNAPSHOT = HUB_BACKUP_SNAPSHOT + (SSH_GATEWAY_MARKER,)
-# These later managed services are outside this embedded updater's rollback
-# snapshot. Refuse before staging or stopping anything until Connect carries
-# their complete transaction contract.
+SSH_GATEWAY_SNAPSHOT = HUB_BACKUP_SNAPSHOT + (SSH_GATEWAY_MARKER,)
+SNAPSHOT = SSH_GATEWAY_SNAPSHOT + (
+    WEB_AGENT_MARKER, WEB_AGENT_DIR,
+    *(f'/etc/systemd/system/{unit}' for unit in WEB_AGENT_UNITS),
+)
+# The external-Agent writer belongs to a separate Hub-only transaction
+# contract. Refuse before staging or stopping anything on those hosts.
 UNSNAPSHOTTED_SERVICE_PATHS = (
-    '/var/lib/sovagrid/.web-agent-installer-managed-by-run-sh',
-    '/var/lib/sovagrid/web-agent',
-    '/etc/systemd/system/sovagrid-web-agent-control.socket',
-    '/etc/systemd/system/sovagrid-web-agent-control.service',
     '/etc/sovagrid/.external-agent-apply-managed-by-run-sh',
     '/etc/systemd/system/sovagrid-external-agent-apply@.service',
     '/var/lib/sovagrid/external-agent-operations',
@@ -494,6 +500,19 @@ def candidate_features_compatible(source, flags):
                      'sovagrid-hub/sovagrid_hub/backup_broker.py'):
             if not (source / name).is_file():
                 fail('COMPAT')
+    if web_agent_managed():
+        if b'# SOVAGRID_WEB_AGENT_INSTALL_V1' not in script:
+            fail('COMPAT')
+        for name in ('compose.web-agent.yaml', 'web_agent_bundle.py',
+                     'web_agent_jobs.py', 'web_agent_service.py',
+                     'web_wireguard_control.py', 'web_amnezia_provision.py',
+                     *WEB_AGENT_UNITS):
+            if not (source / 'sovagrid-blueprint/deploy' / name).is_file():
+                fail('COMPAT')
+        for name in ('deploy/sovagrid-amnezia-provision',
+                     'sovagrid_vpn/amnezia_provision.py'):
+            if not (source / 'sovagrid-vpn' / name).is_file():
+                fail('COMPAT')
     if ssh_gateway_managed():
         gateway_required = (
             'sovagrid-web/Dockerfile.ssh-gateway',
@@ -597,6 +616,50 @@ def backup_broker_socket_ready():
             stat.S_IMODE(directory.st_mode) != 0o755 or
             not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_nlink != 1 or
             (endpoint.st_uid, endpoint.st_gid, stat.S_IMODE(endpoint.st_mode)) != (0, 10001, 0o660)):
+        fail('STATE')
+
+def web_agent_managed():
+    marker = path(WEB_AGENT_MARKER)
+    private = path(WEB_AGENT_DIR)
+    units = tuple(path('/etc/systemd/system/' + unit) for unit in WEB_AGENT_UNITS)
+    if not marker.exists() and not marker.is_symlink():
+        if any(item.exists() or item.is_symlink() for item in (private, *units)):
+            fail('STATE')
+        return False
+    if public_path(WEB_AGENT_MARKER, private=True, limit=128) != WEB_AGENT_MARKER_CONTENT:
+        fail('STATE')
+    if marker.lstat().st_gid != 0:
+        fail('STATE')
+    public_path(WEB_AGENT_DIR, directory=True, private=True)
+    if private.lstat().st_gid != 0:
+        fail('STATE')
+    journal = path(WEB_AGENT_JOURNAL)
+    if journal.exists() or journal.is_symlink():
+        public_path(WEB_AGENT_JOURNAL, directory=True, private=True)
+        if journal.lstat().st_gid != 0:
+            fail('STATE')
+    for unit in WEB_AGENT_UNITS:
+        item = path('/etc/systemd/system/' + unit)
+        if not item.is_file() or item.is_symlink():
+            fail('STATE')
+        info = item.lstat()
+        if info.st_gid != 0 or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o644:
+            fail('STATE')
+        public_path('/etc/systemd/system/' + unit, limit=8192)
+    return True
+
+def web_agent_socket_ready():
+    if not web_agent_managed():
+        return
+    try:
+        directory = path('/run/sovagrid-web-agent').lstat()
+        endpoint = path('/run/sovagrid-web-agent/control.sock').lstat()
+    except OSError:
+        fail('STATE')
+    if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != 0 or
+            stat.S_IMODE(directory.st_mode) != 0o755 or
+            not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_nlink != 1 or
+            (endpoint.st_uid, endpoint.st_gid, stat.S_IMODE(endpoint.st_mode)) != (0, 10005, 0o660)):
         fail('STATE')
 
 def public_web_overlay():
@@ -712,6 +775,38 @@ def public_web_lock():
         os.close(descriptor)
 
 @contextlib.contextmanager
+def web_agent_snapshot_lock():
+    """Wait for a reviewed enrollment to finish before freezing its journal."""
+    import fcntl
+    if not web_agent_managed():
+        yield
+        return
+    directory = path(WEB_AGENT_JOURNAL)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    public_path(WEB_AGENT_JOURNAL, directory=True, private=True)
+    if directory.lstat().st_gid != 0:
+        fail('STATE')
+    target = directory / '.enrollment-web-mutation'
+    descriptor = os.open(target, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        validate_lock(info)
+        if info.st_gid != 0 or info.st_nlink != 1:
+            fail('STATE')
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    fail('BUSY')
+                time.sleep(0.1)
+        yield
+    finally:
+        os.close(descriptor)
+
+@contextlib.contextmanager
 def service_setup_lock():
     """Keep setup from replacing policy or units during a rollback snapshot."""
     import fcntl
@@ -818,6 +913,11 @@ def compose_args(source, *, allow_missing_backup_overlay=False):
             args += ['-f', str(overlay)]
         elif not allow_missing_backup_overlay:
             fail('STATE')
+    if web_agent_managed():
+        overlay = source / 'sovagrid-blueprint/deploy/compose.web-agent.yaml'
+        if not overlay.is_file() or overlay.is_symlink():
+            fail('STATE')
+        args += ['-f', str(overlay)]
     public_overlay = public_web_overlay()
     local_overlay = local_web_overlay()
     if public_overlay and local_overlay:
@@ -936,6 +1036,11 @@ def health(source, expected_units):
         if command(['systemctl', 'is-active', '--quiet', unit], timeout=10, check=False):
             raise UpdateFailure('inactive unit: ' + unit)
     backup_broker_socket_ready()
+    if web_agent_managed():
+        for unit in WEB_AGENT_UNITS:
+            if command(['systemctl', 'is-active', '--quiet', unit], timeout=10, check=False):
+                raise UpdateFailure('inactive unit: ' + unit)
+        web_agent_socket_ready()
     services = compose_services()
     for service in services:
         result = subprocess.run(['docker', 'ps', '--filter', 'label=com.docker.compose.project=sovagrid',
@@ -976,6 +1081,35 @@ def health(source, expected_units):
     if not path('/var/lib/sovagrid/vpn/status.json').is_file():
         raise UpdateFailure('VPN inventory snapshot missing')
     source_manifest(source, allow_generated=True)
+
+def wait_recreated_container_health(images, *, timeout=40):
+    """Wait for recreated Hub and gateway healthchecks before rollback checks."""
+    targets = tuple(name for name in ('hub', SSH_GATEWAY_SERVICE) if name in images)
+    deadline = time.monotonic() + timeout
+    while targets:
+        pending = []
+        for service in targets:
+            result = subprocess.run(
+                ['docker', 'ps', '--filter', 'label=com.docker.compose.project=sovagrid',
+                 '--filter', 'label=com.docker.compose.service=' + service,
+                 '--format', '{{.ID}}'], capture_output=True, text=True, timeout=10, check=True)
+            ids = result.stdout.splitlines()
+            if len(ids) != 1:
+                raise UpdateFailure('missing recreated container: ' + service)
+            status = subprocess.run(
+                ['docker', 'inspect', '--format', '{{.State.Health.Status}}', ids[0]],
+                capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+            if status == 'healthy':
+                continue
+            if status not in ('starting', 'unhealthy'):
+                raise UpdateFailure('invalid recreated container health: ' + service)
+            pending.append(service)
+        if not pending:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise UpdateFailure('recreated container health timeout: ' + ','.join(pending))
+        time.sleep(min(1, remaining))
 
 def safe_snapshot_item(item):
     if not item.exists() and not item.is_symlink():
@@ -1141,10 +1275,12 @@ def remove_new_gateway_on_rollback(prior_ids=()):
 
 def rollback_layout(folder, state):
     layout = state.get('snapshot_layout', 'legacy')
-    if layout == 'ssh_gateway_v1':
+    if layout == 'web_agent_v1':
         return SNAPSHOT, UNITS, True
+    if layout == 'ssh_gateway_v1':
+        return SSH_GATEWAY_SNAPSHOT, SSH_GATEWAY_UNITS, True
     if layout == 'hub_backup_broker_v1':
-        return HUB_BACKUP_SNAPSHOT, UNITS, True
+        return HUB_BACKUP_SNAPSHOT, SSH_GATEWAY_UNITS, True
     if layout == 'routing_v1':
         return ROUTING_SNAPSHOT, ROUTING_ALL_UNITS, True
     if layout == 'service_control_v1':
@@ -1170,7 +1306,8 @@ def rollback_layout(folder, state):
 def restore(folder, state):
     errors = []
     snapshot, units, broker_owned = rollback_layout(folder, state)
-    broker_layout = state.get('snapshot_layout') in ('hub_backup_broker_v1', 'ssh_gateway_v1')
+    layout = state.get('snapshot_layout')
+    broker_layout = layout in ('hub_backup_broker_v1', 'ssh_gateway_v1', 'web_agent_v1')
     source = path('/opt/sovagrid-src')
     old_source = folder / 'source-before'
     try:
@@ -1181,13 +1318,15 @@ def restore(folder, state):
     except Exception as exc:
         errors.append('source: ' + str(exc))
     try:
+        if layout == 'web_agent_v1':
+            command(['systemctl', 'stop', *reversed(WEB_AGENT_UNITS)], timeout=40, check=False)
         if broker_layout:
             command(['systemctl', 'stop', *BACKUP_BROKER_UNITS], timeout=40, check=False)
         if broker_owned:
             command(['systemctl', 'stop', *reversed(SERVICE_UNITS)], timeout=40, check=False)
         args, env = rollback_stop_compose_args(source, folder, snapshot, state['phase'])
         command(args + ['stop'], timeout=120, check=False, env=env)
-        if (state.get('snapshot_layout') == 'ssh_gateway_v1' and
+        if (layout in ('ssh_gateway_v1', 'web_agent_v1') and
                 state['phase'] != 'preparing' and
                 SSH_GATEWAY_SERVICE not in state['images'] and 'gateway_before' in state):
             remove_new_gateway_on_rollback(state['gateway_before']['container_ids'])
@@ -1208,7 +1347,7 @@ def restore(folder, state):
     try:
         for service in state['images']:
             command(['docker', 'image', 'tag', state['images'][service], 'sovagrid-' + service + ':local'])
-        if (state.get('snapshot_layout') == 'ssh_gateway_v1' and
+        if (layout in ('ssh_gateway_v1', 'web_agent_v1') and
                 state['phase'] != 'preparing' and
                 SSH_GATEWAY_SERVICE not in state['images'] and 'gateway_before' in state):
             old_gateway_image = state['gateway_before']['image']
@@ -1230,12 +1369,17 @@ def restore(folder, state):
             command(['systemctl', 'start', BACKUP_BROKER_UNITS[0]], timeout=30)
         if broker_layout:
             backup_broker_socket_ready()
+        if (layout == 'web_agent_v1' and web_agent_managed() and
+                state['units'][WEB_AGENT_UNITS[0]]['active']):
+            command(['systemctl', 'start', WEB_AGENT_UNITS[0]], timeout=30)
+            web_agent_socket_ready()
         args, env = compose_args(source)
         command(args + ['up', '-d', '--no-build', '--force-recreate', *state['images']],
                 timeout=240, env=env)
+        wait_recreated_container_health(state['images'])
         for unit in units:
-            if unit == BACKUP_BROKER_UNITS[0]:
-                continue  # The socket was available before Hub's bind mount.
+            if unit in (BACKUP_BROKER_UNITS[0], WEB_AGENT_UNITS[0]):
+                continue  # Sockets were available before their container bind mounts.
             if unit == ROUTING_UNIT:
                 # Routing sync takes the VPN locks held by this update.
                 if state['units'].get(unit, {}).get('active') and \
@@ -1323,6 +1467,11 @@ def automatic_idle():
 def apply(candidate_digest, expected_manifest, *, automatic=False):
     import fcntl
     refuse_unsnapshotted_services()
+    # The embedded Connect worker does not hold Blueprint's Hub writer and
+    # Agent admission barriers. Defer unattended updates until those guards
+    # are synchronized; explicit manual updates retain their transaction.
+    if automatic:
+        fail('UPDATER_CONTRACT')
     if not re.fullmatch(r'[0-9a-f]{64}', expected_manifest):
         fail('VERSION')
     candidate_root = path('/opt/sovagrid-candidates')
@@ -1334,6 +1483,7 @@ def apply(candidate_digest, expected_manifest, *, automatic=False):
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         # Older Connect versions also take candidate before run.sh's public
         # lock. Preserve that order across versions to avoid a lock cycle.
+        operation_locks.enter_context(web_agent_snapshot_lock())
         operation_locks.enter_context(public_web_lock())
         operation_locks.enter_context(service_setup_lock())
         operation_locks.enter_context(managed_vpn_locks())
@@ -1390,13 +1540,14 @@ def apply(candidate_digest, expected_manifest, *, automatic=False):
         folder = transactions / (str(time.time_ns()) + '-' + candidate_digest[:12])
         folder.mkdir(mode=0o700)
         state = {'phase': 'preparing', 'old_manifest': old_manifest, 'candidate': candidate_digest,
-                 'snapshot_layout': 'ssh_gateway_v1',
+                 'snapshot_layout': 'web_agent_v1',
                  'images': images, 'units': unit_states, 'expected_units': expected_units,
                  'gateway_before': gateway_before}
         state_write(folder, state)
         try:
             for service in images:
                 command(['docker', 'image', 'tag', images[service], 'sovagrid-' + service + ':rollback-' + candidate_digest[:12]])
+            command(['systemctl', 'stop', *reversed(WEB_AGENT_UNITS)], timeout=40, check=False)
             command(['systemctl', 'stop', *BACKUP_BROKER_UNITS], timeout=40, check=False)
             command(['systemctl', 'stop', *reversed(SERVICE_UNITS)], timeout=40, check=False)
             args, env = compose_args(source)
@@ -1442,6 +1593,7 @@ def apply(candidate_digest, expected_manifest, *, automatic=False):
                 install_env['SOVAGRID_RELEASE_FEED_SNAPSHOT'] = '1'
                 install_env['SOVAGRID_HUB_BACKUP_BROKER_SNAPSHOT'] = '1'
                 install_env['SOVAGRID_SSH_GATEWAY_SNAPSHOT'] = '1'
+                install_env['SOVAGRID_WEB_AGENT_SNAPSHOT'] = '1'
                 command(['bash', str(source / 'sovagrid-blueprint/run.sh'), *flags], timeout=2700, stdout=output, env=install_env)
             refresh_service_units(folder / 'source-before', source, unit_states)
             emit('SG_APPLY_STAGE:CHECKING')
