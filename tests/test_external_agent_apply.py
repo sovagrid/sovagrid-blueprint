@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import errno
 import hashlib
 import importlib.util
 import io
@@ -145,6 +146,13 @@ class PromotionWireTests(unittest.TestCase):
                 server.request_release()
                 lines.append(f"PING 4 READY {server._promotion_nonce}")
                 lines.append(f"ACK RELEASE {server._promotion_nonce}")
+            if index == 7:
+                lines.extend((f"PING 5 READY {server._promotion_nonce}",
+                              f"PING 6 ACTIVE {server._promotion_nonce}",
+                              f"PING 7 ACTIVE {server._promotion_nonce}",
+                              f"ACK DETACH {server._promotion_nonce}"))
+            if index == 9:
+                server.request_detach()
             result = lines[index]
             index += 1
             return result
@@ -160,7 +168,31 @@ class PromotionWireTests(unittest.TestCase):
         self.assertEqual(wire[2], f"PROMOTE 1 {server._promotion_nonce}")
         self.assertEqual(wire[3:5], ["PONG 2", "PONG 3"])
         self.assertEqual(wire[5], f"RELEASE 4 {server._promotion_nonce}")
-        self.assertTrue(server.normal_ready.is_set() and server.released.is_set())
+        self.assertEqual(wire[6:8], ["PONG 5", "PONG 6"])
+        self.assertEqual(wire[8], f"DETACH 7 {server._promotion_nonce}")
+        self.assertTrue(server.normal_ready.is_set() and server.released.is_set() and
+                        server.dispatch_ready.is_set() and server.detached.is_set())
+
+    def test_active_before_release_and_detach_before_active_are_refused(self):
+        committed = {"value": True}
+        server = self.server(committed)
+        server.ready.set()
+        server.active = mock.Mock()
+        server.last_ping = time.monotonic()
+        server.request_promotion()
+        server._promotion_sent = True
+        server.normal_ready.set()
+        server.released.set()
+        with self.assertRaisesRegex(planner.Refused, "TRIAL_DETACH_NOT_READY"):
+            server.request_detach()
+        server.released.clear()
+        with mock.patch.object(planner, "_watch_peer", return_value=(456, 1001, 1001)), \
+             mock.patch.object(server, "_eligible", return_value=True), \
+             mock.patch.object(planner, "_watch_line",
+                               side_effect=[f"HELLO 1 {server.epoch}",
+                                            f"PING 0 ACTIVE {server._promotion_nonce}"]), \
+             self.assertRaisesRegex(planner.Refused, "TRIAL_WATCH_PROTOCOL"):
+            server._handle(server.active)
 
     def test_ready_before_promotion_or_wrong_nonce_is_refused(self):
         server = self.server({"value": False})
@@ -187,6 +219,99 @@ class PromotionWireTests(unittest.TestCase):
             server.request_release()
         committed["value"] = True
         server.request_release()
+
+
+class StaleRuntimeRecoveryTests(unittest.TestCase):
+    def fixture(self, root: Path, *, socket_result: int = errno.ECONNREFUSED):
+        gate = root / "gate"
+        watch = root / "watch"
+        gate.mkdir(mode=0o700)
+        watch.mkdir(mode=0o710)
+        for path in (gate / "trial.sock", watch / "gate.sock"):
+            path.write_bytes(b"")
+            path.chmod(0o600 if path.name == "trial.sock" else 0o660)
+        epoch = watch / "epoch.env"
+        epoch.write_text("SOVAGRID_EXTERNAL_TRIAL_EPOCH=" + "a" * 32 + "\n")
+        epoch.chmod(0o600)
+        original_lstat = Path.lstat
+
+        def socket_lstat(path):
+            info = original_lstat(path)
+            if path.name in {"trial.sock", "gate.sock"}:
+                return SimpleNamespace(st_mode=stat.S_IFSOCK | stat.S_IMODE(info.st_mode),
+                                       st_uid=info.st_uid, st_gid=info.st_gid,
+                                       st_nlink=info.st_nlink, st_ino=info.st_ino)
+            return info
+
+        probe = mock.Mock()
+        probe.__enter__ = mock.Mock(return_value=probe)
+        probe.__exit__ = mock.Mock(return_value=None)
+        probe.connect_ex.return_value = socket_result
+        properties = {"ActiveState": "inactive", "MainPID": "0"}
+        return gate, watch, epoch, socket_lstat, probe, properties
+
+    def cleanup(self, gate, watch):
+        planner._cleanup_stale_trial_runtime(
+            agent_stopped=lambda: True, owner=os.getuid(),
+            owner_group=os.getgid(), watch_group=os.getgid(),
+            gate_dir=gate, watch_dir=watch)
+
+    def test_sigkill_stale_sockets_and_epoch_are_removed_for_next_apply(self):
+        with tempfile.TemporaryDirectory() as folder:
+            gate, watch, epoch, fake_lstat, probe, properties = self.fixture(Path(folder))
+            with mock.patch.object(Path, "lstat", fake_lstat), \
+                 mock.patch.object(planner.socket, "socket", return_value=probe), \
+                 mock.patch.object(planner, "_external_unit_properties",
+                                   return_value=properties):
+                self.cleanup(gate, watch)
+            self.assertFalse((gate / "trial.sock").exists())
+            self.assertFalse((watch / "gate.sock").exists())
+            self.assertFalse(epoch.exists())
+            self.assertEqual(probe.connect_ex.call_count, 2)
+
+    def test_live_socket_is_never_removed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            gate, watch, _epoch, fake_lstat, probe, properties = self.fixture(
+                Path(folder), socket_result=0)
+            with mock.patch.object(Path, "lstat", fake_lstat), \
+                 mock.patch.object(planner.socket, "socket", return_value=probe), \
+                 mock.patch.object(planner, "_external_unit_properties",
+                                   return_value=properties), \
+                 self.assertRaisesRegex(planner.Refused, "TRIAL_RUNTIME_SOCKET_LIVE"):
+                self.cleanup(gate, watch)
+            self.assertTrue((gate / "trial.sock").exists())
+
+    def test_running_agent_prevents_stale_runtime_cleanup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            gate, watch, _epoch, fake_lstat, probe, properties = self.fixture(Path(folder))
+            with mock.patch.object(Path, "lstat", fake_lstat), \
+                 mock.patch.object(planner.socket, "socket", return_value=probe), \
+                 mock.patch.object(planner, "_external_unit_properties",
+                                   return_value=properties) as status, \
+                 self.assertRaisesRegex(planner.Refused,
+                                         "TRIAL_RUNTIME_AGENT_RUNNING"):
+                planner._cleanup_stale_trial_runtime(
+                    agent_stopped=lambda: False, owner=os.getuid(),
+                    owner_group=os.getgid(), watch_group=os.getgid(),
+                    gate_dir=gate, watch_dir=watch)
+            status.assert_not_called()
+            self.assertTrue((gate / "trial.sock").exists())
+
+    def test_symlink_epoch_is_refused_without_unlinking(self):
+        with tempfile.TemporaryDirectory() as folder:
+            gate = Path(folder) / "gate"
+            watch = Path(folder) / "watch"
+            gate.mkdir(mode=0o700)
+            watch.mkdir(mode=0o710)
+            target = Path(folder) / "outside"
+            target.write_text("sentinel")
+            (watch / "epoch.env").symlink_to(target)
+            with mock.patch.object(planner, "_external_unit_properties",
+                                   return_value={"ActiveState": "inactive",
+                                                 "MainPID": "0"}), \
+                 self.assertRaisesRegex(planner.Refused, "TRIAL_RUNTIME_PATH"):
+                self.cleanup(gate, watch)
+            self.assertEqual(target.read_text(), "sentinel")
 
 
 class FakeTransaction:
@@ -288,6 +413,7 @@ class ApplyCoordinatorTests(unittest.TestCase):
         self.baseline = {"files": {}}
         self.commands = []
         self.boot_gate_events = []
+        self.fail_dispatch = False
 
     def fixture(self, stack):
         def patched(obj, name, value):
@@ -361,11 +487,18 @@ class ApplyCoordinatorTests(unittest.TestCase):
                 closed=threading.Event(), close=lambda: None,
                 ready=threading.Event(), ping_count=3,
                 normal_ready=threading.Event(), released=threading.Event(),
+                dispatch_ready=threading.Event(), detached=threading.Event(),
                 last_ping=time.monotonic(), active=object())
             watcher.ready.set()
             watcher.normal_ready.set()
+            watcher.dispatch_ready.set()
             watcher.request_promotion = lambda: "0" * 32
             watcher.request_release = lambda: watcher.released.set()
+            watcher.request_detach = lambda: watcher.detached.set()
+            if self.fail_dispatch:
+                watcher.dispatch_ready.clear()
+                watcher.dispatch_ready.wait = lambda _timeout: False
+                watcher.request_detach = mock.Mock()
             watcher.start = lambda: watcher
             self.watcher = watcher
             return watcher
@@ -429,6 +562,21 @@ class ApplyCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.commands[-2:],
                          [("daemon-reload",), ("start", planner.EXTERNAL_AGENT_UNIT)])
 
+    def test_worker_start_failure_after_release_never_reports_success(self):
+        with contextlib.ExitStack() as stack:
+            self.fixture(stack)
+            self.fail_dispatch = True
+            with self.assertRaisesRegex(planner.Refused,
+                                        "NORMAL_DISPATCH_READY_MISSING"):
+                planner.apply(ARCHIVE, CURRENT, OLD, REVIEW)
+            self.watcher.request_detach.assert_not_called()
+        self.assertEqual(self.transaction.events,
+                         ["prepare", "switch", "trial", "commit", "finalize"])
+        self.assertEqual(self.commands[-3:],
+                         [("stop", planner.EXTERNAL_AGENT_UNIT),
+                          ("daemon-reload",), ("start", planner.EXTERNAL_AGENT_UNIT),
+                          ])
+
     def test_missing_boot_gate_prevents_journal_and_stop(self):
         with contextlib.ExitStack() as stack:
             self.fixture(stack)
@@ -461,6 +609,18 @@ class ApplyCoordinatorTests(unittest.TestCase):
 
 
 class RecoveryWindowTests(unittest.TestCase):
+    def test_boot_recovery_rejects_live_cgroup_even_with_zero_main_pid(self):
+        properties = {"ActiveState": "activating", "MainPID": "0",
+                      "ControlGroup": "/system.slice/sovagrid-agent.service"}
+        with mock.patch.object(planner, "_external_unit_properties",
+                               return_value=properties), \
+             mock.patch.object(planner, "_cgroup_empty", return_value=False):
+            self.assertFalse(planner._agent_stopped_for_recovery())
+        with mock.patch.object(planner, "_external_unit_properties",
+                               return_value=properties), \
+             mock.patch.object(planner, "_cgroup_empty", return_value=True):
+            self.assertTrue(planner._agent_stopped_for_recovery())
+
     def test_boot_recovery_disables_temporary_unit_only_after_journal_clears(self):
         enrollment = mock.Mock(files=mock.Mock())
         enrollment.locked.return_value = contextlib.nullcontext()
@@ -473,6 +633,8 @@ class RecoveryWindowTests(unittest.TestCase):
                                side_effect=lambda _path: os.open(os.devnull, os.O_RDONLY)), \
              mock.patch.object(planner.remote, "Enrollment", return_value=enrollment), \
              mock.patch.object(planner.recovery, "Recovery", return_value=transaction), \
+             mock.patch.object(planner, "_agent_stopped_for_recovery",
+                               return_value=True), \
              mock.patch.object(planner.subprocess, "run",
                                return_value=SimpleNamespace(returncode=1)), \
              mock.patch.object(planner, "_disable_recovery_unit") as disable:

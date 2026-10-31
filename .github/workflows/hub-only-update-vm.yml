@@ -24,6 +24,12 @@ on:
       - 'tests/release_feed_vm.py'
       - '.github/workflows/hub-only-update-vm.yml'
   workflow_dispatch:
+    inputs:
+      external_agent_apply:
+        description: Run the destructive external Agent apply trial on this disposable VM
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -68,10 +74,34 @@ jobs:
           mkdir "$RUNNER_TEMP/sovagrid-published-source"
           tar -xzf "$RUNNER_TEMP/sovagrid-0.3.9-published.tar.gz" \
             -C "$RUNNER_TEMP/sovagrid-published-source" --no-same-owner
+      - name: Build an opt-in candidate with the trial-capable Agent
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.external_agent_apply }}
+        env:
+          AGENT_COMMIT: 1085a14a7c0c654a5a6ec16edd028dea1c543c8e
+        run: |
+          git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/sovagrid-agent" \
+            fetch --no-tags origin "$AGENT_COMMIT"
+          git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/sovagrid-agent" \
+            checkout --quiet --detach "$AGENT_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/sovagrid-agent" rev-parse HEAD)" = "$AGENT_COMMIT"
+          python3 "$RUNNER_TEMP/sovagrid-candidate-workspace/sovagrid-blueprint/package_server.py" \
+            "$RUNNER_TEMP/sovagrid-external-agent-candidate.tar.gz"
+          mv "$RUNNER_TEMP/sovagrid-external-agent-candidate.tar.gz" \
+            "$RUNNER_TEMP/sovagrid-candidate.tar.gz"
+          mkdir "$RUNNER_TEMP/sovagrid-candidate-source"
+          tar -xzf "$RUNNER_TEMP/sovagrid-candidate.tar.gz" \
+            -C "$RUNNER_TEMP/sovagrid-candidate-source" --no-same-owner
       - name: Seed and pin an independent external Agent and two transport units
+        env:
+          EXTERNAL_AGENT_APPLY: ${{ inputs.external_agent_apply || false }}
         run: |
           sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 \
             python3 tests/promotion_vm.py seed "$RUNNER_TEMP/sovagrid-published-source"
+          if [ "$EXTERNAL_AGENT_APPLY" = true ]; then
+            sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_EXTERNAL_APPLY_VM_FIXTURE=1 \
+              python3 tests/integrated_external_agent_apply_vm.py seed \
+              "$RUNNER_TEMP/sovagrid-candidate-source"
+          fi
           old_manifest=$(sha256sum "$RUNNER_TEMP/sovagrid-published-source/sovagrid-bundle.json" | cut -d ' ' -f1)
           sudo python3 "$RUNNER_TEMP/sovagrid-published-source/sovagrid-blueprint/deploy/promote_agent_only.py" \
             prepare --manifest-sha256 "$old_manifest"
@@ -221,3 +251,9 @@ jobs:
           sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_RELEASE_FEED_VM_FIXTURE=1 \
             python3 tests/release_feed_vm.py installed
           test ! -e /etc/systemd/system/sovagrid-auto-update.timer
+      - name: Exercise external Agent apply and boot recovery on the disposable VM
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.external_agent_apply }}
+        run: |
+          candidate_sha=$(sha256sum "$RUNNER_TEMP/sovagrid-candidate.tar.gz" | cut -d ' ' -f1)
+          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_EXTERNAL_APPLY_VM_FIXTURE=1 \
+            python3 tests/integrated_external_agent_apply_vm.py run "$candidate_sha"

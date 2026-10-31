@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import errno
 import fcntl
 import grp
 import hashlib
@@ -170,10 +171,13 @@ class TrialWatchServer:
         self.ping_count = 0
         self.normal_ready = threading.Event()
         self.released = threading.Event()
+        self.dispatch_ready = threading.Event()
+        self.detached = threading.Event()
         self._state_lock = threading.Lock()
         self._promotion_nonce: str | None = None
         self._promotion_sent = False
         self._release_requested = False
+        self._detach_requested = False
 
     def request_promotion(self) -> str:
         """Ask the exact trial Agent for a read-only normal configuration test."""
@@ -196,6 +200,18 @@ class TrialWatchServer:
                  not self._release_requested and not self.closed.is_set(),
                  "TRIAL_RELEASE_NOT_READY")
             self._release_requested = True
+
+    def request_detach(self) -> None:
+        """Detach the watchdog only after the same Agent starts normal dispatch."""
+        with self._state_lock:
+            committed = self.committed_current()
+            need(type(committed) is bool and committed and
+                 self.released.is_set() and self.dispatch_ready.is_set() and
+                 self.active is not None and self.last_ping is not None and
+                 time.monotonic() - self.last_ping < 3 and
+                 not self._detach_requested and not self.closed.is_set(),
+                 "TRIAL_DETACH_NOT_READY")
+            self._detach_requested = True
 
     def _directory(self) -> None:
         info = self.directory.lstat()
@@ -319,12 +335,23 @@ class TrialWatchServer:
                     response = f"PROMOTE {sequence} {nonce}\n"
                     self._promotion_sent = True
                 elif nonce is not None and line == f"PING {sequence} READY {nonce}":
+                    need(not self.dispatch_ready.is_set(), "TRIAL_WATCH_PROTOCOL")
                     self.normal_ready.set()
-                    if self._release_requested:
+                    if self._release_requested and not self.released.is_set():
                         committed = self.committed_current()
                         need(type(committed) is bool and committed,
                              "TRIAL_RELEASE_NOT_READY")
                         response = f"RELEASE {sequence} {nonce}\n"
+                    else:
+                        response = f"PONG {sequence}\n"
+                elif nonce is not None and line == f"PING {sequence} ACTIVE {nonce}":
+                    need(self.released.is_set(), "TRIAL_WATCH_PROTOCOL")
+                    self.dispatch_ready.set()
+                    if self._detach_requested:
+                        committed = self.committed_current()
+                        need(type(committed) is bool and committed,
+                             "TRIAL_DETACH_NOT_READY")
+                        response = f"DETACH {sequence} {nonce}\n"
                     else:
                         response = f"PONG {sequence}\n"
                 else:
@@ -332,6 +359,7 @@ class TrialWatchServer:
                          not self.normal_ready.is_set(), "TRIAL_WATCH_PROTOCOL")
                     response = f"PONG {sequence}\n"
                 releasing = response.startswith("RELEASE ")
+                detaching = response.startswith("DETACH ")
             connection.sendall(response.encode("ascii"))
             self.last_ping = time.monotonic()
             sequence += 1
@@ -341,6 +369,10 @@ class TrialWatchServer:
                 need(_watch_line(connection) == f"ACK RELEASE {nonce}",
                      "TRIAL_WATCH_PROTOCOL")
                 self.released.set()
+            if detaching:
+                need(_watch_line(connection) == f"ACK DETACH {nonce}",
+                     "TRIAL_WATCH_PROTOCOL")
+                self.detached.set()
                 self.close()
                 return
 
@@ -790,11 +822,7 @@ def recover_pending() -> dict:
         transaction = recovery.Recovery(enrollment.files)
 
         def stopped() -> bool:
-            status = subprocess.run(["/usr/bin/systemctl", "is-active", "--quiet",
-                                     "sovagrid-agent.service"],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    timeout=10, check=False)
-            return status.returncode != 0
+            return _agent_stopped_for_recovery()
 
         changed = transaction.recover_pending(agent_stopped=stopped)
         if changed:
@@ -802,8 +830,97 @@ def recover_pending() -> dict:
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            timeout=30, check=True)
         need(transaction._load_journal() is None, "RECOVERY_PENDING")
+        _cleanup_stale_trial_runtime(agent_stopped=stopped)
         _disable_recovery_unit()
     return {"protocol": 1, "recovered": changed}
+
+
+def _agent_stopped_for_recovery() -> bool:
+    """Accept a queued systemd start job only before its Agent process runs."""
+    properties = _external_unit_properties(allow_reload=True)
+    if (properties["ActiveState"] not in ("inactive", "failed", "activating") or
+            properties["MainPID"] != "0"):
+        return False
+    cgroup = properties["ControlGroup"] or "/system.slice/sovagrid-agent.service"
+    return _cgroup_empty(cgroup)
+
+
+def _cleanup_stale_trial_runtime(*, agent_stopped,
+                                 owner: int = 0, owner_group: int = 0,
+                                 watch_group: int | None = None,
+                                 watch_dir: Path = TRIAL_WATCH_DIR,
+                                 gate_dir: Path = Path(recovery.TRIAL_GATE_DIR)) -> None:
+    """Remove supervisor sockets left by SIGKILL after locked boot recovery.
+
+    The caller must hold the promotion, candidate and enrollment locks, prove
+    there is no trial journal, and only invoke this after a failed live trial
+    permit. A listening socket or unexpected inode is never unlinked.
+    """
+    paths = ((Path(gate_dir), "trial.sock", 0o700, owner_group,
+              (("trial.sock", "socket", 0o600, owner_group),)),
+             (Path(watch_dir), "gate.sock", 0o710, watch_group,
+              (("gate.sock", "socket", 0o660, watch_group),
+               ("epoch.env", "regular", 0o600, owner_group))))
+    present = any(os.path.lexists(directory / item[0])
+                  for directory, _name, _mode, _group, items in paths
+                  for item in items)
+    if not present:
+        return
+    need(agent_stopped(), "TRIAL_RUNTIME_AGENT_RUNNING")
+    properties = _external_unit_properties(allow_reload=True)
+    need(properties["ActiveState"] in ("inactive", "failed", "activating") and
+         properties["MainPID"] == "0", "TRIAL_RUNTIME_AGENT_RUNNING")
+    if watch_group is None:
+        try:
+            watch_group = grp.getgrnam("sovagrid").gr_gid
+        except KeyError:
+            raise Refused("TRIAL_RUNTIME_PATH") from None
+    verified: list[tuple[Path, os.stat_result, list[tuple[Path, os.stat_result]]]] = []
+    for directory, _name, mode, group, items in paths:
+        group = watch_group if group is None else group
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            need(not any(os.path.lexists(directory / item[0]) for item in items),
+                 "TRIAL_RUNTIME_PATH")
+            continue
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == owner and
+             info.st_gid == group and stat.S_IMODE(info.st_mode) == mode,
+             "TRIAL_RUNTIME_PATH")
+        entries: list[tuple[Path, os.stat_result]] = []
+        for name, kind, file_mode, file_group in items:
+            file_group = watch_group if file_group is None else file_group
+            path = directory / name
+            try:
+                entry = path.lstat()
+            except FileNotFoundError:
+                continue
+            need(entry.st_uid == owner and entry.st_gid == file_group and
+                 entry.st_nlink == 1 and stat.S_IMODE(entry.st_mode) == file_mode and
+                 (stat.S_ISSOCK(entry.st_mode) if kind == "socket" else
+                  stat.S_ISREG(entry.st_mode) and entry.st_size <= 128),
+                 "TRIAL_RUNTIME_PATH")
+            if kind == "socket":
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(0.2)
+                    outcome = probe.connect_ex(str(path))
+                need(outcome == errno.ECONNREFUSED, "TRIAL_RUNTIME_SOCKET_LIVE")
+            entries.append((path, entry))
+        verified.append((directory, info, entries))
+    for directory, info, entries in verified:
+        for path, entry in entries:
+            current = path.lstat()
+            need(current.st_ino == entry.st_ino and
+                 current.st_mode == entry.st_mode and
+                 current.st_uid == entry.st_uid and
+                 current.st_gid == entry.st_gid, "TRIAL_RUNTIME_PATH")
+            path.unlink()
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            need(os.fstat(descriptor).st_ino == info.st_ino, "TRIAL_RUNTIME_PATH")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _live_trial_permit(operation: str) -> bool:
@@ -2008,6 +2125,11 @@ def apply(archive_sha256: str, current_manifest_sha256: str,
                                      full=True), "TRIAL_AGENT_CHANGED")
                     watch.request_release()
                     need(watch.released.wait(10), "RELEASE_ACK_MISSING")
+                    need(watch.dispatch_ready.wait(30) and
+                         trial_healthy(), "NORMAL_DISPATCH_READY_MISSING")
+                    lease.assert_held(fresh=True)
+                    watch.request_detach()
+                    need(watch.detached.wait(10), "DETACH_ACK_MISSING")
                     transaction.finalize_committed()
                     _systemctl("daemon-reload")
                     observed_sha, _manifest_value, _state = _external_snapshot_locked(enrollment)
@@ -2027,8 +2149,14 @@ def apply(archive_sha256: str, current_manifest_sha256: str,
                         journal = transaction._load_journal()
                         if (journal is not None and journal["phase"] == "committed" and
                                 watch is not None and watch.released.is_set()):
-                            # The normal Agent is already released. Retry
-                            # idempotent cleanup without stopping it.
+                            # Commit is durable. If the same Agent never proved
+                            # normal dispatch and detached, stop it before
+                            # removing the trial guard and retry normal start.
+                            if not watch.detached.is_set():
+                                _systemctl("stop", EXTERNAL_AGENT_UNIT, timeout=60)
+                                need(_agent_fully_stopped(stop_proof.cgroup),
+                                     "AGENT_STOP_UNPROVEN")
+                                restart = "new"
                             transaction.finalize_committed()
                             _systemctl("daemon-reload")
                         else:
