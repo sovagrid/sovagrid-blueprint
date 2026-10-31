@@ -353,8 +353,7 @@ def seed(candidate: Path, old_agent_source: Path) -> None:
                                "[Install]\nWantedBy=multi-user.target\n").encode())
     dropin = Path("/etc/systemd/system/sovagrid-agent.service.d/10-tunnel.conf")
     write_root_file(dropin, b"[Unit]\nWants=sovagrid-agent-tunnel.service\n"
-                            b"After=sovagrid-agent-tunnel.service\n"
-                            b"[Service]\nEnvironment=PYTHONDONTWRITEBYTECODE=1\n")
+                            b"After=sovagrid-agent-tunnel.service\n")
     dropin.parent.chmod(0o755)
 
     HUB_ROOT.mkdir(mode=0o700)
