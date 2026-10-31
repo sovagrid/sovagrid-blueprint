@@ -9,6 +9,8 @@ selected server bundle is still trusted code: its run.sh runs as root.
 """
 
 REMOTE_SCRIPT = r'''
+import base64
+import binascii
 import contextlib
 import grp
 import hashlib
@@ -108,6 +110,18 @@ HUB_BACKUP_SNAPSHOT = ROUTING_SNAPSHOT + (
     *(f'/etc/systemd/system/{unit}' for unit in BACKUP_BROKER_UNITS),
 )
 SNAPSHOT = HUB_BACKUP_SNAPSHOT + (SSH_GATEWAY_MARKER,)
+# These later managed services are outside this embedded updater's rollback
+# snapshot. Refuse before staging or stopping anything until Connect carries
+# their complete transaction contract.
+UNSNAPSHOTTED_SERVICE_PATHS = (
+    '/var/lib/sovagrid/.web-agent-installer-managed-by-run-sh',
+    '/var/lib/sovagrid/web-agent',
+    '/etc/systemd/system/sovagrid-web-agent-control.socket',
+    '/etc/systemd/system/sovagrid-web-agent-control.service',
+    '/etc/sovagrid/.external-agent-apply-managed-by-run-sh',
+    '/etc/systemd/system/sovagrid-external-agent-apply@.service',
+    '/var/lib/sovagrid/external-agent-operations',
+)
 MAX_BACKUP = 4 * 1024**3
 MAX_FAILURE_LOG = 2 * 1024**2
 MAX_FAILURE_LOGS = 5
@@ -885,18 +899,36 @@ def browser_ssh_route_health():
     with urllib.request.urlopen(request, timeout=12) as response:
         if response.status != 200:
             raise UpdateFailure('browser SSH route failed')
-        raw = response.read(513)
-    if len(raw) > 512:
+        raw = response.read(16 * 1024 + 1)
+    if len(raw) > 16 * 1024:
         raise UpdateFailure('browser SSH route reply too large')
     try:
         data = json.loads(raw)
     except (ValueError, UnicodeDecodeError) as exc:
         raise UpdateFailure('browser SSH route reply invalid') from exc
-    if (not isinstance(data, dict) or set(data) != {'protocol', 'port', 'key_type', 'fingerprint'} or
-            data['protocol'] != 1 or type(data['port']) is not int or not 1 <= data['port'] <= 65535 or
-            not isinstance(data['key_type'], str) or not data['key_type'] or
+    if (not isinstance(data, dict) or set(data) !=
+            {'protocol', 'port', 'key_type', 'fingerprint', 'host_key_blob'} or
+            type(data['protocol']) is not int or data['protocol'] != 1 or
+            type(data['port']) is not int or not 1 <= data['port'] <= 65535 or
+            not isinstance(data['key_type'], str) or
+            re.fullmatch(r'[A-Za-z0-9@._-]{4,96}', data['key_type']) is None or
             not isinstance(data['fingerprint'], str) or
-            re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', data['fingerprint']) is None):
+            re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', data['fingerprint']) is None or
+            not isinstance(data['host_key_blob'], str) or
+            not 12 <= len(data['host_key_blob']) <= 10924):
+        raise UpdateFailure('browser SSH route reply invalid')
+    try:
+        key = base64.b64decode(data['host_key_blob'], validate=True)
+    except binascii.Error as exc:
+        raise UpdateFailure('browser SSH route reply invalid') from exc
+    if (not 8 <= len(key) <= 8192 or
+            base64.b64encode(key).decode('ascii') != data['host_key_blob']):
+        raise UpdateFailure('browser SSH route reply invalid')
+    kind_length = int.from_bytes(key[:4], 'big')
+    if (not 4 <= kind_length <= 96 or 4 + kind_length > len(key) or
+            key[4:4 + kind_length].decode('ascii', errors='replace') != data['key_type'] or
+            'SHA256:' + base64.b64encode(hashlib.sha256(key).digest()).decode('ascii').rstrip('=') !=
+            data['fingerprint']):
         raise UpdateFailure('browser SSH route reply invalid')
 
 def health(source, expected_units):
@@ -1251,7 +1283,12 @@ def inspect_state():
     health(source, expected)
     return source, manifest, commits, flags, expected
 
+def refuse_unsnapshotted_services():
+    if any(os.path.lexists(path(item)) for item in UNSNAPSHOTTED_SERVICE_PATHS):
+        fail('UPDATER_CONTRACT')
+
 def preview():
+    refuse_unsnapshotted_services()
     source, digest, commits, flags, expected = inspect_state()
     emit('SG_CURRENT_MANIFEST:' + digest)
     for name in sorted(commits):
@@ -1285,6 +1322,7 @@ def automatic_idle():
 
 def apply(candidate_digest, expected_manifest, *, automatic=False):
     import fcntl
+    refuse_unsnapshotted_services()
     if not re.fullmatch(r'[0-9a-f]{64}', expected_manifest):
         fail('VERSION')
     candidate_root = path('/opt/sovagrid-candidates')
