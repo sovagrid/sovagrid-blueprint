@@ -280,3 +280,39 @@ jobs:
           candidate_sha=$(sha256sum "$RUNNER_TEMP/sovagrid-candidate.tar.gz" | cut -d ' ' -f1)
           sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_EXTERNAL_APPLY_VM_FIXTURE=1 \
             python3 tests/integrated_external_agent_apply_vm.py run "$candidate_sha"
+      - name: Report bounded installer diagnostics from the disposable VM
+        if: ${{ failure() }}
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          sudo -n python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path('/opt/sovagrid-candidates/failure-logs')
+          if not root.is_dir() or root.is_symlink():
+              print('No saved installer log')
+              raise SystemExit(0)
+          files = sorted(root.glob('install-*.log'), key=lambda item: item.stat().st_mtime_ns)
+          if not files:
+              print('No saved installer log')
+              raise SystemExit(0)
+          log = files[-1]
+          if log.is_symlink() or not log.is_file() or log.stat().st_size > 4 * 1024 * 1024:
+              print('Saved installer log unavailable')
+              raise SystemExit(0)
+
+          def safe(line):
+              line = line.replace('\r', ' ').replace('\n', ' ')
+              line = re.sub(r'https?://\S+', '[url]', line)
+              line = re.sub(r'(?i)(bearer|token|password|secret)[^ ]*', '[redacted]', line)
+              line = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '[ip]', line)
+              line = re.sub(r'[A-Za-z0-9_+/=-]{24,}', '[redacted]', line)
+              return line[:240]
+
+          lines = log.read_text(errors='replace').splitlines()
+          selected = [line for line in lines if line.startswith('SovaGrid:')][-16:]
+          selected.extend(lines[-8:])
+          for line in selected:
+              print('Installer diagnostic:', safe(line))
+          PY
