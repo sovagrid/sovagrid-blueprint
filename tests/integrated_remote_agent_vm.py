@@ -218,6 +218,7 @@ def start_machine(name: str, port: int) -> None:
             "--console=read-only", "--drop-capability=CAP_NET_ADMIN,CAP_SYS_TIME",
             "--link-journal=no", "--resolv-conf=replace-host")
     deadline = time.monotonic() + 75
+    unit = machine_unit(name)
     while time.monotonic() < deadline:
         if machine_command(name, "/usr/bin/systemctl", "is-active", "--quiet", "ssh.service",
                            check=False).returncode == 0:
@@ -230,7 +231,23 @@ def start_machine(name: str, port: int) -> None:
             require(listeners == {f"{COMPOSE_GATEWAY}:{port}"},
                     "Disposable Ubuntu SSH escaped its private bridge listener")
             return
+        state = command("systemctl", "show", unit, "--property=ActiveState", "--value",
+                        check=False).stdout.strip()
+        if state in ("failed", "inactive"):
+            break
         time.sleep(1)
+    journal = command("journalctl", "-u", unit, "-n", "24", "--no-pager",
+                      "--output=cat", check=False).stdout
+    details = {
+        "unit": command("systemctl", "show", unit,
+                        "--property=ActiveState,SubState,Result,ExecMainStatus",
+                        check=False).stdout.splitlines()[:8],
+        "registered": command("machinectl", "show", name, check=False).returncode == 0,
+        "ssh_listener": command("ss", "-H", "-ltn", "sport = :" + str(port),
+                                check=False).stdout.splitlines()[:4],
+        "boot_log": [line[-500:] for line in journal.splitlines()[-16:]],
+    }
+    print("INTEGRATED_NSPAWN_BOOT_DIAGNOSTIC " + json.dumps(details, sort_keys=True), flush=True)
     raise RuntimeError("Disposable Ubuntu nspawn machine did not start SSH")
 
 
