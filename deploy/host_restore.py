@@ -128,6 +128,8 @@ VPN_STATE_ROOT = "/var/lib/sovagrid-vpn"
 VPN_INSTANCE = re.compile(r"[a-z][a-z0-9-]{1,31}\Z")
 MAX_VPN_STATE = 256 * 1024
 MAX_VPN_CONFIG = 256 * 1024
+MAX_VPN_INSTANCES = 64
+MAX_VPN_CAPTURE_BYTES = 4 * 1024 * 1024
 VPN_LISTEN_PORT = re.compile(r"\s*ListenPort\s*=\s*([0-9]{1,5})\s*\Z")
 
 
@@ -444,9 +446,10 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
     total = 0
     count = 0
     dynamic_gids: dict[str, int] = {}
-    vpn_members: set[str] = set()
+    vpn_instances: set[str] = set()
     vpn_contents: dict[str, bytes] = {}
-    vpn_oversized = False
+    vpn_capture_bytes = 0
+    vpn_unverified = False
     try:
         with os.fdopen(os.dup(fd), "rb") as archive_file:
             with tarfile.open(fileobj=archive_file, mode="r|gz") as archive:
@@ -459,8 +462,29 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
                     _check_member(path, member, directory, sources, directories)
                     if path in DYNAMIC_GROUP_PATHS:
                         dynamic_gids[path] = member.gid
-                    if path.startswith(VPN_STATE_ROOT + "/"):
-                        vpn_members.add(path)
+                    vpn_parts = (path[len(VPN_STATE_ROOT) + 1:].split("/")
+                                 if path.startswith(VPN_STATE_ROOT + "/") else [])
+                    if vpn_parts:
+                        instance = vpn_parts[0]
+                        if instance == ".lock":
+                            if len(vpn_parts) != 1 or directory:
+                                vpn_unverified = True
+                        elif instance == "amnezia-provision":
+                            # Its external container/config is outside this archive.
+                            vpn_unverified = True
+                        elif VPN_INSTANCE.fullmatch(instance) is None:
+                            vpn_unverified = True
+                        elif instance not in vpn_instances:
+                            if len(vpn_instances) >= MAX_VPN_INSTANCES:
+                                vpn_unverified = True
+                            else:
+                                vpn_instances.add(instance)
+                        if (len(vpn_parts) > 2 and
+                                vpn_parts[-1] in ("state.json", "server.conf")):
+                            vpn_unverified = True
+                        if vpn_unverified:
+                            vpn_contents.clear()
+                            vpn_capture_bytes = 0
                     seen.add(path)
                     count += 1
                     if directory:
@@ -479,15 +503,20 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
                     bundle_path = "/opt/sovagrid-src/sovagrid-bundle.json"
                     marker_path = backup.SSH_GATEWAY_MARKER
                     web_marker_path = backup.WEB_AGENT_MARKER
-                    vpn_capture = (path.startswith(VPN_STATE_ROOT + "/") and
-                                   path.rsplit("/", 1)[-1] in ("state.json", "server.conf"))
-                    vpn_limit = (MAX_VPN_STATE if path.endswith("/state.json") else
-                                 MAX_VPN_CONFIG)
-                    if vpn_capture and member.size > vpn_limit:
-                        vpn_oversized = True
+                    vpn_capture = (len(vpn_parts) == 2 and
+                                   vpn_parts[0] in vpn_instances and
+                                   vpn_parts[1] in ("state.json", "server.conf"))
+                    vpn_limit = (MAX_VPN_STATE if vpn_parts and
+                                 vpn_parts[-1] == "state.json" else MAX_VPN_CONFIG)
+                    if vpn_capture and (member.size > vpn_limit or
+                                        vpn_capture_bytes + member.size >
+                                        MAX_VPN_CAPTURE_BYTES):
+                        vpn_unverified = True
+                        vpn_contents.clear()
+                        vpn_capture_bytes = 0
                     capture = (bytearray() if path in
                                (bundle_path, marker_path, web_marker_path) or
-                               (vpn_capture and member.size <= vpn_limit) else None)
+                               (vpn_capture and not vpn_unverified) else None)
                     if path == bundle_path and member.size > MAX_BUNDLE_MANIFEST:
                         raise Refused("INVALID_BUNDLE")
                     if path == marker_path and member.size != len(
@@ -509,6 +538,7 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
                     if capture is not None:
                         if vpn_capture:
                             vpn_contents[path] = bytes(capture)
+                            vpn_capture_bytes += member.size
                         elif path == marker_path:
                             if bytes(capture) != backup.SSH_GATEWAY_MARKER_CONTENT:
                                 raise Refused("INVALID_ARCHIVE")
@@ -539,7 +569,7 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
         raise Refused("INVALID_BUNDLE")
     _bundle(bundle_raw, source_hashes, generated, source_directories)
     vpn_ports, vpn_ports_verified = _archived_vpn_ports(
-        vpn_members, vpn_contents, oversized=vpn_oversized)
+        vpn_instances, vpn_contents, unverified=vpn_unverified)
     return {"archive": backup._summary(manifest), "source_manifest_sha256": manifest[
                 "source_manifest_sha256"], "uncompressed_bytes": total,
             "entries": count, "generated_bytecode_files": len(generated),
@@ -547,55 +577,40 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
             "vpn_udp_ports": vpn_ports, "vpn_ports_verified": vpn_ports_verified}
 
 
-def _archived_vpn_ports(members: set[str], contents: dict[str, bytes],
-                        *, oversized: bool) -> tuple[list[int], bool]:
+def _archived_vpn_ports(instances: set[str], contents: dict[str, bytes],
+                        *, unverified: bool) -> tuple[list[int], bool]:
     """Extract public UDP ports without returning archived keys or configuration."""
-    instances: set[str] = set()
-    unverified = oversized
-    for path in members:
-        remainder = path[len(VPN_STATE_ROOT) + 1:]
-        instance = remainder.split("/", 1)[0]
-        if instance == "amnezia-provision":
-            # Its external container/config is outside the host archive.
-            unverified = True
-        elif VPN_INSTANCE.fullmatch(instance):
-            instances.add(instance)
-        elif instance != ".lock":
-            unverified = True
+    if unverified:
+        return [], False
     ports: set[int] = set()
     for instance in instances:
         prefix = f"{VPN_STATE_ROOT}/{instance}/"
         state_raw = contents.get(prefix + "state.json")
         config_raw = contents.get(prefix + "server.conf")
         if state_raw is None or config_raw is None:
-            unverified = True
-            continue
+            return [], False
         try:
             state = json.loads(state_raw, object_pairs_hook=_unique)
             config = config_raw.decode("ascii")
-        except (UnicodeError, ValueError):
-            unverified = True
-            continue
+        except (UnicodeError, ValueError, Refused):
+            return [], False
         if (not isinstance(state, dict) or type(state.get("schema_version")) is not int or
                 state["schema_version"] != 1 or
                 state.get("name") != instance or type(state.get("port")) is not int or
                 not 1024 <= state["port"] <= 65535):
-            unverified = True
-            continue
+            return [], False
         if not config.startswith(
                 "# SovaGrid managed; edit with sovagrid_vpn.manage only\n[Interface]\n"):
-            unverified = True
-            continue
+            return [], False
         listen_lines = [line for line in config.splitlines()
                         if line.lstrip().startswith("ListenPort")]
         declared = ([int(match.group(1))] if len(listen_lines) == 1 and
                     (match := VPN_LISTEN_PORT.fullmatch(listen_lines[0])) is not None
                     else [])
         if len(declared) != 1 or declared[0] != state["port"] or state["port"] in ports:
-            unverified = True
-            continue
+            return [], False
         ports.add(state["port"])
-    return sorted(ports), not unverified
+    return sorted(ports), True
 
 
 def verify(identity: str) -> dict:

@@ -73,6 +73,22 @@ def make_archive(entries):
     return output.getvalue()
 
 
+def vpn_instance_entries(name, port, *, pad=False):
+    prefix = f"var/lib/sovagrid-vpn/{name}"
+    state = json.dumps({"schema_version": 1, "name": name, "port": port}).encode()
+    config = (b"# SovaGrid managed; edit with sovagrid_vpn.manage only\n"
+              b"[Interface]\nListenPort = " + str(port).encode() +
+              b"\nPrivateKey = private-test-key\n")
+    if pad:
+        state += b" " * (restore.MAX_VPN_STATE - len(state))
+        config += b"#" * (restore.MAX_VPN_CONFIG - len(config))
+    return [
+        (prefix, "dir", b"", 0, 0, 0o700),
+        (prefix + "/state.json", "file", state, 0, 0, 0o600),
+        (prefix + "/server.conf", "file", config, 0, 0, 0o600),
+    ]
+
+
 class RestoreInspectionTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -144,6 +160,88 @@ class RestoreInspectionTest(unittest.TestCase):
             ("var/lib/sovagrid-vpn/amnezia-provision/state.json", "file", b"{}", 0, 0, 0o600),
         ]
         self.assertFalse(self.inspect(entries)["vpn_ports_verified"])
+
+    def test_nested_vpn_state_is_ambiguous_and_never_retained(self):
+        self.sources += (restore.backup.Source("/var/lib/sovagrid-vpn", kind="dir",
+                                              private=True, exact_mode=0o700, gid=0),)
+        entries = self.entries + [
+            ("var/lib/sovagrid-vpn", "dir", b"", 0, 0, 0o700),
+            *vpn_instance_entries("work", 51820),
+            ("var/lib/sovagrid-vpn/work/clients", "dir", b"", 0, 0, 0o700),
+            ("var/lib/sovagrid-vpn/work/clients/state.json", "file",
+             b"nested-private-secret", 0, 0, 0o600),
+        ]
+        with patch.object(restore, "_archived_vpn_ports",
+                          wraps=restore._archived_vpn_ports) as ports:
+            result = self.inspect(entries)
+        self.assertFalse(result["vpn_ports_verified"])
+        self.assertEqual(result["vpn_udp_ports"], [])
+        self.assertEqual(ports.call_args.args[1], {})
+        self.assertNotIn("nested-private-secret", json.dumps(result))
+
+    def test_invalid_vpn_instance_name_is_not_captured(self):
+        self.sources += (restore.backup.Source("/var/lib/sovagrid-vpn", kind="dir",
+                                              private=True, exact_mode=0o700, gid=0),)
+        entries = self.entries + [
+            ("var/lib/sovagrid-vpn", "dir", b"", 0, 0, 0o700),
+            *vpn_instance_entries("Bad-name", 51820),
+        ]
+        with patch.object(restore, "_archived_vpn_ports",
+                          wraps=restore._archived_vpn_ports) as ports:
+            result = self.inspect(entries)
+        self.assertFalse(result["vpn_ports_verified"])
+        self.assertEqual(result["vpn_udp_ports"], [])
+        self.assertEqual(ports.call_args.args[1], {})
+
+    def test_oversized_vpn_state_or_config_is_not_retained(self):
+        self.sources += (restore.backup.Source("/var/lib/sovagrid-vpn", kind="dir",
+                                              private=True, exact_mode=0o700, gid=0),)
+        base = self.entries + [("var/lib/sovagrid-vpn", "dir", b"", 0, 0, 0o700)]
+        for filename, limit in (("state.json", restore.MAX_VPN_STATE),
+                                ("server.conf", restore.MAX_VPN_CONFIG)):
+            with self.subTest(filename=filename):
+                instance = vpn_instance_entries("work", 51820)
+                oversized = [(name, kind, raw + b"x" * (limit + 1 - len(raw)),
+                              uid, gid, mode)
+                             if name.endswith("/" + filename) else
+                             (name, kind, raw, uid, gid, mode)
+                             for name, kind, raw, uid, gid, mode in instance]
+                with patch.object(restore, "_archived_vpn_ports",
+                                  wraps=restore._archived_vpn_ports) as ports:
+                    result = self.inspect(base + oversized)
+                self.assertFalse(result["vpn_ports_verified"])
+                self.assertEqual(result["vpn_udp_ports"], [])
+                self.assertEqual(ports.call_args.args[1], {})
+
+    def test_vpn_capture_has_aggregate_byte_and_instance_limits(self):
+        self.sources += (restore.backup.Source("/var/lib/sovagrid-vpn", kind="dir",
+                                              private=True, exact_mode=0o700, gid=0),)
+        base = self.entries + [("var/lib/sovagrid-vpn", "dir", b"", 0, 0, 0o700)]
+        padded = [entry for index in range(8)
+                  for entry in vpn_instance_entries(f"vpn-{index:02d}", 51000 + index,
+                                                    pad=True)]
+        self.assertEqual(8 * (restore.MAX_VPN_STATE + restore.MAX_VPN_CONFIG),
+                         restore.MAX_VPN_CAPTURE_BYTES)
+        at_limit = self.inspect(base + padded)
+        self.assertTrue(at_limit["vpn_ports_verified"])
+        self.assertEqual(at_limit["vpn_udp_ports"], list(range(51000, 51008)))
+        with patch.object(restore, "_archived_vpn_ports",
+                          wraps=restore._archived_vpn_ports) as ports:
+            over_limit = self.inspect(base + padded +
+                                      vpn_instance_entries("vpn-08", 51008, pad=True))
+        self.assertFalse(over_limit["vpn_ports_verified"])
+        self.assertEqual(over_limit["vpn_udp_ports"], [])
+        self.assertEqual(ports.call_args.args[1], {})
+
+        instances = [entry for index in range(restore.MAX_VPN_INSTANCES + 1)
+                     for entry in vpn_instance_entries(f"vpn-{index:02d}", 51000 + index)]
+        self.assertTrue(self.inspect(base + instances[:-3])["vpn_ports_verified"])
+        with patch.object(restore, "_archived_vpn_ports",
+                          wraps=restore._archived_vpn_ports) as ports:
+            too_many = self.inspect(base + instances)
+        self.assertFalse(too_many["vpn_ports_verified"])
+        self.assertEqual(too_many["vpn_udp_ports"], [])
+        self.assertEqual(ports.call_args.args[1], {})
 
     def test_digest_of_archive_alone_cannot_authorize_unsafe_member(self):
         attacks = (
