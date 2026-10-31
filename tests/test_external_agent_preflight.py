@@ -37,6 +37,7 @@ def bundle(main_hash: str) -> dict:
         "sovagrid-agent/NOTICE": "3" * 64,
         "sovagrid-agent/ATTRIBUTION.md": "4" * 64,
         "sovagrid-agent/deploy/sovagrid-agent.service": "5" * 64,
+        "sovagrid-agent/sovagrid_agent/agent.py": "9" * 64,
         "sovagrid-agent/sovagrid_agent/trial_gate.py": "8" * 64,
         "sovagrid-agent/sovagrid_agent/__main__.py": main_hash,
     }}
@@ -190,13 +191,12 @@ class PreflightContractTests(unittest.TestCase):
             for patcher in patches:
                 stack.enter_context(patcher)
             result = planner.preflight(ARCHIVE, NEW)
-        self.assertFalse(result["apply_supported"])
-        self.assertEqual(result["candidate_agent_file_count"], 7)
-        self.assertEqual(result["apply_blockers"],
-                         ["ORIGINAL_HUB_AGENT_UPDATE_LEASE_NOT_VERIFIED",
-                          "AGENT_IDLE_ACK_NOT_VERIFIED",
-                          "TRIAL_FD_WATCHDOG_NOT_VERIFIED",
-                          "EXPLICIT_REVIEW_AND_LIVE_GATES_REQUIRED"])
+        self.assertTrue(result["apply_supported"])
+        self.assertEqual(result["candidate_agent_file_count"], 8)
+        self.assertEqual(result["apply_blockers"], [])
+        self.assertEqual(result["live_gates_pending"],
+                         ["ORIGINAL_HUB_AGENT_UPDATE_LEASE", "AGENT_IDLE_ACK",
+                          "TRIAL_FD_WATCHDOG"])
         self.assertNotIn("agent.token", json.dumps(result))
 
 

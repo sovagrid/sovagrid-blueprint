@@ -71,6 +71,12 @@ AGENT_IDLE_FIELDS = frozenset(("jobs_inflight", "file_operations",
 AGENT_IDLE_MAX_HOLD = 880.0
 AGENT_IDLE_ACK_TIMEOUT = 185.0
 AGENT_IDLE_LINE_MAX = 512
+TRIAL_AGENT_FILES = frozenset((
+    "sovagrid-agent/sovagrid_agent/__main__.py",
+    "sovagrid-agent/sovagrid_agent/agent.py",
+    "sovagrid-agent/sovagrid_agent/trial_gate.py",
+    "sovagrid-agent/deploy/sovagrid-agent.service",
+))
 
 
 def _module(name: str, filename: str):
@@ -496,6 +502,42 @@ def _external_snapshot() -> tuple[str, dict, dict]:
         return _external_snapshot_locked(enrollment)
 
 
+def _idle_endpoint_present() -> bool:
+    """Inspect socket metadata only; status must never quiesce the Agent."""
+    try:
+        uid = pwd.getpwnam("sovagrid").pw_uid
+        gid = grp.getgrnam("sovagrid").gr_gid
+        parent = AGENT_IDLE_SOCKET.parent.lstat()
+        endpoint = AGENT_IDLE_SOCKET.lstat()
+    except (OSError, KeyError):
+        return False
+    return (stat.S_ISDIR(parent.st_mode) and parent.st_uid == uid and
+            parent.st_gid == gid and stat.S_IMODE(parent.st_mode) == 0o700 and
+            stat.S_ISSOCK(endpoint.st_mode) and endpoint.st_uid == uid and
+            endpoint.st_gid == gid and stat.S_IMODE(endpoint.st_mode) == 0o600 and
+            endpoint.st_nlink == 1)
+
+
+def status() -> dict:
+    """Return verified local manifest IDs without a candidate or secret data."""
+    need(os.geteuid() == 0, "ROOT")
+    with _promotion_lock():
+        current, promoted, _commits, baseline = update.inspect()
+        hub_only = (promoted.get("phase") == "activated" and
+                    promoted.get("external_agent_preserved") is True and
+                    promoted.get("baseline_sha256") == baseline)
+        result = {"protocol": 1, "hub_only": hub_only,
+                  "current_hub_manifest_sha256": current,
+                  "external_agent_manifest_sha256": None,
+                  "idle_endpoint_present": False,
+                  "live_idle_ack_verified": False}
+        if hub_only:
+            external_sha, _manifest_value, _state = _external_snapshot()
+            result["external_agent_manifest_sha256"] = external_sha
+            result["idle_endpoint_present"] = _idle_endpoint_present()
+        return result
+
+
 def _changes(before: dict, after: dict) -> list[dict[str, str]]:
     old = remote.Enrollment.installed_projection(before)
     new = remote.Enrollment.installed_projection(after)
@@ -854,8 +896,7 @@ def preflight(archive_sha256: str, current_manifest_sha256: str) -> dict:
         old = remote.Enrollment.installed_projection(before)
         new = _candidate_agent_files(candidate_root, after)
         _installed_agent_tree(old)
-        need("sovagrid-agent/sovagrid_agent/trial_gate.py" in after["sha256"],
-             "TRIAL_CAPABILITY_MISSING")
+        need(_normal_activation_ready(after), "TRIAL_CAPABILITY_MISSING")
         need(old.keys() <= new.keys(), "UNSUPPORTED_SOURCE_REMOVAL")
         # Atomic tree exchange can add vetted source files and directories.
         # Removing an old installed file is intentionally a separate review.
@@ -878,11 +919,11 @@ def preflight(archive_sha256: str, current_manifest_sha256: str) -> dict:
               "metadata_paths_to_change": [MANIFEST_FILE,
                                            "/var/lib/sovagrid-agent-enrollment/state.json",
                                            "/var/lib/sovagrid-promotion/baseline.json"],
-              "apply_supported": False,
-              "apply_blockers": ["ORIGINAL_HUB_AGENT_UPDATE_LEASE_NOT_VERIFIED",
-                                 "AGENT_IDLE_ACK_NOT_VERIFIED",
-                                 "TRIAL_FD_WATCHDOG_NOT_VERIFIED",
-                                 "EXPLICIT_REVIEW_AND_LIVE_GATES_REQUIRED"]}
+              "apply_supported": True,
+              "apply_blockers": [],
+              "live_gates_pending": ["ORIGINAL_HUB_AGENT_UPDATE_LEASE",
+                                     "AGENT_IDLE_ACK", "TRIAL_FD_WATCHDOG"],
+              "explicit_review_required": True}
     need(len(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()) <= MAX_OUTPUT,
          "OUTPUT_TOO_LARGE")
     return result
@@ -1917,6 +1958,7 @@ def preview(archive_sha256: str, current_manifest_sha256: str) -> dict:
         need(promotion.capture_external() == promotion._private_json(promotion.BASELINE) and
              update._hash_file(promotion.BASELINE) == baseline, "EXTERNAL_CHANGED")
         _original_hub_compatibility(state, candidate_sha)
+        capable = _normal_activation_ready(candidate_manifest)
         result = {"protocol": 1, "current_hub_manifest_sha256": current,
                   "candidate_manifest_sha256": candidate_sha,
                   "external_agent_manifest_sha256": external_sha,
@@ -1925,8 +1967,10 @@ def preview(archive_sha256: str, current_manifest_sha256: str) -> dict:
                   "future_metadata_paths": ["/var/lib/sovagrid-agent-enrollment/state.json",
                                             "/var/lib/sovagrid-promotion/baseline.json"],
                   "original_hub_compatibility": "verified_same_bundle",
-                  "apply_supported": False,
-                  "apply_blockers": ["EXTERNAL_AGENT_PREFLIGHT_REQUIRED"]}
+                  "apply_supported": capable,
+                  "apply_blockers": ["EXTERNAL_AGENT_PREFLIGHT_REQUIRED" if capable else
+                                     "TRIAL_CAPABILITY_MISSING"],
+                  "explicit_review_required": True}
         raw = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
         need(len(raw) <= MAX_OUTPUT, "OUTPUT_TOO_LARGE")
         return result
@@ -2045,10 +2089,17 @@ def _repair_interrupted(transaction, cgroup: str, *, idle: AgentIdleProof,
     return result
 
 
-def _normal_activation_ready() -> bool:
-    # Enabled only after the Agent-side in-process PROMOTE/RELEASE protocol and
-    # its integrated Linux trial are available in the exact candidate bundle.
-    return False
+def _normal_activation_ready(manifest: dict) -> bool:
+    """Require the candidate's normal-dispatch and trial protocol files.
+
+    These manifest entries are a static capability check, not live proof.
+    Apply obtains the original Agent idle ACK and Hub lease separately and
+    refuses before mutation when the old Agent lacks that protocol.
+    """
+    hashes = manifest.get("sha256") if isinstance(manifest, dict) else None
+    return (isinstance(hashes, dict) and all(
+        isinstance(hashes.get(path), str) and SHA.fullmatch(hashes[path]) is not None
+        for path in TRIAL_AGENT_FILES))
 
 
 def apply(archive_sha256: str, current_manifest_sha256: str,
@@ -2061,7 +2112,6 @@ def apply(archive_sha256: str, current_manifest_sha256: str,
     """
     need(os.geteuid() == 0 and os.getegid() == 0 and
          sys.platform.startswith("linux"), "ROOT_LINUX")
-    need(_normal_activation_ready(), "NORMAL_ACTIVATION_GATE_MISSING")
     need(all(isinstance(item, str) and SHA.fullmatch(item) is not None
              for item in (archive_sha256, current_manifest_sha256,
                           external_manifest_sha256, review_sha256)), "HASH")
@@ -2093,7 +2143,7 @@ def apply(archive_sha256: str, current_manifest_sha256: str,
         new_projection = _candidate_agent_files(candidate_root, after)
         _installed_agent_tree(old_projection)
         need(old_projection.keys() <= new_projection.keys() and
-             "sovagrid-agent/sovagrid_agent/trial_gate.py" in after["sha256"],
+             _normal_activation_ready(after),
              "TRIAL_CAPABILITY_MISSING")
         changes = _changes(before, after)
         changes.append({"path": MANIFEST_FILE, "operation": "replace"})
@@ -2284,14 +2334,18 @@ def apply(archive_sha256: str, current_manifest_sha256: str,
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    if args == ["recover"]:
+    if args == ["status"]:
+        action = lambda: status()
+    elif args == ["recover"]:
         action = lambda: recover_pending()
     elif args == ["trial-start-guard"]:
         action = lambda: trial_start_guard()
     elif len(args) == 3 and args[0] in ("preview", "preflight"):
         action = lambda: (preview if args[0] == "preview" else preflight)(args[1], args[2])
+    elif len(args) == 5 and args[0] == "apply":
+        action = lambda: apply(args[1], args[2], args[3], args[4])
     else:
-        print("usage: external_agent_update.py {preview|preflight} ARCHIVE_SHA256 CURRENT_MANIFEST_SHA256 | recover | trial-start-guard", file=sys.stderr)
+        print("usage: external_agent_update.py status | {preview|preflight} ARCHIVE_SHA256 CURRENT_MANIFEST_SHA256 | apply ARCHIVE_SHA256 CURRENT_MANIFEST_SHA256 EXTERNAL_MANIFEST_SHA256 REVIEW_SHA256 | recover | trial-start-guard", file=sys.stderr)
         return 2
     try:
         result = action()

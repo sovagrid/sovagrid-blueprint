@@ -1,77 +1,63 @@
-# External Agent trial boundary
+# External Agent update and trial boundary
 
-The preserved external Agent on a promoted host is not changed by the
-Hub-only updater. `external_agent_update.py` exposes read-only `preview` and
-`preflight`, plus boot recovery. It has no public `apply` command. The original
-Agent may lack the quiescence socket, so it cannot produce the required idle
-ACK for a normal update. A future one-time bootstrap needs an explicit
-maintenance window and separate crash-safe approval; a Hub lease alone is not
-an Agent idle proof.
+The Hub-only updater preserves the Agent originally enrolled with another
+Hub. Updating that external Agent is a separate root operation. It is never
+part of a Hub-only update, the signed full-server feed, or an automatic timer.
+The source archive must already be staged by its SHA-256 in the local candidate
+store; this CLI does not download a package or accept a URL.
 
-`external_agent_recovery.py` prepares a journal before switching the source.
-Its durable phases are `prepared`, `switched`, `trial`, and `committed`.
-Pre-commit recovery returns the original Agent. Committed recovery verifies
-the new tree and metadata and completes cleanup using a marker outside the
-scratch directory. Missing or altered source, metadata, credentials, tunnel
-units, or the trial start drop-in makes recovery refuse rather than guess.
+`external_agent_update.py` exposes four operator-facing operations (plus boot
+`recover` and the internal `trial-start-guard`):
 
-The future root supervisor can create a private Unix socket at
-`/run/sovagrid-external-agent-update/trial.sock`. The trial gate checks Linux
-`SO_PEERCRED`, a fresh nonce, the SHA-256 of the exact trial journal, and
-current callbacks for the original Hub maintenance lease and old Agent idle
-ACK. It grants `recover` and then `start` at most once each, within 900
-seconds. A stale socket, dead supervisor, expired lease, changed journal, or
-lost ACK denies the request. The installed drop-in must run the root pre-start
-check immediately before Agent `ExecStart` and be present in systemd's loaded
-configuration.
+```text
+status
+preview ARCHIVE_SHA256 CURRENT_HUB_MANIFEST_SHA256
+preflight ARCHIVE_SHA256 CURRENT_HUB_MANIFEST_SHA256
+apply ARCHIVE_SHA256 CURRENT_HUB_MANIFEST_SHA256 EXTERNAL_AGENT_MANIFEST_SHA256 REVIEW_SHA256
+```
 
-**The live trial path remains disabled.** `recover` does not pass the optional
-trial authorization callback, and `trial-start-guard` rejects a trial. A
-successful `ExecStartPre` check alone leaves a gap before `ExecStart`: the
-supervisor could die or lose its lease during that gap. The candidate Agent
-will instead require its own live supervisor connection before any Hub request.
-The static trial drop-in sets `SOVAGRID_EXTERNAL_TRIAL_GATE=1` and reads
-`/run/sovagrid-external-agent-trial/epoch.env`. A future root writer must
-atomically create that file as root:root mode `0600`, containing exactly
-`SOVAGRID_EXTERNAL_TRIAL_EPOCH=<32 lowercase hex>`, before it starts the trial
-Agent. Missing or malformed epoch data makes the new Agent refuse startup; the
-old Agent ignores these variables if boot recovery rolls back its source.
+All operations require root. `status` returns verified Hub and external Agent
+manifest hashes, the Hub-only layout flag, and whether an idle socket with the
+expected ownership and mode is present. It never connects to that socket;
+`live_idle_ack_verified` is therefore always false. It returns no address,
+token, key, or enrollment identity. `preview` describes source paths and
+checks candidate/original-Hub compatibility. `preflight` also validates the
+installed tree, candidate Agent protocol files, enrollment projection, and
+external baseline, then returns a review digest bound to the exact archive,
+Hub and external Agent manifests, baseline, enrollment, and path changes.
+Neither read-only command reserves a maintenance lease or idles the Agent.
+`apply_supported=true` means the candidate has the static protocol capability;
+it does not guarantee that the live lease, idle ACK, or trial will succeed.
 
-The Agent runtime gate protocol is a root:sovagrid Unix socket at
-`/run/sovagrid-external-agent-trial/gate.sock` under a root:sovagrid directory
-mode `0710`; the socket is mode `0660`. The Agent verifies path ownership and
-mode plus root `SO_PEERCRED`, sends `HELLO 1 <epoch>`, requires
-`READY 1 <epoch>`, then sends `PING 0` and requires `PONG 0` before connecting
-to Hub. It then sends numbered pings no more than two seconds apart and exits
-on EOF, mismatch or a reply timeout above three seconds. The supervisor must
-continue to prove the exact journal, original Hub lease and Agent idle ACK
-before each reply. Its loss therefore prevents the new Agent from starting
-across the pre-start handoff and terminates a running trial Agent.
-During the trial the Agent reports metrics only: it disables command and
-journal permission and starts no terminal, file, or network-check poller.
-This matters because a lease could expire just after a successful heartbeat;
-the trial Agent must not claim work in that interval.
+`apply` requires the four exact lower-case SHA-256 values from a fresh
+preflight. It repeats preflight and all state checks before a write, then
+acquires the original Hub's authenticated command-drain lease and the old
+Agent's authenticated idle ACK. An old Agent without
+`/run/sovagrid-agent-control/agent.sock` fails closed before the transaction.
+Such an installation needs a separately designed one-time bootstrap; this
+operation does not silently replace it. The root supervisor verifies the
+exact old systemd PID, invocation, cgroup, idle socket peer, and stopped state
+before switching source. The external tunnel and original Hub stay in place.
 
-The implementation also contains two dormant writer primitives.
-`OriginalHubLease` authenticates to the enrolled original Hub through the
-verified local TLS tunnel, acquires its 120-second job/relay drain lease,
-renews it every five seconds, and invalidates itself permanently on any
-failed or changed renewal. Its local 880-second limit uses monotonic time,
-because the promoted host and remote Hub clocks may differ. The trial
-watchdog can require a fresh renewal on each Agent heartbeat. The lease does **not** prove
-that an older Agent has finished a file or command it already received.
-`ExternalAgentStopProof` records the active original systemd MainPID,
-invocation and cgroup. It accepts a stopped Agent only after the unit reports
-inactive/dead with MainPID 0, the original process start time is gone, and
-the entire cgroup-v2 subtree has no processes; it samples systemd again after
-the cgroup walk to detect a concurrent start. A future writer must still hold
-the start guard across this check and the source switch. These classes have
-no public apply or service-stop action.
+The recovery journal uses `prepared`, `switched`, `trial`, and `committed`
+phases. The Agent service requires the recovery unit during the trial. A crash
+or lost live supervisor before commit returns the original Agent at boot.
+Missing or altered source, metadata, credentials, units, or trial drop-in
+causes recovery to refuse rather than guess. A live root trial gate authorizes
+`recover` and `start` at most once each. The new Agent independently connects
+to the root-owned Unix watchdog before Hub access and exits on a lost or
+invalid heartbeat. During trial it performs metrics-only Hub cycles: it does
+not claim jobs, checks, files, terminals, or command work. After a second
+read-only cycle, the supervisor durably commits, sends `RELEASE`, verifies
+normal dispatch in the **same Agent PID**, then sends `DETACH` and removes
+temporary trial and recovery state. Post-commit recovery finishes the new
+Agent instead of reverting it.
 
-The writer still needs boot-safe installation and removal of the trial
-drop-in, an old-Agent idle ACK or a separately approved one-time bootstrap,
-lease-bound stop/start orchestration, live health confirmation, commit and
-rollback under the existing durable journal. In particular, installing the
-drop-in before the journal is durable could strand the old Agent after a
-crash; merely checking `ExecStartPre` cannot solve that. None of this is
-enabled on a promoted host. A signed stable update feed is a separate task.
+The original Hub lease, Agent idle ACK, and trial watchdog have bounded
+monotonic lifetimes. A stale review, changed candidate or enrollment, expired
+lease, unsafe socket, altered journal, wrong Agent peer, or failed health
+check causes refusal or rollback. The optional disposable Ubuntu VM test
+`tests/integrated_external_agent_apply_vm.py` exercises pre-commit rollback,
+SIGKILL boot recovery, same-PID release/detach, normal dispatch, and exact
+cleanup with real systemd. The production CLI still needs a controlled Hub
+broker and review UI before users can complete this flow without a console.

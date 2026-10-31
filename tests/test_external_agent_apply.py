@@ -11,6 +11,7 @@ import errno
 import hashlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import stat
@@ -408,7 +409,11 @@ class ApplyCoordinatorTests(unittest.TestCase):
         self.enrollment = mock.Mock(files=mock.Mock())
         self.enrollment.locked.return_value = contextlib.nullcontext()
         self.before = {"sha256": {}}
-        self.after = {"sha256": {"sovagrid-agent/sovagrid_agent/trial_gate.py": "1" * 64}}
+        self.after = {"sha256": {
+            "sovagrid-agent/sovagrid_agent/trial_gate.py": "1" * 64,
+            "sovagrid-agent/sovagrid_agent/__main__.py": "2" * 64,
+            "sovagrid-agent/sovagrid_agent/agent.py": "3" * 64,
+            "sovagrid-agent/deploy/sovagrid-agent.service": "4" * 64}}
         self.state = {"identity": {"server_id": "example"}}
         self.baseline = {"files": {}}
         self.commands = []
@@ -422,7 +427,6 @@ class ApplyCoordinatorTests(unittest.TestCase):
         patched(planner.os, "geteuid", lambda: 0)
         patched(planner.os, "getegid", lambda: 0)
         patched(planner.sys, "platform", "linux")
-        patched(planner, "_normal_activation_ready", lambda: True)
         patched(planner, "preflight", lambda *_: {
             "external_agent_manifest_sha256": OLD, "review_sha256": REVIEW})
         patched(planner, "_exclusive_lock", lambda _path: os.open(os.devnull, os.O_RDONLY))
@@ -454,6 +458,8 @@ class ApplyCoordinatorTests(unittest.TestCase):
         patched(planner, "_disable_recovery_unit",
                 lambda: self.boot_gate_events.append("disable"))
         patched(planner, "_new_metadata", lambda *_args: ({"old": OLD}, {"new": CURRENT}, {}))
+        patched(planner, "_projected_candidate_tree",
+                lambda *_args: contextlib.nullcontext(Path("/candidate/sovagrid-agent")))
         patched(planner, "ExternalAgentStopProof", lambda: self.stop_proof)
         patched(planner, "OriginalHubLease", lambda *_args: self.lease)
         patched(planner, "AgentIdleProof", lambda _stop: self.idle)
@@ -509,7 +515,6 @@ class ApplyCoordinatorTests(unittest.TestCase):
         with mock.patch.object(planner.os, "geteuid", return_value=0), \
              mock.patch.object(planner.os, "getegid", return_value=0), \
              mock.patch.object(planner.sys, "platform", "linux"), \
-             mock.patch.object(planner, "_normal_activation_ready", return_value=True), \
              mock.patch.object(planner, "preflight", return_value={
                  "external_agent_manifest_sha256": OLD,
                  "review_sha256": REVIEW}), \
@@ -518,15 +523,30 @@ class ApplyCoordinatorTests(unittest.TestCase):
             planner.apply(ARCHIVE, CURRENT, OLD, "f" * 64)
         lock.assert_not_called()
 
-    def test_public_apply_route_and_internal_activation_are_closed(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(planner.main(["apply", ARCHIVE, CURRENT, OLD, REVIEW]), 2)
+    def test_public_apply_route_requires_exact_args_and_root(self):
+        with mock.patch.object(planner, "apply", return_value={"protocol": 1, "applied": True}) as apply, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(planner.main(["apply", ARCHIVE, CURRENT, OLD, REVIEW]), 0)
+        apply.assert_called_once_with(ARCHIVE, CURRENT, OLD, REVIEW)
+        self.assertEqual(json.loads(output.getvalue()), {"protocol": 1, "applied": True})
+        with mock.patch.object(planner, "apply") as apply, \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(planner.main(["apply", ARCHIVE, CURRENT, OLD]), 2)
+            self.assertEqual(planner.main(["apply", ARCHIVE, CURRENT, OLD, REVIEW, REVIEW]), 2)
+        apply.assert_not_called()
+        with mock.patch.object(planner.os, "geteuid", return_value=501), \
+             mock.patch.object(planner, "preflight") as preflight, \
+             self.assertRaisesRegex(planner.Refused, "ROOT_LINUX"):
+            planner.apply(ARCHIVE, CURRENT, OLD, REVIEW)
+        preflight.assert_not_called()
+
+    def test_apply_rejects_invalid_hash_before_preflight(self):
         with mock.patch.object(planner.os, "geteuid", return_value=0), \
              mock.patch.object(planner.os, "getegid", return_value=0), \
              mock.patch.object(planner.sys, "platform", "linux"), \
              mock.patch.object(planner, "preflight") as preflight, \
-             self.assertRaisesRegex(planner.Refused, "NORMAL_ACTIVATION_GATE_MISSING"):
-            planner.apply(ARCHIVE, CURRENT, OLD, REVIEW)
+             self.assertRaisesRegex(planner.Refused, "HASH"):
+            planner.apply("not-a-sha", CURRENT, OLD, REVIEW)
         preflight.assert_not_called()
 
     def test_guarded_success_releases_the_same_normal_agent_after_commit(self):

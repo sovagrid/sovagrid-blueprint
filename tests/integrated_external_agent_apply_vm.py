@@ -13,10 +13,12 @@ inert tunnel unit does not test real SSH forwarding.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -478,8 +480,7 @@ def killed_at_trial(archive_sha256: str) -> None:
         original(transaction, **kwargs)
         os.kill(os.getpid(), signal.SIGKILL)
 
-    with mock.patch.object(planner, "_normal_activation_ready", return_value=True), \
-         mock.patch.object(planner.recovery.Recovery, "begin_trial", interrupt):
+    with mock.patch.object(planner.recovery.Recovery, "begin_trial", interrupt):
         planner.apply(archive_sha256, current, old, review)
     raise SystemExit("trial SIGKILL did not happen")
 
@@ -487,8 +488,10 @@ def killed_at_trial(archive_sha256: str) -> None:
 def run(archive_sha256: str) -> None:
     require(SHA.fullmatch(archive_sha256) is not None, "archive SHA required")
     planner = installed_planner()
-    require(planner._normal_activation_ready() is False,
-            "disposable apply trial must not silently arm the product gate")
+    candidate_root, _commits = planner.common.candidate_source(archive_sha256)
+    _candidate_sha, candidate_manifest = planner._manifest(candidate_root)
+    require(planner._normal_activation_ready(candidate_manifest),
+            "candidate lacks the production trial protocol")
     old_sha, _old_manifest, _old_state = planner._external_snapshot()
     old_state = Path("/var/lib/sovagrid-agent-enrollment/state.json").read_bytes()
     old_baseline = Path("/var/lib/sovagrid-promotion/baseline.json").read_bytes()
@@ -502,8 +505,7 @@ def run(archive_sha256: str) -> None:
         original_switch(transaction, **kwargs)
         raise planner.Refused("VM_PRECOMMIT_FAULT")
 
-    with mock.patch.object(planner, "_normal_activation_ready", return_value=True), \
-         mock.patch.object(planner.recovery.Recovery,
+    with mock.patch.object(planner.recovery.Recovery,
                            "_switch_under_quiescence", interrupted_switch):
         try:
             planner.apply(archive_sha256, current, old, review)
@@ -604,14 +606,21 @@ def run(archive_sha256: str) -> None:
         return original_commit_trial(transaction, **{name: wrap(name, callback)
                                                      for name, callback in gates.items()})
 
-    with mock.patch.object(planner, "_normal_activation_ready", return_value=True), \
-         mock.patch.object(planner, "_trial_peer", recorded_peer), \
+    with mock.patch.object(planner, "_trial_peer", recorded_peer), \
          mock.patch.object(planner.TrialWatchServer, "__init__", record_watch_init), \
          mock.patch.object(planner.TrialWatchServer, "start", record_watch_start), \
          mock.patch.object(planner.TrialWatchServer, "_handle", record_watch_error), \
          mock.patch.object(planner.recovery.Recovery, "commit_trial", record_commit_gates):
         try:
-            result = planner.apply(archive_sha256, current, old, review)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = planner.main(["apply", archive_sha256, current, old, review])
+            if code != 0:
+                error = stderr.getvalue().strip().removeprefix(
+                    "SG_EXTERNAL_AGENT_UPDATE_REFUSE:")
+                raise planner.Refused(error if re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", error)
+                                      else "APPLY_FAILED")
+            result = json.loads(stdout.getvalue())
         except planner.Refused as exc:
             watch = trial_watch[-1] if trial_watch else None
             journal = subprocess.run(["journalctl", "-u", AGENT_UNIT, "-n", "200",
@@ -632,7 +641,7 @@ def run(archive_sha256: str) -> None:
             print("VM_TRIAL_DIAGNOSTIC:" + json.dumps(debug, sort_keys=True), flush=True)
             raise
     require(result["applied"] is True and result["review_sha256"] == review,
-            "internal apply did not finish")
+            "public apply CLI did not finish")
     final_pid = _pid()
     require(same_process == {final_pid}, "Agent PID changed between trial and normal dispatch")
     final_sha, _manifest, _state = planner._external_snapshot()

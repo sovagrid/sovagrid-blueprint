@@ -42,6 +42,8 @@ def manifest(agent_hash: str) -> dict:
               "sovagrid-agent/NOTICE": "3" * 64,
               "sovagrid-agent/ATTRIBUTION.md": "4" * 64,
               "sovagrid-agent/deploy/sovagrid-agent.service": "5" * 64,
+              "sovagrid-agent/sovagrid_agent/agent.py": "8" * 64,
+              "sovagrid-agent/sovagrid_agent/trial_gate.py": "9" * 64,
               "sovagrid-agent/sovagrid_agent/__main__.py": agent_hash}
     return {"format": 1, "components": {}, "sha256": hashes}
 
@@ -81,10 +83,39 @@ class ExternalAgentPreviewTests(unittest.TestCase):
             {"path": "/opt/sovagrid-agent-installer/source-manifest.json", "operation": "replace"},
         ])
         self.assertTrue(result["external_agent_preserved"] and result["tunnel_active"])
-        self.assertFalse(result["apply_supported"])
+        self.assertTrue(result["apply_supported"])
         self.assertEqual(result["original_hub_compatibility"], "verified_same_bundle")
         self.assertEqual(result["apply_blockers"], ["EXTERNAL_AGENT_PREFLIGHT_REQUIRED"])
         self.assertNotIn("token", json.dumps(result).lower())
+
+    def test_preview_marks_candidate_without_trial_protocol_unsupported(self):
+        unsupported = manifest("7" * 64)
+        del unsupported["sha256"]["sovagrid-agent/sovagrid_agent/trial_gate.py"]
+        with mock.patch.object(previewer, "_manifest", return_value=(CURRENT, unsupported)):
+            result = previewer.preview(ARCHIVE, CURRENT)
+        self.assertFalse(result["apply_supported"])
+        self.assertEqual(result["apply_blockers"], ["TRIAL_CAPABILITY_MISSING"])
+
+    def test_status_reports_only_verified_hashes_and_socket_metadata(self):
+        with mock.patch.object(previewer, "_idle_endpoint_present", return_value=True):
+            result = previewer.status()
+        self.assertTrue(result["hub_only"])
+        self.assertEqual(result["current_hub_manifest_sha256"], CURRENT)
+        self.assertEqual(result["external_agent_manifest_sha256"], EXTERNAL)
+        self.assertTrue(result["idle_endpoint_present"])
+        self.assertFalse(result["live_idle_ack_verified"])
+        self.assertNotIn("token", json.dumps(result).lower())
+
+    def test_status_cli_is_read_only_and_requires_root(self):
+        with mock.patch.object(previewer, "_idle_endpoint_present", return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(previewer.main(["status"]), 0)
+        self.assertEqual(json.loads(output.getvalue())["external_agent_manifest_sha256"],
+                         EXTERNAL)
+        with mock.patch.object(previewer.os, "geteuid", return_value=501), \
+             contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(previewer.main(["status"]), 40)
+        self.assertIn("SG_EXTERNAL_AGENT_UPDATE_REFUSE:ROOT", error.getvalue())
 
     def test_changed_external_baseline_or_stopped_tunnel_refuses(self):
         with mock.patch.object(previewer.promotion, "capture_external", return_value={"proof": False}), \
