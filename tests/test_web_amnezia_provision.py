@@ -229,6 +229,26 @@ class ProvisionBridgeTests(unittest.TestCase):
                                          ["preflight", "exchange", "exchange"] if action == "apply"
                                          else ["preflight", "exchange"])
 
+    def test_installation_drift_blocks_apply_and_recover_as_fixed_refusal(self):
+        reason = "INSTALLATION_DRIFT"
+        full = preview(can_apply=False, reason=reason)
+        self.assertEqual(module._response(*full, "preview")["reason"], reason)
+        bridge, rpc, _transports, _jobs = self.bridge(full)
+        with self.assertRaises(module.AmneziaProvisionError) as error:
+            self.execute(bridge, "apply", **PARAMS, expected_state=STATE, confirm=True)
+        self.assertEqual(error.exception.code, reason)
+        self.assertEqual([call[0] for call in rpc.calls], ["preflight", "exchange"])
+
+        refusal = (b'{"ok":false,"error":"INSTALLATION_DRIFT"}\n', 2)
+        for action, replies, kwargs in (
+                ("apply", (preview(), refusal), PARAMS | {"expected_state": STATE, "confirm": True}),
+                ("recover", (refusal,), {"confirm": True})):
+            with self.subTest(action=action):
+                bridge, _rpc, _transports, _jobs = self.bridge(*replies)
+                with self.assertRaises(module.AmneziaProvisionError) as error:
+                    self.execute(bridge, action, **kwargs)
+                self.assertEqual(error.exception.code, reason)
+
     def test_preflight_and_preview_failure_before_apply_are_not_uncertain(self):
         bridge, rpc, _transports, _jobs = self.bridge(preflight_error="ROOT_REQUIRED")
         with self.assertRaises(module.AmneziaProvisionError) as error:
@@ -252,7 +272,7 @@ class ProvisionBridgeTests(unittest.TestCase):
             module._response(payload(degraded)[0], 0, "preview")
         full = preview(can_apply=False, reason="UDP_PORT_BUSY")[0]
         self.assertEqual(module._response(full, 0, "preview")["reason"], "UDP_PORT_BUSY")
-        for code in ("SOURCE_BUSY", "SOURCE_UNTRUSTED"):
+        for code in ("SOURCE_BUSY", "SOURCE_UNTRUSTED", "INSTALLATION_DRIFT"):
             with self.subTest(code=code):
                 degraded["reason"] = code
                 self.assertEqual(module._response(payload(degraded)[0], 0, "preview"), degraded)
