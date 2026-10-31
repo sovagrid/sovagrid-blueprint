@@ -3,18 +3,8 @@
 # Additional author attribution terms: see ATTRIBUTION.md.
 name: Inactive release-feed migration on disposable Hub VM
 
-# Root changes run only on a disposable GitHub-hosted Ubuntu VM after a push.
+# Root changes run only on a manually dispatched disposable GitHub-hosted Ubuntu VM.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'run.sh'
-      - 'deploy/release_feed.py'
-      - 'deploy/remote_update_worker.py'
-      - 'deploy/sovagrid-release-feed.service'
-      - 'deploy/sovagrid-release-feed.timer'
-      - 'tests/release_feed_vm.py'
-      - '.github/workflows/release-feed-migration-vm.yml'
   workflow_dispatch:
 
 permissions:

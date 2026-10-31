@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Jigokuraku01
 # Additional author attribution terms: see ATTRIBUTION.md.
-"""Disposable Ubuntu VM postconditions for the inactive signed-feed migration."""
+"""Disposable Ubuntu VM postconditions for an unconfigured feed migration."""
 
 from __future__ import annotations
 
@@ -95,13 +95,15 @@ def check(mode: str) -> None:
         require(malformed_enable.returncode == 40 and
                 "SG_RELEASE_FEED_REFUSE:INVALID_EXPECTED_STATE" in malformed_enable.stdout,
                 "full-server enable accepted malformed CAS")
+    # The public stable feed may exist by the time this migration is rerun.
+    # A stale review must fail before network access; never opt a fixture in.
     attempt = subprocess.run(["python3", "-I", str(SCRIPT), "enable", "--expected-state",
-                              report["state_revision"]],
+                              "0" * 64 if not hub_only else report["state_revision"]],
                              check=False, capture_output=True, text=True, timeout=20)
-    expected_refusal = "HUB_ONLY_UNSUPPORTED" if hub_only else "UNCONFIGURED_TRUST"
+    expected_refusal = "HUB_ONLY_UNSUPPORTED" if hub_only else "STATE_CHANGED"
     require(attempt.returncode == 40 and
             "SG_RELEASE_FEED_REFUSE:" + expected_refusal in attempt.stdout,
-            "enable accepted an unsupported Hub-only node or missing trust anchor")
+            "enable accepted a stale review or unsupported Hub-only node")
     if mode == "installed":
         disabled = subprocess.run(["python3", "-I", str(SCRIPT), "disarm"],
                                   check=True, capture_output=True, text=True, timeout=20)
