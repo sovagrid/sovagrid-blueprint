@@ -59,7 +59,7 @@ class ReleaseFeedMigration(unittest.TestCase):
     def test_pinned_key_and_older_worker_cannot_enable_discovery(self) -> None:
         installer = (ROOT / "run.sh").read_text()
         self.assertLess(installer.index("SOVAGRID_RELEASE_FEED_SNAPSHOT"),
-                        installer.index("apt_refresh()"))
+                        installer.index("\ninstall_core_dependencies\n"))
         self.assertIn("release_feed_deferred=1", installer)
         self.assertIn("install_release_feed_units", installer)
         self.assertNotIn("systemctl enable --now sovagrid-release-feed.timer", installer)

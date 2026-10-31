@@ -138,7 +138,8 @@ class TimerPolicy(unittest.TestCase):
 
     def test_install_guard_precedes_mutation_and_timer_is_opt_in(self) -> None:
         source = (SCRIPT.parents[1] / "run.sh").read_text()
-        self.assertLess(source.index("SOVAGRID_UPDATER_TIMER_SNAPSHOT"), source.index("apt_refresh()"))
+        self.assertLess(source.index("SOVAGRID_UPDATER_TIMER_SNAPSHOT"),
+                        source.index("\ninstall_core_dependencies\n"))
         self.assertIn("systemctl enable --now sovagrid-auto-update.timer", source)
         service = (SCRIPT.parent / "sovagrid-auto-update.service").read_text()
         self.assertIn("ConditionPathExists=/etc/sovagrid/auto-update.json", service)

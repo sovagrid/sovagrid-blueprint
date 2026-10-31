@@ -139,7 +139,7 @@ class BackupBrokerMigration(unittest.TestCase):
     def test_installer_gates_old_updater_and_starts_socket_before_compose(self) -> None:
         installer = (ROOT / "run.sh").read_text()
         self.assertLess(installer.index("SOVAGRID_HUB_BACKUP_BROKER_SNAPSHOT"),
-                        installer.index("apt_refresh()"))
+                        installer.index("\ninstall_core_dependencies\n"))
         self.assertIn("backup_broker_deferred=1", installer)
         self.assertIn("$source_root/sovagrid-hub/sovagrid_hub/backup_broker.py", installer)
         self.assertIn("managed Hub backup broker source is missing", installer)
