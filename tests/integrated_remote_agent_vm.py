@@ -231,6 +231,11 @@ def setup(state_dir: Path) -> None:
         command("ssh", "-F", "/dev/null", "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=5",
                 "-i", str(key), f"root@{host}", "true")
+    # The Agent reaches the host through its own isolated Docker bridge.
+    # Reaching the separate Compose bridge gateway is not guaranteed by Docker.
+    command("docker", "exec", state["container"], "/usr/bin/python3", "-c",
+            "import socket,sys; socket.create_connection((sys.argv[1],22),5).close()",
+            state["target_gateway"])
     print("INTEGRATED_REMOTE_AGENT_FIXTURE_READY", flush=True)
 
 
@@ -554,12 +559,20 @@ def verify(state_dir: Path) -> None:
         preview = controller.prepare(target_options=target,
                                      name="ci-remote-agent-" + state["container"].rsplit("-", 1)[-1],
                                      bundle=Path(os.environ["RUNNER_TEMP"]) / "SovaGrid-server-source.tar.gz",
-                                     hub_host=COMPOSE_GATEWAY, hub_port=22, local_port=18767,
+                                     hub_host=state["target_gateway"], hub_port=22, local_port=18767,
                                      credentials={"username": "admin", "password": password})
         require(preview["platform"]["ubuntu_version"] == "24.04",
                 "The second server is not Ubuntu 24.04")
         require(preview["record"]["phase"] == "prepared", "Connect did not complete review")
-        installed = controller.apply()
+        try:
+            installed = controller.apply()
+        except Exception:
+            journal = command("docker", "exec", state["container"], "journalctl", "-u",
+                              "sovagrid-agent-tunnel.service", "-n", "16", "--no-pager",
+                              "--output=cat", check=False).stdout
+            print("INTEGRATED_CONNECT_TARGET_TUNNEL_LOG " +
+                  json.dumps(journal.splitlines()[-16:]), flush=True)
+            raise
         require(installed["phase"] == "active" and installed["registration"]["state"] == "active",
                 "Connect did not activate the second Agent")
         remote_id = installed["target"]["server_id"]
