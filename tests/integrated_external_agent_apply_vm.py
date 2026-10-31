@@ -6,9 +6,9 @@
 
 This fixture is never a product API. It runs only on a fresh GitHub-hosted
 systemd VM with explicit opt-in. It replaces the published fixture Agent with
-an enrolled Agent sourced from the reviewed candidate, except for one NOTICE
-byte change. A private loopback TLS Hub supplies real HTTP lease and metrics
-traffic. Its inert tunnel unit does not test real SSH forwarding.
+an enrolled historical Agent and applies the reviewed current candidate. A
+private loopback TLS Hub supplies real HTTP lease and metrics traffic. Its
+inert tunnel unit does not test real SSH forwarding.
 """
 
 from __future__ import annotations
@@ -46,6 +46,13 @@ HUB_KEY = HUB_ROOT / "key.pem"
 HUB_CERT = HUB_ROOT / "cert.pem"
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 AGENT_UNIT = "sovagrid-agent.service"
+BASELINE_AGENT_COMMIT = "1085a14a7c0c654a5a6ec16edd028dea1c543c8e"
+EXPECTED_TRIAL_COMPONENTS = {
+    "sovagrid-agent": "7b4dab289ca239266b77584a927f6976f375042c",
+    "sovagrid-hub": "f63511381c9c0fd8d8976891ed462aec9a88398e",
+    "sovagrid-web": "cf126ca047f17df951ff40a5b75eb236b2939bd2",
+    "sovagrid-vpn": "e500d5a9a97ad329c33af6a06eb1d2f17a541897",
+}
 
 
 def require(ok: bool, reason: str) -> None:
@@ -266,16 +273,45 @@ def serve() -> None:
     server.serve_forever(poll_interval=0.25)
 
 
-def seed(candidate: Path) -> None:
+def seed(candidate: Path, old_agent_source: Path) -> None:
     from promotion_vm import save_baseline, snapshot
 
     candidate = candidate.resolve(strict=True)
+    old_agent_source = old_agent_source.resolve(strict=True)
     raw = (candidate / "sovagrid-bundle.json").read_bytes()
     candidate_manifest = json.loads(raw)
     manifest_sha256 = sha(raw)
+    components = candidate_manifest.get("components") if isinstance(candidate_manifest, dict) else None
+    require(isinstance(components, dict) and all(
+            isinstance(components.get(name), dict) and
+            components[name].get("commit") == commit
+            for name, commit in EXPECTED_TRIAL_COMPONENTS.items()),
+            "candidate does not use the reviewed server component set")
     require(SHA.fullmatch(manifest_sha256) is not None and
             (candidate / "sovagrid-agent/sovagrid_agent/trial_gate.py").is_file(),
             "candidate lacks trial-capable Agent")
+    # Stage an actual older Agent source tree so the trial covers code migration.
+    # The workflow extracts this tree from the pinned Git commit before seeding.
+    helper = _module("sovagrid_vm_remote_agent", ROOT / "deploy/remote_agent.py")
+    old_manifest = json.loads(raw)
+    old_files = sorted(path for path in old_agent_source.rglob("*") if path.is_file())
+    require(bool(old_files) and all(not path.is_symlink() for path in old_files) and
+            (old_agent_source / "sovagrid_agent/trial_gate.py").is_file() and
+            (old_agent_source / "sovagrid_agent/agent.py").read_bytes() !=
+            (candidate / "sovagrid-agent/sovagrid_agent/agent.py").read_bytes(),
+            "historical Agent source is missing or matches the candidate")
+    old_hashes = {"sovagrid-agent/" + path.relative_to(old_agent_source).as_posix():
+                  sha(path.read_bytes()) for path in old_files}
+    hashes = old_manifest["sha256"]
+    for relative in list(hashes):
+        if relative.startswith("sovagrid-agent/"):
+            del hashes[relative]
+    hashes.update(old_hashes)
+    old_manifest["components"]["sovagrid-agent"] = {
+        "commit": BASELINE_AGENT_COMMIT, "file_count": len(old_hashes)}
+    old_projection = helper.Enrollment.installed_projection(old_manifest)
+    require(set(old_projection) <= set(helper.Enrollment.installed_projection(candidate_manifest)),
+            "historical Agent has installed files absent from candidate")
     require(not HUB_ROOT.exists() and not Path("/etc/systemd/system", HUB_UNIT).exists(),
             "fixture already installed")
     command("systemctl", "stop", AGENT_UNIT)
@@ -288,20 +324,14 @@ def seed(candidate: Path) -> None:
     os.chown("/var/lib/sovagrid-agent", 0, agent.pw_gid)
     Path("/var/lib/sovagrid-agent").chmod(0o750)
 
-    # Keep current capable code in the old tree. Change only a public NOTICE
-    # byte so an actual source transaction is required and reviewable.
-    helper = _module("sovagrid_vm_remote_agent", ROOT / "deploy/remote_agent.py")
-    old_manifest = json.loads(raw)
-    notice_name = "sovagrid-agent/NOTICE"
-    notice = (candidate / notice_name).read_bytes() + b"\nDisposable VM source revision.\n"
-    old_manifest["sha256"][notice_name] = sha(notice)
-    old_projection = helper.Enrollment.installed_projection(old_manifest)
     shutil.rmtree("/opt/sovagrid-agent")
     Path("/opt/sovagrid-agent").mkdir(mode=0o755)
     for destination in old_projection:
         relative = (helper.SELF_NAME if destination == helper.TARGET_HELPER else
                     "sovagrid-agent/" + destination.removeprefix("/opt/sovagrid-agent/"))
-        data = notice if relative == notice_name else (candidate / relative).read_bytes()
+        data = ((candidate / relative).read_bytes() if destination == helper.TARGET_HELPER
+                else (old_agent_source /
+                      relative.removeprefix("sovagrid-agent/")).read_bytes())
         target = Path(destination)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
@@ -315,7 +345,7 @@ def seed(candidate: Path) -> None:
     manifest_path = Path("/opt/sovagrid-agent-installer/source-manifest.json")
     replace_root_file(manifest_path, old_raw)
     unit = Path("/etc/systemd/system/sovagrid-agent.service")
-    replace_root_file(unit, (candidate / "sovagrid-agent/deploy/sovagrid-agent.service").read_bytes())
+    replace_root_file(unit, (old_agent_source / "deploy/sovagrid-agent.service").read_bytes())
     tunnel = Path("/etc/systemd/system/sovagrid-agent-tunnel.service")
     replace_root_file(tunnel, ("[Unit]\nDescription=Disposable test transport\n"
                                "[Service]\nType=simple\nUser=sovagrid-tunnel\n"
@@ -454,6 +484,8 @@ def killed_at_trial(archive_sha256: str) -> None:
 def run(archive_sha256: str) -> None:
     require(SHA.fullmatch(archive_sha256) is not None, "archive SHA required")
     planner = installed_planner()
+    require(planner._normal_activation_ready() is False,
+            "disposable apply trial must not silently arm the product gate")
     old_sha, _old_manifest, _old_state = planner._external_snapshot()
     old_state = Path("/var/lib/sovagrid-agent-enrollment/state.json").read_bytes()
     old_baseline = Path("/var/lib/sovagrid-promotion/baseline.json").read_bytes()
@@ -544,8 +576,8 @@ def main(argv: list[str]) -> None:
             os.environ.get("SOVAGRID_EXTERNAL_APPLY_VM_FIXTURE") == "1" and
             Path("/proc/1/comm").read_text().strip() == "systemd",
             "requires explicit opt-in on a disposable GitHub-hosted systemd VM")
-    if len(argv) == 2 and argv[0] == "seed":
-        seed(Path(argv[1]))
+    if len(argv) == 3 and argv[0] == "seed":
+        seed(Path(argv[1]), Path(argv[2]))
     elif len(argv) == 2 and argv[0] == "run":
         run(argv[1])
     elif len(argv) == 2 and argv[0] == "kill-at-trial":
@@ -554,7 +586,7 @@ def main(argv: list[str]) -> None:
         serve()
     else:
         raise SystemExit("usage: integrated_external_agent_apply_vm.py "
-                         "seed CANDIDATE_SOURCE | run ARCHIVE_SHA256")
+                         "seed CANDIDATE_SOURCE OLD_AGENT_SOURCE | run ARCHIVE_SHA256")
 
 
 if __name__ == "__main__":

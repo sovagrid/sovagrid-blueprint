@@ -74,16 +74,36 @@ jobs:
           mkdir "$RUNNER_TEMP/sovagrid-published-source"
           tar -xzf "$RUNNER_TEMP/sovagrid-0.3.9-published.tar.gz" \
             -C "$RUNNER_TEMP/sovagrid-published-source" --no-same-owner
-      - name: Build an opt-in candidate with the trial-capable Agent
+      - name: Build an opt-in candidate from one reviewed server component set
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.external_agent_apply }}
         env:
-          AGENT_COMMIT: 1085a14a7c0c654a5a6ec16edd028dea1c543c8e
+          OLD_AGENT_COMMIT: 1085a14a7c0c654a5a6ec16edd028dea1c543c8e
+          AGENT_COMMIT: 7b4dab289ca239266b77584a927f6976f375042c
+          HUB_COMMIT: f63511381c9c0fd8d8976891ed462aec9a88398e
+          WEB_COMMIT: cf126ca047f17df951ff40a5b75eb236b2939bd2
+          VPN_COMMIT: e500d5a9a97ad329c33af6a06eb1d2f17a541897
         run: |
+          set -o pipefail
+          [[ "$OLD_AGENT_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/sovagrid-agent" \
-            fetch --no-tags origin "$AGENT_COMMIT"
+            fetch --no-tags origin "$OLD_AGENT_COMMIT"
+          mkdir "$RUNNER_TEMP/sovagrid-old-agent-source"
           git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/sovagrid-agent" \
-            checkout --quiet --detach "$AGENT_COMMIT"
-          test "$(git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/sovagrid-agent" rev-parse HEAD)" = "$AGENT_COMMIT"
+            archive "$OLD_AGENT_COMMIT" | \
+            tar -x -C "$RUNNER_TEMP/sovagrid-old-agent-source"
+          while read -r repo commit; do
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+            git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/$repo" \
+              fetch --no-tags origin "$commit"
+            git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/$repo" \
+              checkout --quiet --detach "$commit"
+            test "$(git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/$repo" rev-parse HEAD)" = "$commit"
+          done <<REFS
+          sovagrid-agent $AGENT_COMMIT
+          sovagrid-hub $HUB_COMMIT
+          sovagrid-web $WEB_COMMIT
+          sovagrid-vpn $VPN_COMMIT
+          REFS
           python3 "$RUNNER_TEMP/sovagrid-candidate-workspace/sovagrid-blueprint/package_server.py" \
             "$RUNNER_TEMP/sovagrid-external-agent-candidate.tar.gz"
           mv "$RUNNER_TEMP/sovagrid-external-agent-candidate.tar.gz" \
@@ -100,7 +120,8 @@ jobs:
           if [ "$EXTERNAL_AGENT_APPLY" = true ]; then
             sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_EXTERNAL_APPLY_VM_FIXTURE=1 \
               python3 tests/integrated_external_agent_apply_vm.py seed \
-              "$RUNNER_TEMP/sovagrid-candidate-source"
+              "$RUNNER_TEMP/sovagrid-candidate-source" \
+              "$RUNNER_TEMP/sovagrid-old-agent-source"
           fi
           old_manifest=$(sha256sum "$RUNNER_TEMP/sovagrid-published-source/sovagrid-bundle.json" | cut -d ' ' -f1)
           sudo python3 "$RUNNER_TEMP/sovagrid-published-source/sovagrid-blueprint/deploy/promote_agent_only.py" \

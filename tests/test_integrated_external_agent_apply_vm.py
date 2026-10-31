@@ -73,7 +73,12 @@ class FixtureContractTests(unittest.TestCase):
         self.assertIn("default: false", workflow)
         self.assertIn("github.event_name == 'workflow_dispatch' && inputs.external_agent_apply",
                       workflow)
-        self.assertIn("1085a14a7c0c654a5a6ec16edd028dea1c543c8e", workflow)
+        self.assertIn(f"OLD_AGENT_COMMIT: {fixture.BASELINE_AGENT_COMMIT}", workflow)
+        self.assertIn('"$RUNNER_TEMP/sovagrid-old-agent-source"', workflow)
+        for component, commit in fixture.EXPECTED_TRIAL_COMPONENTS.items():
+            label = component.removeprefix("sovagrid-").upper() + "_COMMIT"
+            with self.subTest(component=component):
+                self.assertIn(f"{label}: {commit}", workflow)
         self.assertLess(workflow.index("Stage and preflight the exact candidate"),
                         workflow.index("Exercise external Agent apply and boot recovery"))
 
