@@ -535,6 +535,86 @@ class RestoreInspectionTest(unittest.TestCase):
         self.assertEqual(result["target_identity_conflicts"], 1)
         self.assertIn("TARGET_IDENTITY_CONFLICT", result["blockers"])
 
+    def test_portable_clean_plan_requires_verified_pair_and_checks_target(self):
+        identity = "a" * 32
+        source = "b" * 64
+        clean = {"ok": True, "protocol": restore.PROTOCOL, "verified": True,
+                 "archive": {"layout": "full"},
+                 "source_manifest_sha256": source, "uncompressed_bytes": 128,
+                 "target_kind": "clean", "target_empty": True,
+                 "target_conflicts": 0, "target_unsafe_paths": 0,
+                 "target_identity_conflicts": 0,
+                 "apply_available": False,
+                 "blockers": ["APPLY_NOT_IMPLEMENTED", "DOCKER_IMAGES_NOT_INCLUDED"]}
+        receipt = {"host_archive_id": identity, "host_archive_sha256": "c" * 64,
+                   "source_manifest_sha256": source, "images_sha256": "d" * 64,
+                   "images": {"hub": "sha256:" + "e" * 64}}
+        artifact = {"verified": True, "receipt": receipt, "platforms": {
+                    "hub": {"os": "linux", "architecture": "amd64"}},
+                    "bytes": 1024, "image_count": 1}
+        exporter = SimpleNamespace(
+            verify=lambda _id, *, require_receipt: artifact,
+            Refused=restore.Refused,
+            backup=SimpleNamespace(Refused=restore.Refused),
+            restore=SimpleNamespace(Refused=restore.Refused),
+            MAX_IMAGE_BYTES=8 * 1024**3)
+        docker = {"available": True, "architecture": "amd64",
+                  "conflicts": 0, "root_free_bytes": 10**10}
+        with (patch.object(restore, "clean_plan", return_value=clean),
+              patch.object(restore, "_portable_export_module", return_value=exporter),
+              patch.object(restore, "_docker_target", return_value=docker),
+              patch.object(restore, "_occupied_restore_ports", return_value=0),
+              patch.object(restore.shutil, "disk_usage",
+                           return_value=SimpleNamespace(free=10**10))):
+            result = restore.portable_clean_plan(identity)
+            self.assertTrue(result["portable_verified"])
+            self.assertTrue(result["target_empty"])
+            self.assertEqual(result["blockers"], ["APPLY_NOT_IMPLEMENTED"])
+            self.assertEqual(result["image_count"], 1)
+            self.assertEqual(result["images_sha256"], "d" * 64)
+            docker["architecture"] = "arm64"
+            docker["conflicts"] = 2
+            with patch.object(restore, "_occupied_restore_ports", return_value=1):
+                blocked = restore.portable_clean_plan(identity)
+            self.assertFalse(blocked["target_empty"])
+            self.assertIn("PLATFORM_MISMATCH", blocked["blockers"])
+            self.assertIn("DOCKER_STATE_PRESENT", blocked["blockers"])
+            self.assertIn("PORT_IN_USE", blocked["blockers"])
+            receipt["source_manifest_sha256"] = "f" * 64
+            with self.assertRaisesRegex(restore.Refused, "IMAGE_PAIR_INVALID"):
+                restore.portable_clean_plan(identity)
+
+            receipt["source_manifest_sha256"] = source
+            def missing(_id, *, require_receipt):
+                raise restore.Refused("RECEIPT_NOT_FOUND")
+            exporter.verify = missing
+            with self.assertRaisesRegex(restore.Refused, "RECEIPT_NOT_FOUND"):
+                restore.portable_clean_plan(identity)
+
+    def test_portable_target_inventory_is_bounded_and_read_only(self):
+        outputs = iter(("linux|x86_64|/var/lib/docker\n",
+                        "docker.io/library/sovagrid-hub:local\n",
+                        "sovagrid-hub-1\n",
+                        "sovagrid_default\n", "sovagrid_data\n"))
+        calls = []
+        def read_local_docker(args, **_kwargs):
+            calls.append(args)
+            return next(outputs)
+        with (patch.object(restore, "_read_command", side_effect=read_local_docker),
+              patch.object(restore.shutil, "disk_usage",
+                           return_value=SimpleNamespace(free=123456))):
+            target = restore._docker_target()
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(all(args[:len(restore.DOCKER)] == list(restore.DOCKER)
+                            for args in calls))
+        self.assertEqual(target, {"available": True, "architecture": "amd64",
+                                  "conflicts": 4, "root_free_bytes": 123456})
+        with patch.object(restore, "_read_command", return_value=(
+                "LISTEN 0 128 127.0.0.1:8766 0.0.0.0:*\n"
+                "LISTEN 0 128 [::]:443 [::]:*\n"
+                "LISTEN 0 128 127.0.0.1:22 0.0.0.0:*\n")):
+            self.assertEqual(restore._occupied_restore_ports(), 2)
+
     def test_identity_plan_uses_archived_dynamic_gid_and_checks_nss(self):
         present = {"/etc/sovagrid/agent.json", "/etc/sovagrid/agent.token",
                    restore.backup.WEB_AGENT_MARKER,

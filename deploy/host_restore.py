@@ -22,6 +22,7 @@ import grp
 import pwd
 import re
 import shutil
+import subprocess
 import stat
 import sys
 import tarfile
@@ -52,6 +53,10 @@ backup = _sibling("host_backup.py", "_sovagrid_host_restore_backup")
 PROTOCOL = "sovagrid-host-restore-plan-v1"
 STAGE_PROTOCOL = "sovagrid-host-restore-stage-v1"
 STAGING = Path("/var/lib/.sovagrid-host-restore-staging")
+RESTORE_PORTS = frozenset((80, 443, 8766, 8767))
+MIN_RESTORE_FREE = 512 * 1024**2
+MAX_DOCKER_OUTPUT = 128 * 1024
+DOCKER = ("/usr/bin/docker", "--host", "unix:///var/run/docker.sock")
 ID = re.compile(r"[0-9a-f]{32}\Z")
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
@@ -647,6 +652,176 @@ def clean_plan(identity: str) -> dict:
             "apply_available": False, "blockers": blockers}
 
 
+def _portable_export_module():
+    # Load only for the explicit portable plan. The exporter validates its
+    # own private files, including the transfer receipt, without source-host
+    # operation state.
+    return _sibling("host_image_export.py", "_sovagrid_restore_portable_export")
+
+
+def _read_command(args: list[str], *, limit: int = MAX_DOCKER_OUTPUT) -> str | None:
+    """Run one bounded local inventory command; no shell or Docker mutation."""
+    try:
+        command = subprocess.run(args, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if command.returncode != 0 or len(command.stdout) > limit:
+        return None
+    try:
+        return command.stdout.decode("ascii")
+    except UnicodeError:
+        return None
+
+
+def _docker_target() -> dict:
+    """Inspect only the target daemon and names a restore could collide with."""
+    info = _read_command([*DOCKER, "info", "--format",
+                          "{{.OSType}}|{{.Architecture}}|{{.DockerRootDir}}"],
+                         limit=4096)
+    if info is None:
+        return {"available": False, "architecture": None,
+                "conflicts": None, "root_free_bytes": None}
+    parts = info.strip().split("|")
+    if len(parts) != 3 or parts[0] != "linux" or not parts[2].startswith("/") or \
+            any(character in parts[2] for character in "\r\n\x00"):
+        raise Refused("DOCKER_CHECK_UNAVAILABLE")
+    architecture = {"x86_64": "amd64", "aarch64": "arm64",
+                    "amd64": "amd64", "arm64": "arm64"}.get(parts[1])
+    if architecture is None:
+        raise Refused("DOCKER_CHECK_UNAVAILABLE")
+    commands = (
+        ("image", "ls", "-a", "--format", "{{.Repository}}:{{.Tag}}"),
+        ("ps", "-a", "--format", "{{.Names}}"),
+        ("network", "ls", "--format", "{{.Name}}"),
+        ("volume", "ls", "--format", "{{.Name}}"),
+    )
+    inventories = []
+    for args in commands:
+        raw = _read_command([*DOCKER, *args])
+        if raw is None:
+            raise Refused("DOCKER_CHECK_UNAVAILABLE")
+        names = raw.splitlines()
+        if len(names) > 4096 or any(not name or len(name) > 256 or
+                                     any(character.isspace() for character in name)
+                                     for name in names):
+            raise Refused("DOCKER_CHECK_UNAVAILABLE")
+        inventories.append(names)
+    images, containers, networks, volumes = inventories
+    conflicts = (sum(re.match(r"^(?:(?:docker\.io/)?library/)?sovagrid-", name)
+                     is not None for name in images) +
+                 sum(name.startswith("sovagrid-") for name in containers) +
+                 sum(name.startswith(("sovagrid_", "sovagrid-")) for name in networks) +
+                 sum(name.startswith(("sovagrid_", "sovagrid-")) for name in volumes))
+    try:
+        root_free = shutil.disk_usage(parts[2]).free
+    except OSError as exc:
+        raise Refused("DOCKER_CHECK_UNAVAILABLE") from exc
+    return {"available": True, "architecture": architecture,
+            "conflicts": conflicts, "root_free_bytes": root_free}
+
+
+def _occupied_restore_ports() -> int | None:
+    raw = _read_command(["/usr/bin/ss", "-H", "-ltn"])
+    if raw is None:
+        return None
+    occupied = set()
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) < 5 or fields[0] != "LISTEN":
+            raise Refused("PORT_CHECK_UNAVAILABLE")
+        match = re.search(r":([0-9]{1,5})\Z", fields[3])
+        if match is None:
+            raise Refused("PORT_CHECK_UNAVAILABLE")
+        port = int(match.group(1))
+        if port in RESTORE_PORTS:
+            occupied.add(port)
+    return len(occupied)
+
+
+def portable_clean_plan(identity: str) -> dict:
+    """Verify a transferred host+image pair and inspect clean-host conflicts.
+
+    This is advisory and grants no restore authority. A future apply must
+    revalidate every source FD and target observation under its own locks.
+    """
+    identity = _id(identity)
+    clean = clean_plan(identity)
+    try:
+        exporter = _portable_export_module()
+    except (RuntimeError, ImportError, OSError) as exc:
+        raise Refused("IMAGE_PAIR_UNAVAILABLE") from exc
+    try:
+        artifact = exporter.verify(identity, require_receipt=True)
+    except (exporter.Refused, exporter.backup.Refused, exporter.restore.Refused,
+            OSError, ValueError, TypeError, AttributeError) as exc:
+        code = str(exc) if isinstance(exc, exporter.Refused) else "IMAGE_PAIR_INVALID"
+        raise Refused(code) from None
+    if (not isinstance(artifact, dict) or artifact.get("verified") is not True or
+            type(artifact.get("bytes")) is not int or
+            not 0 < artifact["bytes"] <= exporter.MAX_IMAGE_BYTES or
+            type(artifact.get("image_count")) is not int or
+            not isinstance(artifact.get("receipt"), dict) or
+            not isinstance(artifact.get("platforms"), dict)):
+        raise Refused("IMAGE_PAIR_INVALID")
+    receipt = artifact["receipt"]
+    if (receipt.get("host_archive_id") != identity or
+            receipt.get("source_manifest_sha256") != clean["source_manifest_sha256"] or
+            any(not isinstance(receipt.get(key), str) or
+                SHA.fullmatch(receipt[key]) is None
+                for key in ("host_archive_sha256", "images_sha256")) or
+            not isinstance(receipt.get("images"), dict) or
+            set(artifact["platforms"]) != set(receipt["images"]) or
+            type(artifact["image_count"]) is not int or
+            artifact["image_count"] != len(artifact["platforms"]) or
+            any(platform not in ({"os": "linux", "architecture": "amd64"},
+                                 {"os": "linux", "architecture": "arm64"})
+                for platform in artifact["platforms"].values())):
+        raise Refused("IMAGE_PAIR_INVALID")
+    docker = _docker_target()
+    ports = _occupied_restore_ports()
+    try:
+        root_free = shutil.disk_usage(backup.ROOT).free
+    except OSError as exc:
+        raise Refused("TARGET_CHECK_UNAVAILABLE") from exc
+    required_free = (clean["uncompressed_bytes"] +
+                     4 * artifact["bytes"] + MIN_RESTORE_FREE)
+    platform_match = (docker["available"] and
+                      all(platform == {"os": "linux",
+                                       "architecture": docker["architecture"]}
+                          for platform in artifact["platforms"].values()))
+    blockers = [code for code in clean["blockers"]
+                if code != "DOCKER_IMAGES_NOT_INCLUDED"]
+    if not docker["available"]:
+        blockers.append("DOCKER_UNAVAILABLE")
+    elif not platform_match:
+        blockers.append("PLATFORM_MISMATCH")
+    if docker["conflicts"]:
+        blockers.append("DOCKER_STATE_PRESENT")
+    if ports is None:
+        blockers.append("PORT_CHECK_UNAVAILABLE")
+    elif ports:
+        blockers.append("PORT_IN_USE")
+    if root_free < required_free or (docker["root_free_bytes"] is not None and
+                                    docker["root_free_bytes"] < 4 * artifact["bytes"] +
+                                    MIN_RESTORE_FREE):
+        blockers.append("DISK_SPACE")
+    return {**clean, "portable_verified": True,
+            "host_archive_sha256": receipt["host_archive_sha256"],
+            "images_sha256": receipt["images_sha256"],
+            "image_count": artifact["image_count"], "image_bytes": artifact["bytes"],
+            "image_platforms": artifact["platforms"],
+            "target_docker_available": docker["available"],
+            "target_docker_architecture": docker["architecture"],
+            "target_docker_conflicts": docker["conflicts"],
+            "target_ports_in_use": ports, "target_free_bytes": root_free,
+            "required_free_bytes": required_free,
+            "target_empty": clean["target_empty"] and not docker["conflicts"] and
+                            ports == 0,
+            "apply_available": False, "blockers": blockers}
+
+
 def _staging_root() -> tuple[Path, int]:
     """Create/open the one root-only staging namespace without following links."""
     present, unsafe = _target_path("/var/lib")
@@ -1031,11 +1206,13 @@ def stage(identity: str) -> dict:
 
 def main(argv: list[str]) -> int:
     try:
-        if len(argv) != 2 or argv[0] not in ("verify", "plan", "clean-plan", "stage",
+        if len(argv) != 2 or argv[0] not in ("verify", "plan", "clean-plan",
+                                              "portable-clean-plan", "stage",
                                               "stage-status"):
             raise Refused("USAGE")
         result = (verify(argv[1]) if argv[0] == "verify" else
                   clean_plan(argv[1]) if argv[0] == "clean-plan" else
+                  portable_clean_plan(argv[1]) if argv[0] == "portable-clean-plan" else
                   stage(argv[1]) if argv[0] == "stage" else
                   stage_status(argv[1]) if argv[0] == "stage-status" else plan(argv[1]))
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
