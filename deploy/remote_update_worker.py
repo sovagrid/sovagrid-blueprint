@@ -492,6 +492,7 @@ def candidate_features_compatible(source, flags):
             fail('COMPAT')
         for name in ('compose.web-agent.yaml', 'web_agent_bundle.py',
                      'web_agent_jobs.py', 'web_agent_service.py',
+                     'web_wireguard_control.py',
                      *WEB_AGENT_UNITS):
             if not (source / 'sovagrid-blueprint/deploy' / name).is_file():
                 fail('COMPAT')

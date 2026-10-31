@@ -34,7 +34,9 @@ REQUIRED = frozenset(("sovagrid-blueprint/run.sh", "sovagrid-blueprint/deploy/co
     "sovagrid-blueprint/deploy/vpn_source_install.py",
     "sovagrid-web/Dockerfile", "sovagrid-web/deploy/Caddyfile.container",
     "sovagrid-agent/deploy/sovagrid-agent.service",
-    "sovagrid-vpn/deploy/sovagrid-vpn-status.service"))
+    "sovagrid-vpn/deploy/sovagrid-vpn-status.service",
+    "sovagrid-vpn/deploy/install-wireguard-control.py",
+    "sovagrid-vpn/sovagrid_vpn/wireguard_install.py"))
 _NAME = re.compile(r"[A-Za-z0-9_.-]+\Z")
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")

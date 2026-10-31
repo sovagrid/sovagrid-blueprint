@@ -72,6 +72,16 @@ class FakeVpnSource:
                 "host_key_fingerprint": kwargs["fingerprint"]}
 
 
+class FakeWireguardControl:
+    def __init__(self):
+        self.calls = []
+
+    def execute(self, action, **kwargs):
+        self.calls.append((action, kwargs))
+        return {"protocol": 1, "scope": "entered_target", "action": action,
+                "host": kwargs["options"].host, "port": kwargs["options"].port}
+
+
 def request(action, payload):
     return {"action": action, "session_token": TOKEN, "payload": payload}
 
@@ -150,6 +160,39 @@ class ServiceTests(unittest.TestCase):
             service.dispatch(self.jobs, request("vpn-source-apply", login_payload()),
                              authorize=lambda token: None, vpn_source=vpn)
         self.assertEqual(len(vpn.calls), 1)
+
+    def test_wireguard_control_requires_fresh_admin_and_exact_confirmed_shape(self):
+        wg = FakeWireguardControl()
+        payload = login_payload()
+        authorized = []
+        self.assertEqual(service.dispatch(self.jobs, request("wg-control-preview", payload),
+            authorize=lambda token: authorized.append(token), wg_control=wg)["action"], "preview")
+        self.assertEqual(authorized, [TOKEN])
+        self.assertEqual(payload["password"], "")
+        self.assertEqual(wg.calls[0][1]["credential"].password, "")
+        self.assertEqual(wg.calls[0][1]["fingerprint"], FINGERPRINT)
+        for bad in (
+                request("wg-control-preview", {**login_payload(), "command": "id"}),
+                request("wg-control-apply", {**login_payload(), "confirm": True}),
+                request("wg-control-recover", {**login_payload(), "expected": {}})):
+            with self.assertRaises(service.RequestError):
+                service.dispatch(self.jobs, bad, authorize=lambda token: authorized.append(token),
+                                 wg_control=wg)
+            self.assertEqual(bad["payload"]["password"], "")
+        self.assertEqual(len(wg.calls), 1)
+        expected = {"state_revision": "a" * 64, "source_revision": "b" * 64}
+        applied = login_payload() | {"expected": expected, "confirm": True}
+        service.dispatch(self.jobs, request("wg-control-apply", applied),
+                         authorize=lambda token: authorized.append(token), wg_control=wg)
+        self.assertEqual(wg.calls[-1][0], "apply")
+        self.assertEqual(wg.calls[-1][1]["expected"], expected)
+        self.assertIs(wg.calls[-1][1]["confirm"], True)
+        self.assertEqual(applied["password"], "")
+        recovered = login_payload() | {"confirm": True}
+        service.dispatch(self.jobs, request("wg-control-recover", recovered),
+                         authorize=lambda token: authorized.append(token), wg_control=wg)
+        self.assertEqual(wg.calls[-1][0], "recover")
+        self.assertEqual(len(authorized), 6)
 
     def _socket_reply(self, payload: bytes, *, uid=service._GATEWAY_UID):
         client, server = socket.socketpair()

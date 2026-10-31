@@ -369,7 +369,8 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
         need(b"# SOVAGRID_WEB_AGENT_INSTALL_V1" in script,
              "CANDIDATE_INCOMPATIBLE")
         for name in ("compose.web-agent.yaml", "web_agent_bundle.py",
-                     "web_agent_jobs.py", "web_agent_service.py", *WEB_AGENT_UNITS):
+                     "web_agent_jobs.py", "web_agent_service.py",
+                     "web_wireguard_control.py", *WEB_AGENT_UNITS):
             need((source / "sovagrid-blueprint/deploy" / name).is_file(),
                  "CANDIDATE_INCOMPATIBLE")
     if common.ssh_gateway_managed():

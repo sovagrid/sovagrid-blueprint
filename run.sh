@@ -347,13 +347,18 @@ if (( with_containers )); then
   done
 fi
 [[ -f $source_root/sovagrid-vpn/deploy/sovagrid-vpn-status.service && -f $source_root/sovagrid-vpn/deploy/sovagrid-vpn-status.timer ]] || die 'VPN inventory systemd units are missing'
+[[ -f $source_root/sovagrid-vpn/deploy/install-wireguard-control.py &&
+   -f $source_root/sovagrid-vpn/sovagrid_vpn/wireguard_install.py &&
+   ! -L $source_root/sovagrid-vpn/deploy/install-wireguard-control.py &&
+   ! -L $source_root/sovagrid-vpn/sovagrid_vpn/wireguard_install.py ]] ||
+  die 'managed WireGuard installer source is missing or a symlink'
 for auto_file in auto_update.py remote_update_worker.py sovagrid-auto-update.service sovagrid-auto-update.timer \
                  release_feed.py sovagrid-release-feed.service sovagrid-release-feed.timer \
                  sovagrid-hub-backup-control.socket sovagrid-hub-backup-control.service compose.backup.yaml; do
   [[ -f $source_root/sovagrid-blueprint/deploy/$auto_file && ! -L $source_root/sovagrid-blueprint/deploy/$auto_file ]] || die "auto-update source $auto_file is missing or a symlink"
 done
 for web_agent_file in web_agent_bundle.py web_agent_jobs.py web_agent_local_rpc.py web_agent_target_ssh.py \
-                      web_agent_service.py web_vpn_source.py vpn_source_install.py sovagrid-web-agent-control.socket \
+                      web_agent_service.py web_vpn_source.py web_wireguard_control.py vpn_source_install.py sovagrid-web-agent-control.socket \
                       sovagrid-web-agent-control.service compose.web-agent.yaml; do
   [[ -f $source_root/sovagrid-blueprint/deploy/$web_agent_file &&
      ! -L $source_root/sovagrid-blueprint/deploy/$web_agent_file ]] ||

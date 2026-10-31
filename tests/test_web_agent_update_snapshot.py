@@ -54,6 +54,7 @@ class WebAgentUpdateSnapshotTest(unittest.TestCase):
             script.write_bytes(b"# SOVAGRID_WEB_AGENT_INSTALL_V1\n")
             required = ("compose.web-agent.yaml", "web_agent_bundle.py",
                         "web_agent_jobs.py", "web_agent_service.py",
+                        "web_wireguard_control.py",
                         *worker.WEB_AGENT_UNITS)
             for name in required:
                 path = source / "sovagrid-blueprint/deploy" / name
@@ -65,7 +66,7 @@ class WebAgentUpdateSnapshotTest(unittest.TestCase):
                  mock.patch.object(worker, "ssh_gateway_managed", return_value=False), \
                  mock.patch.object(worker, "managed_routing_enabled", return_value=False):
                 worker.candidate_features_compatible(source, [])
-                (source / "sovagrid-blueprint/deploy/web_agent_jobs.py").unlink()
+                (source / "sovagrid-blueprint/deploy/web_wireguard_control.py").unlink()
                 with self.assertRaises(worker.UpdateFailure):
                     worker.candidate_features_compatible(source, [])
 
