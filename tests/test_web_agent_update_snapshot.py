@@ -57,10 +57,15 @@ class WebAgentUpdateSnapshotTest(unittest.TestCase):
             script.write_bytes(b"# SOVAGRID_WEB_AGENT_INSTALL_V1\n")
             required = ("compose.web-agent.yaml", "web_agent_bundle.py",
                         "web_agent_jobs.py", "web_agent_service.py",
-                        "web_wireguard_control.py",
+                        "web_wireguard_control.py", "web_amnezia_provision.py",
                         *worker.WEB_AGENT_UNITS)
             for name in required:
                 path = source / "sovagrid-blueprint/deploy" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture\n")
+            for name in ("deploy/sovagrid-amnezia-provision",
+                         "sovagrid_vpn/amnezia_provision.py"):
+                path = source / "sovagrid-vpn" / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("fixture\n")
             with mock.patch.object(worker, "ROOT", source), \

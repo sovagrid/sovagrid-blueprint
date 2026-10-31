@@ -253,6 +253,8 @@ class Installer:
                     "deploy/sovagrid-amnezia-broker", "deploy/sovagrid-amnezia-control.service",
                     "deploy/sovagrid-amnezia-control.socket", "sovagrid_vpn/amnezia_install.py",
                     "sovagrid_vpn/amnezia_admin.py"}
+        required.update({"deploy/sovagrid-amnezia-provision",
+                         "sovagrid_vpn/amnezia_provision.py"})
         need(required <= set(component), "SOURCE_UNTRUSTED")
         source = {}
         package = {}

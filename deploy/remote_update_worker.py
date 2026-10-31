@@ -492,9 +492,13 @@ def candidate_features_compatible(source, flags):
             fail('COMPAT')
         for name in ('compose.web-agent.yaml', 'web_agent_bundle.py',
                      'web_agent_jobs.py', 'web_agent_service.py',
-                     'web_wireguard_control.py',
+                     'web_wireguard_control.py', 'web_amnezia_provision.py',
                      *WEB_AGENT_UNITS):
             if not (source / 'sovagrid-blueprint/deploy' / name).is_file():
+                fail('COMPAT')
+        for name in ('deploy/sovagrid-amnezia-provision',
+                     'sovagrid_vpn/amnezia_provision.py'):
+            if not (source / 'sovagrid-vpn' / name).is_file():
                 fail('COMPAT')
     if ssh_gateway_managed():
         gateway_required = (

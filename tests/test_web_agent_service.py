@@ -82,6 +82,10 @@ class FakeWireguardControl:
                 "host": kwargs["options"].host, "port": kwargs["options"].port}
 
 
+class FakeAmneziaProvision(FakeWireguardControl):
+    pass
+
+
 def request(action, payload):
     return {"action": action, "session_token": TOKEN, "payload": payload}
 
@@ -192,6 +196,41 @@ class ServiceTests(unittest.TestCase):
         service.dispatch(self.jobs, request("wg-control-recover", recovered),
                          authorize=lambda token: authorized.append(token), wg_control=wg)
         self.assertEqual(wg.calls[-1][0], "recover")
+        self.assertEqual(len(authorized), 6)
+
+    def test_amnezia_provision_requires_fresh_admin_and_wipes_credentials(self):
+        provision = FakeAmneziaProvision()
+        authorized = []
+        preview = login_payload() | {"listen_port": 49289, "subnet": "10.91.7.0/24",
+                                     "route_mode": "full"}
+        result = service.dispatch(self.jobs, request("amnezia-provision-preview", preview),
+            authorize=lambda token: authorized.append(token), amnezia_provision=provision)
+        self.assertEqual(result["action"], "preview")
+        self.assertEqual(authorized, [TOKEN])
+        self.assertEqual(preview["password"], "")
+        self.assertEqual(provision.calls[-1][1]["credential"].password, "")
+        for bad in (
+                request("amnezia-provision-preview", login_payload() | {"command": "id"}),
+                request("amnezia-provision-apply", login_payload() | {
+                    "listen_port": 49289, "subnet": "10.91.7.0/24", "route_mode": "full",
+                    "expected_state": "a" * 64}),
+                request("amnezia-provision-recover", login_payload() | {"route_mode": "split"})):
+            with self.assertRaises(service.RequestError):
+                service.dispatch(self.jobs, bad, authorize=lambda token: authorized.append(token),
+                                 amnezia_provision=provision)
+            self.assertEqual(bad["payload"]["password"], "")
+        applied = login_payload() | {"listen_port": 49289, "subnet": "10.91.7.0/24",
+                                     "route_mode": "full", "expected_state": "a" * 64,
+                                     "confirm": True}
+        service.dispatch(self.jobs, request("amnezia-provision-apply", applied),
+                         authorize=lambda token: authorized.append(token), amnezia_provision=provision)
+        self.assertEqual(provision.calls[-1][0], "apply")
+        self.assertEqual(provision.calls[-1][1]["expected_state"], "a" * 64)
+        self.assertEqual(applied["password"], "")
+        recovered = login_payload() | {"confirm": True}
+        service.dispatch(self.jobs, request("amnezia-provision-recover", recovered),
+                         authorize=lambda token: authorized.append(token), amnezia_provision=provision)
+        self.assertEqual(provision.calls[-1][0], "recover")
         self.assertEqual(len(authorized), 6)
 
     def _socket_reply(self, payload: bytes, *, uid=service._GATEWAY_UID):

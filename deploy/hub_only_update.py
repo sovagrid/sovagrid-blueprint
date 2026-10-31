@@ -370,8 +370,13 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
              "CANDIDATE_INCOMPATIBLE")
         for name in ("compose.web-agent.yaml", "web_agent_bundle.py",
                      "web_agent_jobs.py", "web_agent_service.py",
-                     "web_wireguard_control.py", *WEB_AGENT_UNITS):
+                     "web_wireguard_control.py", "web_amnezia_provision.py",
+                     *WEB_AGENT_UNITS):
             need((source / "sovagrid-blueprint/deploy" / name).is_file(),
+                 "CANDIDATE_INCOMPATIBLE")
+        for name in ("deploy/sovagrid-amnezia-provision",
+                     "sovagrid_vpn/amnezia_provision.py"):
+            need((source / "sovagrid-vpn" / name).is_file(),
                  "CANDIDATE_INCOMPATIBLE")
     if common.ssh_gateway_managed():
         need(b"# SOVAGRID_SSH_GATEWAY_INSTALL_V1" in script,
