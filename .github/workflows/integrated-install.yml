@@ -115,12 +115,14 @@ jobs:
           print("SOVAGRID_EXPECTED_MANIFEST=" + hashlib.sha256(path.read_bytes()).hexdigest())
           PY
       - name: Prepare a private SSH and systemd Ubuntu target
-        run: >-
-          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
-          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
-          RUNNER_TEMP="$RUNNER_TEMP"
-          python3 sovagrid-blueprint/tests/integrated_remote_agent_vm.py
-          prepare "$RUNNER_TEMP/sovagrid-remote-ci"
+        run: |
+          sudo -n apt-get update -qq
+          sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends systemd-container
+          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            python3 sovagrid-blueprint/tests/integrated_remote_agent_vm.py \
+            prepare "$RUNNER_TEMP/sovagrid-remote-ci"
       - name: Install the complete pinned source on the disposable Ubuntu host
         run: sudo -n bash /opt/sovagrid-src/sovagrid-blueprint/run.sh
       - name: Verify live Hub image pin, Agent and Web

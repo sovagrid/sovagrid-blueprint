@@ -21,6 +21,19 @@ class Response(io.BytesIO):
 
 
 class BrowserRequestTests(unittest.TestCase):
+    def test_machine_roots_and_units_are_fixed_to_disposable_names(self):
+        target = "sovagrid-ci-target-012345abcdef"
+        web = "sovagrid-ci-web-target-012345abcdef"
+        self.assertEqual(fixture.machine_root(target), Path("/var/lib/machines") / target)
+        self.assertEqual(fixture.machine_root(web), Path("/var/lib/machines") / web)
+        self.assertEqual(fixture.machine_unit(target), "sovagrid-ci-nspawn-target-012345abcdef.service")
+        self.assertEqual(fixture.machine_unit(web), "sovagrid-ci-nspawn-web-target-012345abcdef.service")
+        self.assertNotEqual(fixture.CONNECT_PORT, fixture.WEB_PORT)
+        for name in ("sovagrid-ci-target-../../etc", "sovagrid-ci-target-012345abcdef/else",
+                     "sovagrid-ci-target-untrusted", "sovagrid-ci-other-012345abcdef"):
+            with self.subTest(name=name), self.assertRaises(RuntimeError):
+                fixture.machine_root(name)
+
     def test_connect_journal_uses_a_root_owned_runtime_ancestor(self):
         records = fixture.ci_records_dir({"container": "sovagrid-ci-target-012345abcdef"})
         self.assertEqual(records, Path("/run/sovagrid-ci-connect-012345abcdef"))

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Jigokuraku01
 # Additional author attribution terms: see ATTRIBUTION.md.
-# Disposable Ubuntu target for the GitHub-hosted two-server install check.
+# Ubuntu rootfs source for disposable systemd-nspawn CI machines. Docker
+# builds and exports this image; it never runs the target's systemd service.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -12,7 +13,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -m 0700 /root/.ssh \
     && install -d -m 0755 /run/sshd \
-    && ssh-keygen -A \
     && printf '%s\n' \
        'PermitRootLogin prohibit-password' \
        'PasswordAuthentication no' \
