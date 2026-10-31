@@ -20,6 +20,9 @@ jobs:
           test "$RUNNER_OS" = Linux
           test ! -e /opt/sovagrid-src
           test ! -e /var/lib/sovagrid/.managed-by-run-sh
+          test -d /opt && test ! -L /opt
+          sudo -n chown root:root /opt
+          sudo -n chmod 0755 /opt
           sudo -n systemctl start docker
       - uses: actions/checkout@v6
         with:
