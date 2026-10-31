@@ -49,7 +49,13 @@ def _sibling(filename: str, name: str):
 restore = _sibling("host_restore.py", "_sovagrid_host_images_restore")
 backup = restore.backup
 PROTOCOL = "sovagrid-host-images-v1"
-PORTABLE_RECEIPT = "sovagrid-portable-host-receipt-v1"
+PORTABLE_RECEIPT_V1 = "sovagrid-portable-host-receipt-v1"
+PORTABLE_RECEIPT = "sovagrid-portable-host-receipt-v2"
+MAX_UNIT_STATES = 32
+ENABLEMENT_STATES = frozenset((
+    "enabled", "enabled-runtime", "disabled", "static", "indirect", "alias",
+    "masked", "masked-runtime", "linked", "linked-runtime", "generated", "transient",
+))
 OUTPUT = Path("/var/lib/sovagrid-host-image-exports")
 # Pin the local daemon. A caller's Docker context must not redirect an export
 # to a remote host with identically named Compose services.
@@ -99,16 +105,17 @@ def _unique(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
-def _verified_host(identity: str, *, deadline: float) -> tuple[int, dict, tuple]:
+def _verified_host(identity: str, *, deadline: float) -> tuple[int, dict, tuple, dict[str, str]]:
     """Pin the host archive FD throughout export, including its source bundle."""
     fd, manifest = restore._archive_fd(identity)
     try:
         before = restore._hash_archive(fd, manifest, deadline=deadline)
+        unit_hashes: dict[str, str] = {}
         restore._inspect_tar(fd, manifest, backup._sources(manifest["layout"]),
-                             deadline=deadline)
+                             deadline=deadline, managed_unit_hashes=unit_hashes)
         if restore._fingerprint(os.fstat(fd)) != before:
             raise Refused("HOST_ARCHIVE_CHANGED")
-        return fd, manifest, before
+        return fd, manifest, before, unit_hashes
     except BaseException:
         os.close(fd)
         raise
@@ -827,18 +834,48 @@ def _hash_tar(fd: int, record: dict, *, deadline: float) -> tuple:
 
 
 def _valid_portable_receipt(value: object, identity: str, record: dict) -> bool:
-    if not isinstance(value, dict) or set(value) != {
+    fields = {
             "protocol", "host_archive_id", "host_archive_sha256",
             "source_manifest_sha256", "images_sha256", "images",
             "container_ids", "exported_configs", "rootfs_sha256",
-            "active_units", "unit_hashes"}:
+            "active_units", "unit_hashes"}
+    if not isinstance(value, dict):
+        return False
+    v2 = value.get("protocol") == PORTABLE_RECEIPT
+    if (value.get("protocol") not in (PORTABLE_RECEIPT_V1, PORTABLE_RECEIPT) or
+            set(value) != (fields | {"unit_states"} if v2 else fields)):
         return False
     units = value["active_units"]
     hashes = value["unit_hashes"]
     allowed = backup.WRITERS[record["layout"]] | (
         backup.AMNEZIA_WRITERS if record["layout"] == "full" else frozenset())
-    return (value["protocol"] == PORTABLE_RECEIPT and
-            value["host_archive_id"] == identity and
+    if v2:
+        states = value["unit_states"]
+        allowed_names = {Path(source.path).name
+                         for source in backup._sources(record["layout"])
+                         if source.kind == "file" and source.path.startswith(
+                             "/etc/systemd/system/sovagrid-")}
+        if (not isinstance(states, dict) or len(states) > MAX_UNIT_STATES or
+                len(allowed_names) > MAX_UNIT_STATES or
+                any(not isinstance(name, str) or name not in allowed_names or
+                    not isinstance(state, dict) or
+                    set(state) != {"active", "enablement", "sha256"} or
+                    type(state["active"]) is not bool or
+                    not isinstance(state["enablement"], str) or
+                    state["enablement"] not in ENABLEMENT_STATES or
+                    not isinstance(state["sha256"], str) or
+                    re.fullmatch(r"[0-9a-f]{64}", state["sha256"]) is None
+                    for name, state in states.items()) or
+                not isinstance(units, list) or len(units) > MAX_UNIT_STATES or
+                any(not isinstance(unit, str) for unit in units) or
+                set(units) != {name for name, state in states.items()
+                               if name in allowed and state["active"]} or
+                not isinstance(hashes, dict) or
+                not set(hashes).issubset(states) or
+                any(states[name]["sha256"] != digest
+                    for name, digest in hashes.items())):
+            return False
+    return (value["host_archive_id"] == identity and
             value["host_archive_sha256"] == record["host_archive_sha256"] and
             value["source_manifest_sha256"] == record["source_manifest_sha256"] and
             value["images_sha256"] == record["sha256"] and
@@ -936,7 +973,8 @@ def verify(identity: str, *, require_receipt: bool = False) -> dict:
     backup._require_root()
     identity = _id(identity)
     deadline = time.monotonic() + 2 * backup.MAX_SECONDS
-    host_fd, host, _before = _verified_host(identity, deadline=deadline)
+    host_fd, host, _before, archived_unit_hashes = _verified_host(
+        identity, deadline=deadline)
     os.close(host_fd)
     folder, directory_fd, tar_fd, record = _artifact(identity)
     try:
@@ -958,6 +996,10 @@ def verify(identity: str, *, require_receipt: bool = False) -> dict:
             raise Refused("ARTIFACT_CHANGED")
         receipt = _read_portable_receipt(directory_fd, identity, record,
                                          required=require_receipt)
+        if (receipt is not None and receipt["protocol"] == PORTABLE_RECEIPT and
+                {name: state["sha256"] for name, state in
+                 receipt["unit_states"].items()} != archived_unit_hashes):
+            raise Refused("INVALID_RECEIPT")
         result = {"ok": True, "protocol": PROTOCOL, "id": identity,
                   "verified": True, "image_count": len(record["images"]),
                   "bytes": record["bytes"], "apply_available": False}
@@ -970,13 +1012,16 @@ def verify(identity: str, *, require_receipt: bool = False) -> dict:
         os.close(directory_fd)
 
 
-def _create_locked(identity: str, *, expected_installed: dict | None = None) -> dict:
+def _create_locked(identity: str, *, expected_installed: dict | None = None,
+                   expected_unit_hashes: dict[str, str] | None = None) -> dict:
     """Create a paired artifact while the caller owns candidate/public locks."""
     backup._require_root()
     identity = _id(identity)
     deadline = time.monotonic() + 2 * backup.MAX_SECONDS
-    host_fd, host, before = _verified_host(identity, deadline=deadline)
+    host_fd, host, before, archived_units = _verified_host(identity, deadline=deadline)
     try:
+        if expected_unit_hashes is not None and archived_units != expected_unit_hashes:
+            raise Refused("HOST_ARCHIVE_CHANGED")
         if backup._layout() != host["layout"] or (
                 backup._source_manifest() != host["source_manifest_sha256"]):
             raise Refused("SOURCE_CHANGED")

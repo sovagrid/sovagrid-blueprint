@@ -53,7 +53,8 @@ update = _sibling("remote_update_worker.py", "_sovagrid_backup_compose")
 images = _sibling("host_image_export.py", "_sovagrid_backup_images")
 
 PROTOCOL = "sovagrid-host-backup-operation-v1"
-PORTABLE_RECEIPT = "sovagrid-portable-host-receipt-v1"
+PORTABLE_RECEIPT_V1 = "sovagrid-portable-host-receipt-v1"
+PORTABLE_RECEIPT = "sovagrid-portable-host-receipt-v2"
 DEFAULT_STATE_DIR = Path("/var/lib/sovagrid-host-backup-operations")
 STATE_DIR = DEFAULT_STATE_DIR
 SOURCE = Path("/opt/sovagrid-src")
@@ -67,6 +68,11 @@ FINAL = frozenset(("complete", "recovered", "failed"))
 MAX_OPERATIONS = 10_000
 LIST_LIMIT = 100
 MAX_STATE = 16_384
+MAX_UNIT_STATES = 32
+ENABLEMENT_STATES = frozenset((
+    "enabled", "enabled-runtime", "disabled", "static", "indirect", "alias",
+    "masked", "masked-runtime", "linked", "linked-runtime", "generated", "transient",
+))
 MAX_COMMAND_SECONDS = 120
 TRANSIENT_WRITERS = frozenset((
     "sovagrid-vpn-status.service", "sovagrid-auto-update.service",
@@ -183,8 +189,10 @@ def _record(identity: str) -> dict[str, Any]:
     keys = {"protocol", "request_id", "phase", "created_at", "updated_at",
             "expected_manifest_sha256", "layout", "active_units", "running_containers",
             "container_ids", "unit_hashes", "archive_id", "archive", "error"}
-    portable_keys = keys | {"portable_images", "image_receipt"}
-    if (not isinstance(value, dict) or set(value) not in (keys, portable_keys) or
+    portable_v1_keys = keys | {"portable_images", "image_receipt"}
+    portable_v2_keys = portable_v1_keys | {"unit_states"}
+    if (not isinstance(value, dict) or
+            set(value) not in (keys, portable_v1_keys, portable_v2_keys) or
             value["protocol"] != PROTOCOL or
             value["request_id"] != identity or not isinstance(value["phase"], str) or
             value["phase"] not in PHASES or
@@ -222,7 +230,11 @@ def _record(identity: str) -> dict[str, Any]:
             (value["error"] is not None and (not isinstance(value["error"], str) or
              re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", value["error"]) is None))):
         raise Refused("INVALID_STATE")
-    if set(value) == portable_keys:
+    if set(value) in (portable_v1_keys, portable_v2_keys):
+        if "unit_states" in value and not _valid_unit_states(
+                value["unit_states"], value["layout"], value["active_units"],
+                value["unit_hashes"]):
+            raise Refused("INVALID_STATE")
         installed = value["portable_images"]
         receipt = value["image_receipt"]
         if (not isinstance(installed, dict) or
@@ -245,13 +257,16 @@ def _record(identity: str) -> dict[str, Any]:
 
 
 def _valid_image_receipt(receipt: Any, value: dict[str, Any]) -> bool:
-    if not isinstance(receipt, dict) or set(receipt) != {
+    fields = {
             "protocol", "host_archive_id", "host_archive_sha256",
             "source_manifest_sha256", "images_sha256", "images", "container_ids",
-            "exported_configs", "rootfs_sha256", "active_units", "unit_hashes"}:
+            "exported_configs", "rootfs_sha256", "active_units", "unit_hashes"}
+    v2 = "unit_states" in value
+    if not isinstance(receipt, dict) or set(receipt) != (
+            fields | {"unit_states"} if v2 else fields):
         return False
     return (value["archive"] is not None and value["error"] is None and
-            receipt["protocol"] == PORTABLE_RECEIPT and
+            receipt["protocol"] == (PORTABLE_RECEIPT if v2 else PORTABLE_RECEIPT_V1) and
             receipt["host_archive_id"] == value["archive_id"] and
             isinstance(receipt["host_archive_sha256"], str) and
             SHA.fullmatch(receipt["host_archive_sha256"]) is not None and
@@ -269,7 +284,34 @@ def _valid_image_receipt(receipt: Any, value: dict[str, Any]) -> bool:
                 service: item["rootfs_sha256"]
                 for service, item in value["portable_images"].items()} and
             receipt["active_units"] == value["active_units"] and
-            receipt["unit_hashes"] == value["unit_hashes"])
+            receipt["unit_hashes"] == value["unit_hashes"] and
+            (not v2 or receipt["unit_states"] == value["unit_states"]))
+
+
+def _valid_unit_states(states: Any, layout: str, active_units: list[str],
+                       unit_hashes: dict[str, str]) -> bool:
+    if not isinstance(states, dict) or len(states) > MAX_UNIT_STATES:
+        return False
+    allowed = {Path(source.path).name for source in _managed_unit_sources(layout)}
+    writers = backup.WRITERS[layout] | (
+        backup.AMNEZIA_WRITERS if layout == "full" else frozenset())
+    if (len(allowed) > MAX_UNIT_STATES or any(
+            not isinstance(name, str) or name not in allowed or
+            not isinstance(state, dict) or
+            set(state) != {"active", "enablement", "sha256"} or
+            type(state["active"]) is not bool or
+            not isinstance(state["enablement"], str) or
+            state["enablement"] not in ENABLEMENT_STATES or
+            not isinstance(state["sha256"], str) or
+            SHA.fullmatch(state["sha256"]) is None
+            for name, state in states.items())):
+        return False
+    return (set(active_units) == {
+        name for name, state in states.items()
+        if name in writers and state["active"]} and
+        all(states[name]["sha256"] == digest
+            for name, digest in unit_hashes.items() if name in states) and
+        set(unit_hashes).issubset(states))
 
 
 def _valid_archive(value: Any) -> bool:
@@ -428,6 +470,65 @@ def _unit_hashes(units: list[str]) -> dict[str, str]:
     return result
 
 
+def _managed_unit_sources(layout: str) -> tuple:
+    # The static FULL sources include Amnezia control units in addition to
+    # updater SNAPSHOT units returned by backup._unit_paths(layout).
+    return tuple(source for source in backup._sources(layout)
+                 if source.kind == "file" and
+                 source.path.startswith("/etc/systemd/system/sovagrid-"))
+
+
+def _systemd_state(action: str, unit: str, allowed: frozenset[str]) -> str:
+    try:
+        result = subprocess.run(["systemctl", action, unit],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=10, check=False,
+                                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+        state = result.stdout.decode("ascii", "strict").strip()
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
+        raise Refused("UNIT_STATE_UNAVAILABLE") from exc
+    if state not in allowed:
+        raise Refused("UNIT_STATE_UNAVAILABLE")
+    return state
+
+
+def _unit_states(layout: str) -> dict[str, dict[str, Any]]:
+    """Read every present managed unit before writers are paused."""
+    sources = _managed_unit_sources(layout)
+    if len(sources) > MAX_UNIT_STATES:
+        raise Refused("UNIT_LIMIT")
+    names = [Path(source.path).name for source in sources]
+    if len(set(names)) != len(names):
+        raise Refused("UNIT_LIMIT")
+    # Uninstantiated template units can report unknown while their unit file
+    # is present; they have no active instance to restore from this filename.
+    active_states = frozenset(("active", "inactive", "failed", "unknown"))
+    states = {}
+    for source in sources:
+        if not backup._present(source.path):
+            continue
+        name = Path(source.path).name
+        digest = _unit_hashes([name])[name]
+        active = _systemd_state("is-active", name, active_states) == "active"
+        enablement = _systemd_state("is-enabled", name, ENABLEMENT_STATES)
+        states[name] = {"active": active, "enablement": enablement,
+                        "sha256": digest}
+    return states
+
+
+def _unit_states_unchanged(value: dict[str, Any], *, include_active: bool) -> bool:
+    if "unit_states" not in value:
+        return True  # Legacy v1 operations have no full unit-state snapshot.
+    current = _unit_states(value["layout"])
+    expected = value["unit_states"]
+    if include_active:
+        return current == expected
+    return (set(current) == set(expected) and
+            all(current[name]["sha256"] == state["sha256"] and
+                current[name]["enablement"] == state["enablement"]
+                for name, state in expected.items()))
+
+
 def _compose_stop(services: list[str]) -> None:
     if not services:
         return
@@ -456,7 +557,8 @@ def _stop(value: dict[str, Any]) -> None:
 
 def _restart(value: dict[str, Any]) -> None:
     if backup._source_manifest() != value["expected_manifest_sha256"] or (
-            _unit_hashes(value["active_units"]) != value["unit_hashes"]):
+            _unit_hashes(value["active_units"]) != value["unit_hashes"]) or (
+            not _unit_states_unchanged(value, include_active=False)):
         raise Refused("STATE_CHANGED")
     # Inspect all compose services before starting any container; a replacement
     # instance must never be joined with the archived instance.
@@ -588,7 +690,8 @@ def _portable_receipt(value: dict[str, Any], artifact: dict[str, Any]) -> dict[s
                 for service, item in value["portable_images"].items()} or
             artifact["container_ids"] != value["container_ids"]):
         raise Refused("IMAGE_CHANGED")
-    receipt = {"protocol": PORTABLE_RECEIPT,
+    v2 = "unit_states" in value
+    receipt = {"protocol": PORTABLE_RECEIPT if v2 else PORTABLE_RECEIPT_V1,
                "host_archive_id": value["archive_id"],
                "host_archive_sha256": host["sha256"],
                "source_manifest_sha256": value["expected_manifest_sha256"],
@@ -599,6 +702,8 @@ def _portable_receipt(value: dict[str, Any], artifact: dict[str, Any]) -> dict[s
                "rootfs_sha256": artifact["rootfs_sha256"],
                "active_units": value["active_units"],
                "unit_hashes": value["unit_hashes"]}
+    if v2:
+        receipt["unit_states"] = value["unit_states"]
     if not _valid_image_receipt(receipt, value):
         raise Refused("IMAGE_CHANGED")
     return receipt
@@ -647,11 +752,17 @@ def _worker(identity: str, *, recovery: bool) -> None:
                 _clear_active(identity)
                 return
             current = backup.plan()
+            try:
+                unit_states_unchanged = _unit_states_unchanged(
+                    value, include_active=True)
+            except (Refused, backup.Refused, OSError):
+                unit_states_unchanged = False
             if (current["layout"] != value["layout"] or
                     current["active_units"] != value["active_units"] or
                     current["running_containers"] != value["running_containers"] or
                     _container_ids(value["running_containers"]) != value["container_ids"] or
-                    _unit_hashes(value["active_units"]) != value["unit_hashes"]):
+                    _unit_hashes(value["active_units"]) != value["unit_hashes"] or
+                    not unit_states_unchanged):
                 _phase(value, "failed", error="STATE_CHANGED")
                 _clear_active(identity)
                 return
@@ -692,8 +803,12 @@ def _worker(identity: str, *, recovery: bool) -> None:
                 return
             if error is None and "portable_images" in value:
                 try:
-                    artifact = images._create_locked(
-                        value["archive_id"], expected_installed=value["portable_images"])
+                    export_options = {"expected_installed": value["portable_images"]}
+                    if "unit_states" in value:
+                        export_options["expected_unit_hashes"] = {
+                            name: state["sha256"]
+                            for name, state in value["unit_states"].items()}
+                    artifact = images._create_locked(value["archive_id"], **export_options)
                     receipt = _portable_receipt(value, artifact)
                     images._publish_portable_receipt_locked(value["archive_id"], receipt)
                     value["image_receipt"] = receipt
@@ -763,6 +878,10 @@ def start(identity: str, expected_manifest: str, *, portable: bool = False) -> d
                  "archive_id": uuid.uuid4().hex,
                  "archive": None, "error": None}
         if portable:
+            value["unit_states"] = _unit_states(plan["layout"])
+            if not _valid_unit_states(value["unit_states"], plan["layout"],
+                                      value["active_units"], value["unit_hashes"]):
+                raise Refused("STATE_CHANGED")
             value["portable_images"] = _portable_images(value)
             value["image_receipt"] = None
         _write_record(value)

@@ -55,6 +55,13 @@ backup = _sibling("host_backup.py", "_sovagrid_host_restore_backup")
 PROTOCOL = "sovagrid-host-restore-plan-v1"
 STAGE_PROTOCOL = "sovagrid-host-restore-stage-v1"
 PORTABLE_STAGE_PROTOCOL = "sovagrid-portable-restore-stage-v1"
+PORTABLE_RECEIPT_V1 = "sovagrid-portable-host-receipt-v1"
+PORTABLE_RECEIPT_V2 = "sovagrid-portable-host-receipt-v2"
+MAX_UNIT_STATES = 32
+ENABLEMENT_STATES = frozenset((
+    "enabled", "enabled-runtime", "disabled", "static", "indirect", "alias",
+    "masked", "masked-runtime", "linked", "linked-runtime", "generated", "transient",
+))
 STAGING = Path("/var/lib/.sovagrid-host-restore-staging")
 RESTORE_PORTS = frozenset((80, 443, 8766, 8767))
 MIN_RESTORE_FREE = 512 * 1024**2
@@ -472,7 +479,8 @@ def _expected_stage_digest(files: dict[str, tuple[int, bytes]],
     return digest.hexdigest()
 
 
-def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) -> dict:
+def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float,
+                 managed_unit_hashes: dict[str, str] | None = None) -> dict:
     os.lseek(fd, 0, os.SEEK_SET)
     seen: set[str] = set()
     directories: set[str] = set()
@@ -581,6 +589,9 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
                             capture.extend(block)
                         remaining -= len(block)
                     staged_files[path.lstrip("/")] = (member.size, digest.digest())
+                    if (managed_unit_hashes is not None and
+                            path.startswith("/etc/systemd/system/sovagrid-")):
+                        managed_unit_hashes[path.rsplit("/", 1)[1]] = digest.hexdigest()
                     if capture is not None:
                         if vpn_capture:
                             vpn_contents[path] = bytes(capture)
@@ -1525,7 +1536,7 @@ def _rename_noreplace(root_fd: int, temporary: str, final: str) -> None:
 
 
 def _verify_staged_units(identity: str, receipt: dict) -> list[str]:
-    """Bind activation names in the portable receipt to exact staged bytes."""
+    """Bind every v2 managed unit (or v1 active unit) to staged archive bytes."""
     units = receipt.get("active_units")
     hashes = receipt.get("unit_hashes")
     allowed = (backup.WRITERS["full"] | backup.WRITERS["hub-only"] |
@@ -1538,7 +1549,35 @@ def _verify_staged_units(identity: str, receipt: dict) -> list[str]:
                 not isinstance(hashes[unit], str) or
                 SHA.fullmatch(hashes[unit]) is None for unit in units)):
         raise Refused("PORTABLE_STAGE_CHANGED")
-    for unit in units:
+    states = receipt.get("unit_states")
+    if receipt.get("protocol") == PORTABLE_RECEIPT_V2 and states is None:
+        raise Refused("PORTABLE_STAGE_CHANGED")
+    if states is not None:
+        if (receipt.get("protocol") != PORTABLE_RECEIPT_V2 or
+                not isinstance(states, dict) or len(states) > MAX_UNIT_STATES):
+            raise Refused("PORTABLE_STAGE_CHANGED")
+        managed = {Path(source.path).name for layout in ("full", "hub-only")
+                   for source in backup._sources(layout)
+                   if source.kind == "file" and source.path.startswith(
+                       "/etc/systemd/system/sovagrid-")}
+        present = {name for name in managed if os.path.lexists(backup._host(
+            STAGING / identity / "etc/systemd/system" / name))}
+        if (set(states) != present or
+                any(not isinstance(name, str) or name not in managed or
+                    not isinstance(state, dict) or
+                    set(state) != {"active", "enablement", "sha256"} or
+                    type(state["active"]) is not bool or
+                    not isinstance(state["enablement"], str) or
+                    state["enablement"] not in ENABLEMENT_STATES or
+                    not isinstance(state["sha256"], str) or
+                    SHA.fullmatch(state["sha256"]) is None
+                    for name, state in states.items()) or
+                set(units) != {name for name, state in states.items()
+                               if name in allowed and state["active"]} or
+                any(states[name]["sha256"] != digest or
+                    not states[name]["active"] for name, digest in hashes.items())):
+            raise Refused("PORTABLE_STAGE_CHANGED")
+    for unit in (states if states is not None else hashes):
         path = STAGING / identity / "etc/systemd/system" / unit
         try:
             fd = backup._safe_open(path)
@@ -1559,7 +1598,8 @@ def _verify_staged_units(identity: str, receipt: dict) -> list[str]:
                     raise Refused("PORTABLE_STAGE_CHANGED")
                 digest.update(block)
                 remaining -= len(block)
-            if (digest.hexdigest() != hashes[unit] or
+            expected = states[unit]["sha256"] if states is not None else hashes[unit]
+            if (digest.hexdigest() != expected or
                     _fingerprint(os.fstat(fd)) != _fingerprint(info)):
                 raise Refused("PORTABLE_STAGE_CHANGED")
         finally:
@@ -1609,6 +1649,7 @@ def portable_stage_status(identity: str) -> dict:
     return {"ok": True, "protocol": PORTABLE_STAGE_PROTOCOL, "id": identity,
             "staged": True, "verified": True,
             "active_units": active_units,
+            "receipt_protocol": receipt.get("protocol"),
             "review_sha256": marker["review_sha256"],
             "tree_sha256": marker["tree_sha256"],
             "host_archive_sha256": marker["archive_sha256"],
@@ -1616,7 +1657,10 @@ def portable_stage_status(identity: str) -> dict:
             "image_manifest_sha256": marker["image_manifest_sha256"],
             "portable_receipt_sha256": marker["portable_receipt_sha256"],
             "image_bytes": marker["image_bytes"],
-            "apply_available": False, "blockers": ["APPLY_NOT_IMPLEMENTED"]}
+            "apply_available": False,
+            "blockers": (["APPLY_NOT_IMPLEMENTED", "RECEIPT_V1_UNSUPPORTED"]
+                         if receipt.get("protocol") == PORTABLE_RECEIPT_V1 else
+                         ["APPLY_NOT_IMPLEMENTED"])}
 
 
 def portable_stage(identity: str, expected_review_sha256: str) -> dict:
@@ -1723,6 +1767,8 @@ def portable_apply_preview(identity: str) -> dict:
         blockers.append("TARGET_NOT_CLEAN")
     if staged["review_sha256"] != target["review_sha256"]:
         blockers.append("STALE_REVIEW")
+    if staged.get("receipt_protocol") == PORTABLE_RECEIPT_V1:
+        blockers.append("RECEIPT_V1_UNSUPPORTED")
     bounded = list(dict.fromkeys(blockers))
     record = {"protocol": "sovagrid-portable-restore-apply-review-v1",
               "id": identity,

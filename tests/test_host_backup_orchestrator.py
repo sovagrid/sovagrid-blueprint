@@ -5,17 +5,21 @@
 
 from contextlib import contextmanager, nullcontext
 import json
+import hashlib
+import os
 from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
 from unittest.mock import call, patch
+from types import SimpleNamespace
 
 from deploy import host_backup_orchestrator as operation
 
 
 REAL_SPAWN = operation._spawn
+REAL_UNIT_STATES = operation._unit_states
 REQUEST = "a" * 32
 MANIFEST = "b" * 64
 UNIT = "sovagrid-vpn-control.socket"
@@ -46,6 +50,10 @@ class OrchestratorTests(unittest.TestCase):
             patch.object(operation, "_container_ids", return_value={"hub": "c" * 64,
                                                                 "web": "d" * 64}),
             patch.object(operation, "_unit_hashes", return_value={UNIT: "e" * 64}),
+            patch.object(operation, "_unit_states", return_value={
+                UNIT: {"active": True, "enablement": "enabled", "sha256": "e" * 64},
+                "sovagrid-agent.service": {
+                    "active": True, "enablement": "enabled", "sha256": "f" * 64}}),
             patch.object(operation.backup, "_locks", return_value=nullcontext()),
             patch.object(operation, "_spawn"),
         )
@@ -126,7 +134,8 @@ class OrchestratorTests(unittest.TestCase):
                               return_value=artifact) as export, \
                  patch.object(operation.images, "_publish_portable_receipt_locked") as publish:
                 operation._worker(REQUEST, recovery=False)
-        export.assert_called_once_with(archive_id, expected_installed=PORTABLE_IMAGES)
+        export.assert_called_once_with(archive_id, expected_installed=PORTABLE_IMAGES,
+            expected_unit_hashes={UNIT: "e" * 64, "sovagrid-agent.service": "f" * 64})
         publish.assert_called_once()
         self.assertEqual(publish.call_args.args[0], archive_id)
         self.assertEqual(publish.call_args.args[1]["images_sha256"], "4" * 64)
@@ -137,6 +146,9 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(receipt["container_ids"], artifact["container_ids"])
         self.assertEqual(receipt["rootfs_sha256"], artifact["rootfs_sha256"])
         self.assertEqual(receipt["exported_configs"], artifact["exported_configs"])
+        self.assertEqual(receipt["protocol"], operation.PORTABLE_RECEIPT)
+        self.assertEqual(set(receipt["unit_states"]),
+                         {UNIT, "sovagrid-agent.service"})
         damaged = operation._record(REQUEST)
         damaged["image_receipt"] = None
         operation._private_write(operation._record_path(REQUEST),
@@ -205,6 +217,88 @@ class OrchestratorTests(unittest.TestCase):
         stop.assert_not_called()
         export.assert_not_called()
         self.assertEqual(operation.portable_status(REQUEST)["error"], "IMAGE_CHANGED")
+
+    def test_portable_unit_state_drift_blocks_stop(self):
+        with patch.object(operation, "_portable_images", return_value=PORTABLE_IMAGES):
+            operation.start(REQUEST, MANIFEST, portable=True)
+        changed = {**operation._record(REQUEST)["unit_states"],
+                   "sovagrid-agent.service": {"active": True,
+                       "enablement": "disabled", "sha256": "f" * 64}}
+        with patch.object(operation, "_unit_states", return_value=changed), \
+             patch.object(operation, "_stop") as stop:
+            operation._worker(REQUEST, recovery=False)
+        stop.assert_not_called()
+        self.assertEqual(operation.portable_status(REQUEST)["error"], "STATE_CHANGED")
+
+    def test_unit_state_capture_includes_inactive_present_units(self):
+        root = self.state_dir.parent / "source-root"
+        folder = root / "etc/systemd/system"
+        folder.mkdir(parents=True)
+        raw = b"[Service]\nExecStart=/bin/true\n"
+        (folder / "sovagrid-agent.service").write_bytes(raw)
+        (folder / "sovagrid-agent.service").chmod(0o644)
+        paths = tuple(SimpleNamespace(path="/etc/systemd/system/" + name,
+                                      kind="file")
+                      for name in ("sovagrid-agent.service",
+                                   "sovagrid-vpn-status.timer"))
+        with (patch.object(operation.backup, "ROOT", root),
+              patch.object(operation.backup, "ROOT_UID", os.geteuid()),
+              patch.object(operation.backup, "ROOT_GID", os.getegid()),
+              patch.object(operation.backup, "_sources", return_value=paths),
+              patch.object(operation, "_unit_states", side_effect=REAL_UNIT_STATES),
+              patch.object(operation, "_unit_hashes", return_value={
+                  "sovagrid-agent.service": hashlib.sha256(raw).hexdigest()}),
+              patch.object(operation, "_systemd_state", side_effect=[
+                  "inactive", "disabled"])):
+            states = operation._unit_states("full")
+        self.assertEqual(states, {"sovagrid-agent.service": {
+            "active": False, "enablement": "disabled",
+            "sha256": hashlib.sha256(raw).hexdigest()}})
+
+    def test_portable_journal_rejects_unknown_or_mismatched_unit_state(self):
+        with patch.object(operation, "_portable_images", return_value=PORTABLE_IMAGES):
+            operation.start(REQUEST, MANIFEST, portable=True)
+        original = operation._record(REQUEST)
+        for states in (
+                {**original["unit_states"], "sovagrid-foreign.service": {
+                    "active": False, "enablement": "disabled", "sha256": "a" * 64}},
+                {**original["unit_states"], UNIT: {
+                    "active": True, "enablement": "enabled", "sha256": "0" * 64}},
+                {**original["unit_states"], UNIT: {
+                    "active": True, "enablement": [], "sha256": "e" * 64}}):
+            with self.subTest(states=states):
+                damaged = {**original, "unit_states": states}
+                operation._private_write(operation._record_path(REQUEST),
+                                         (json.dumps(damaged) + "\n").encode())
+                with self.assertRaisesRegex(operation.Refused, "INVALID_STATE"):
+                    operation.portable_status(REQUEST)
+
+    def test_legacy_v1_portable_journal_remains_readable(self):
+        with patch.object(operation, "_portable_images", return_value=PORTABLE_IMAGES):
+            operation.start(REQUEST, MANIFEST, portable=True)
+        value = operation._record(REQUEST)
+        value.pop("unit_states")
+        value["phase"] = "complete"
+        value["archive"] = {"id": value["archive_id"],
+                            "created_at": "2026-10-27T00:00:00+00:00",
+                            "layout": "full", "bytes": 512, "files": 3}
+        value["image_receipt"] = {
+            "protocol": operation.PORTABLE_RECEIPT_V1,
+            "host_archive_id": value["archive_id"],
+            "host_archive_sha256": "3" * 64,
+            "source_manifest_sha256": MANIFEST,
+            "images_sha256": "4" * 64,
+            "images": {name: item["image_id"] for name, item in PORTABLE_IMAGES.items()},
+            "container_ids": value["container_ids"],
+            "exported_configs": {name: item["image_id"]
+                                 for name, item in PORTABLE_IMAGES.items()},
+            "rootfs_sha256": {name: item["rootfs_sha256"]
+                              for name, item in PORTABLE_IMAGES.items()},
+            "active_units": value["active_units"],
+            "unit_hashes": value["unit_hashes"]}
+        operation._write_record(value)
+        self.assertEqual(operation.portable_status(REQUEST)["image_receipt"]["protocol"],
+                         operation.PORTABLE_RECEIPT_V1)
 
     def test_portable_recovery_never_reexports_images(self):
         with patch.object(operation, "_portable_images", return_value=PORTABLE_IMAGES):

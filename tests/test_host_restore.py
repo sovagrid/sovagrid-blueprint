@@ -102,7 +102,7 @@ class RestoreInspectionTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def inspect(self, entries=None, *, source_sha=None):
+    def inspect(self, entries=None, *, source_sha=None, managed_unit_hashes=None):
         selected = self.entries if entries is None else entries
         content = make_archive(selected)
         path = self.folder / "archive.tar.gz"
@@ -116,7 +116,8 @@ class RestoreInspectionTest(unittest.TestCase):
         try:
             restore._hash_archive(fd, manifest, deadline=time.monotonic() + 10)
             return restore._inspect_tar(
-                fd, manifest, self.sources, deadline=time.monotonic() + 10)
+                fd, manifest, self.sources, deadline=time.monotonic() + 10,
+                managed_unit_hashes=managed_unit_hashes)
         finally:
             os.close(fd)
 
@@ -127,6 +128,17 @@ class RestoreInspectionTest(unittest.TestCase):
         self.assertEqual(result["source_manifest_sha256"], self.source_sha)
         self.assertEqual(result["vpn_udp_ports"], [])
         self.assertTrue(result["vpn_ports_verified"])
+
+    def test_inspection_captures_managed_unit_sha_from_archive_bytes(self):
+        name = "sovagrid-agent.service"
+        raw = b"[Service]\nExecStart=/bin/true\n"
+        path = "etc/systemd/system/" + name
+        self.sources += (restore.backup.Source("/" + path, exact_mode=0o644,
+                                               gid=0),)
+        entries = self.entries + [(path, "file", raw, 0, 0, 0o644)]
+        captured = {}
+        self.inspect(entries, managed_unit_hashes=captured)
+        self.assertEqual(captured, {name: hashlib.sha256(raw).hexdigest()})
 
     def test_managed_vpn_port_is_bound_to_verified_state_and_server_config(self):
         self.sources += (restore.backup.Source("/var/lib/sovagrid-vpn", kind="dir",
@@ -936,6 +948,41 @@ class RestoreInspectionTest(unittest.TestCase):
             with self.assertRaisesRegex(restore.Refused, "PORTABLE_STAGE_CHANGED"):
                 restore._verify_staged_units("a" * 32, receipt)
 
+    def test_v2_staged_unit_states_bind_inactive_unit_bytes_and_exact_set(self):
+        target = self.folder / "target-v2-units"
+        identity = "a" * 32
+        unit = "sovagrid-vpn-status.timer"
+        other = "sovagrid-agent.service"
+        folder = (target / "var/lib/.sovagrid-host-restore-staging" /
+                  identity / "etc/systemd/system")
+        folder.mkdir(parents=True)
+        for name, raw in ((unit, b"[Timer]\nOnCalendar=hourly\n"),
+                          (other, b"[Service]\nExecStart=/bin/true\n")):
+            (folder / name).write_bytes(raw)
+            (folder / name).chmod(0o600)
+        states = {
+            unit: {"active": True, "enablement": "enabled",
+                   "sha256": hashlib.sha256((folder / unit).read_bytes()).hexdigest()},
+            other: {"active": True, "enablement": "disabled",
+                    "sha256": hashlib.sha256((folder / other).read_bytes()).hexdigest()}}
+        receipt = {"protocol": "sovagrid-portable-host-receipt-v2",
+                   "active_units": [unit], "unit_hashes": {unit: states[unit]["sha256"]},
+                   "unit_states": states}
+        with (patch.object(restore.backup, "ROOT", target),
+              patch.object(restore.backup, "ROOT_UID", os.geteuid()),
+              patch.object(restore.backup, "ROOT_GID", os.getegid())):
+            self.assertEqual(restore._verify_staged_units(identity, receipt), [unit])
+            with self.assertRaisesRegex(restore.Refused, "PORTABLE_STAGE_CHANGED"):
+                restore._verify_staged_units(identity, {
+                    **receipt, "unit_states": {unit: states[unit]}})
+            with self.assertRaisesRegex(restore.Refused, "PORTABLE_STAGE_CHANGED"):
+                restore._verify_staged_units(identity, {
+                    **receipt, "unit_states": {**states,
+                        "sovagrid-foreign.service": states[other]}})
+            (folder / other).write_bytes(b"[Service]\nExecStart=/bin/false\n")
+            with self.assertRaisesRegex(restore.Refused, "PORTABLE_STAGE_CHANGED"):
+                restore._verify_staged_units(identity, receipt)
+
     def _stage_fixture(self):
         content = make_archive(self.entries)
         archive = self.folder / "stage-archive.tar.gz"
@@ -1179,6 +1226,12 @@ class RestoreInspectionTest(unittest.TestCase):
             self.assertEqual(result["blockers"], ["APPLY_NOT_IMPLEMENTED"])
             self.assertRegex(result["apply_review_sha256"], r"^[0-9a-f]{64}$")
             original = result["apply_review_sha256"]
+            staged["receipt_protocol"] = "sovagrid-portable-host-receipt-v1"
+            legacy = restore.portable_apply_preview(identity)
+            self.assertFalse(legacy["target_ready"])
+            self.assertFalse(legacy["apply_available"])
+            self.assertIn("RECEIPT_V1_UNSUPPORTED", legacy["blockers"])
+            staged.pop("receipt_protocol")
             target["review_sha256"] = "7" * 64
             target["target_conflicts"] = 1
             target["target_empty"] = False

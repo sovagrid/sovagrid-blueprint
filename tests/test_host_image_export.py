@@ -377,7 +377,7 @@ class ImageExportTest(unittest.TestCase):
         record = json.loads((artifact / "manifest.json").read_text())
         with self.assertRaisesRegex(images.Refused, "RECEIPT_NOT_FOUND"):
             images.verify(IDENTITY, require_receipt=True)
-        receipt = {"protocol": images.PORTABLE_RECEIPT,
+        receipt = {"protocol": images.PORTABLE_RECEIPT_V1,
                    "host_archive_id": IDENTITY,
                    "host_archive_sha256": record["host_archive_sha256"],
                    "source_manifest_sha256": record["source_manifest_sha256"],
@@ -426,7 +426,7 @@ class ImageExportTest(unittest.TestCase):
                                             for service, item in installed.items()})
         self.assertTrue(all(record["images"][service] != record["exported_configs"][service]
                             for service in installed))
-        receipt = {"protocol": images.PORTABLE_RECEIPT,
+        receipt = {"protocol": images.PORTABLE_RECEIPT_V1,
                    "host_archive_id": IDENTITY,
                    "host_archive_sha256": record["host_archive_sha256"],
                    "source_manifest_sha256": record["source_manifest_sha256"],
@@ -440,6 +440,84 @@ class ImageExportTest(unittest.TestCase):
         checked = images.verify(IDENTITY, require_receipt=True)
         self.assertEqual(checked["receipt"], receipt)
         self.assertEqual(set(checked["platforms"]), set(installed))
+
+    def test_v2_receipt_validates_all_managed_unit_states(self):
+        record = {"layout": "full", "host_archive_sha256": "a" * 64,
+                  "source_manifest_sha256": "b" * 64, "sha256": "c" * 64,
+                  "images": {}, "container_ids": {}, "exported_configs": {},
+                  "rootfs_sha256": {}}
+        unit = "sovagrid-vpn-control.socket"
+        states = {
+            unit: {"active": True, "enablement": "enabled", "sha256": "d" * 64},
+            "sovagrid-agent.service": {"active": True,
+                                       "enablement": "disabled", "sha256": "e" * 64}}
+        receipt = {"protocol": images.PORTABLE_RECEIPT,
+                   "host_archive_id": IDENTITY,
+                   "host_archive_sha256": record["host_archive_sha256"],
+                   "source_manifest_sha256": record["source_manifest_sha256"],
+                   "images_sha256": record["sha256"], "images": {},
+                   "container_ids": {}, "exported_configs": {},
+                   "rootfs_sha256": {}, "active_units": [unit],
+                   "unit_hashes": {unit: "d" * 64}, "unit_states": states}
+        self.assertTrue(images._valid_portable_receipt(receipt, IDENTITY, record))
+        amnezia = "sovagrid-amnezia-control.socket"
+        with_amnezia = {**receipt,
+                        "active_units": [unit, amnezia],
+                        "unit_hashes": {unit: "d" * 64, amnezia: "f" * 64},
+                        "unit_states": {**states, amnezia: {
+                            "active": True, "enablement": "enabled",
+                            "sha256": "f" * 64}}}
+        self.assertTrue(images._valid_portable_receipt(
+            with_amnezia, IDENTITY, record))
+        legacy = {key: value for key, value in receipt.items()
+                  if key != "unit_states"}
+        legacy["protocol"] = images.PORTABLE_RECEIPT_V1
+        self.assertTrue(images._valid_portable_receipt(legacy, IDENTITY, record))
+        for changed in (
+                {**states, "sovagrid-foreign.service": {"active": False,
+                    "enablement": "disabled", "sha256": "f" * 64}},
+                {**states, unit: {"active": True, "enablement": "enabled",
+                                  "sha256": "f" * 64}},
+                {**states, unit: {"active": False, "enablement": "enabled",
+                                  "sha256": "d" * 64}},
+                {**states, unit: {"active": True, "enablement": [],
+                                  "sha256": "d" * 64}}):
+            with self.subTest(states=changed):
+                self.assertFalse(images._valid_portable_receipt(
+                    {**receipt, "unit_states": changed}, IDENTITY, record))
+
+    def test_v2_receipt_verify_binds_unit_hashes_to_host_archive_bytes(self):
+        fixture = self._export_fixture()
+        *_, target, _installed = fixture
+        for context in self._patch_environment(*fixture):
+            context.start()
+            self.addCleanup(context.stop)
+        images.backup._sources.return_value = (
+            images.backup.Source("/etc/systemd/system/sovagrid-agent.service"),)
+        with self.assertRaisesRegex(images.Refused, "HOST_ARCHIVE_CHANGED"):
+            images._create_locked(IDENTITY, expected_unit_hashes={
+                "sovagrid-agent.service": "e" * 64})
+        images.create(IDENTITY)
+        artifact = target / "var/lib/sovagrid-host-image-exports" / IDENTITY
+        record = json.loads((artifact / "manifest.json").read_text())
+        receipt = {"protocol": images.PORTABLE_RECEIPT,
+                   "host_archive_id": IDENTITY,
+                   "host_archive_sha256": record["host_archive_sha256"],
+                   "source_manifest_sha256": record["source_manifest_sha256"],
+                   "images_sha256": record["sha256"],
+                   "images": record["images"],
+                   "container_ids": record["container_ids"],
+                   "exported_configs": record["exported_configs"],
+                   "rootfs_sha256": record["rootfs_sha256"],
+                   "active_units": [], "unit_hashes": {}, "unit_states": {}}
+        images._publish_portable_receipt_locked(IDENTITY, receipt)
+        self.assertEqual(images.verify(IDENTITY, require_receipt=True)["receipt"], receipt)
+        receipt["unit_states"] = {"sovagrid-agent.service": {
+            "active": False, "enablement": "disabled", "sha256": "e" * 64}}
+        self.assertTrue(images._valid_portable_receipt(receipt, IDENTITY, record))
+        (artifact / "receipt.json").write_text(json.dumps(receipt) + "\n")
+        with self.assertRaisesRegex(images.Refused, "INVALID_RECEIPT"):
+            images.verify(IDENTITY, require_receipt=True)
 
     def test_bounded_export_rejects_large_stream_and_cleans_temp(self):
         fixture = self._export_fixture()
