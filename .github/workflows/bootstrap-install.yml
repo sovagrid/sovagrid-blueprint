@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Jigokuraku01
+# Additional author attribution terms: see ATTRIBUTION.md.
+name: One-command bootstrap install
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Require a disposable clean Ubuntu runner
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test ! -e /opt/sovagrid-src
+          test ! -e /var/lib/sovagrid/.managed-by-run-sh
+          sudo -n systemctl start docker
+      - uses: actions/checkout@v6
+        with:
+          path: sovagrid-blueprint
+          persist-credentials: false
+      - name: Run the published one-command script with a custom panel path
+        env:
+          SCRIPT_REF: ${{ github.sha }}
+        run: |
+          set -o pipefail
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            "https://raw.githubusercontent.com/sovagrid/sovagrid-blueprint/$SCRIPT_REF/bootstrap/run.sh" |
+            sudo -n env SOVAGRID_SETUP_NONINTERACTIVE=1 SOVAGRID_PANEL_PATH=/sovagrid/first/ bash
+      - name: Verify managed Hub, full Agent features and custom panel route
+        run: |
+          sudo -n test -f /var/lib/sovagrid/.managed-by-run-sh
+          test "$(sudo -n stat -c '%u:%a' /etc/sovagrid/admin-password)" = 0:600
+          sudo -n systemctl is-active --quiet sovagrid-agent.service
+          sudo -n docker compose --env-file /etc/sovagrid/deploy.env \
+            -f /opt/sovagrid-src/sovagrid-blueprint/deploy/compose.yaml \
+            ps --status running --quiet hub | grep -q .
+          curl --fail --silent --show-error --max-time 8 \
+            http://127.0.0.1:8766/sovagrid/first/ | grep -q SovaGrid
+          sudo -n python3 -B -I /opt/sovagrid-src/sovagrid-blueprint/deploy/local_web.py status > "$RUNNER_TEMP/local-web-status.json"
+          python3 - "$RUNNER_TEMP/local-web-status.json" <<'PY'
+          import json, sys
+          value=json.load(open(sys.argv[1], encoding='utf-8'))
+          assert value['ok'] is True and value['enabled'] is True
+          assert value['config']=={'panel_path':'/sovagrid/first/','root_behavior':'untouched'}
+          PY
+      - name: Verify repeat bootstrap refuses existing installation
+        run: |
+          if sudo -n env SOVAGRID_SETUP_NONINTERACTIVE=1 bash sovagrid-blueprint/bootstrap/run.sh; then
+            echo 'Repeated bootstrap unexpectedly overwrote an installed Hub' >&2
+            exit 1
+          fi
+          sudo -n test -f /var/lib/sovagrid/.managed-by-run-sh
