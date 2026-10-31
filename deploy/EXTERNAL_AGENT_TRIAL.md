@@ -76,3 +76,24 @@ instead of sending another apply. A failed unit starts the existing recovery
 service, never the apply unit. The unit is installed by `run.sh --hub-only`
 only when the supervising updater can snapshot and restore its marker, unit
 file and operation ledger; an older updater defers first installation.
+
+## Web review and limits
+
+On a host with its own Hub and a preserved external Agent, first use Connect to
+stage and apply a reviewed **Hub-only** bundle. The candidate for the external
+Agent must have the exact manifest of the Hub now running locally. Then open
+**Settings → External Agent update** in Web. The panel reads current state,
+requests a fresh preflight, shows the archive, both Agent/Hub fingerprints and
+changed paths, and requires a separate checkbox confirmation. It creates one
+UUID before applying; after a lost response or page reload it reads the durable
+operation status and never submits an automatic second apply. The route is
+limited to a same-origin global administrator. It does not upload or stage a
+server bundle from the browser.
+
+An `uncertain` result deliberately blocks another Hub-only source swap until an
+administrator checks the original Agent, recovery journal, unit state and Hub
+state. It must not be treated as a failed preflight or retried with a new UUID.
+The old external Agent without the idle socket still needs a separate one-time
+bootstrap. The fixed-unit path, including precommit rollback, SIGKILL recovery,
+same-PID `ACTIVE`/`DETACH` and normal dispatch, passed the
+[disposable Ubuntu VM scenario](https://github.com/sovagrid/sovagrid-blueprint/actions/runs/41207706488).
