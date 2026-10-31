@@ -212,6 +212,36 @@ class ProvisionBridgeTests(unittest.TestCase):
             self.assertEqual(error.exception.code, "OPERATION_FAILED")
             self.assertNotIn("secret", str(error.exception))
 
+    def test_source_guard_refusals_remain_exact_before_mutation(self):
+        for code in ("SOURCE_BUSY", "SOURCE_UNTRUSTED"):
+            with self.subTest(code=code):
+                refusal = (json.dumps({"ok": False, "error": code}) + "\n").encode(), 2
+                for action in ("apply", "recover"):
+                    with self.subTest(action=action):
+                        replies = (preview(), refusal) if action == "apply" else (refusal,)
+                        bridge, rpc, _transports, _jobs = self.bridge(*replies)
+                        kwargs = PARAMS | {"expected_state": STATE, "confirm": True} if action == "apply" \
+                            else {"confirm": True}
+                        with self.assertRaises(module.AmneziaProvisionError) as error:
+                            self.execute(bridge, action, **kwargs)
+                        self.assertEqual(error.exception.code, code)
+                        self.assertEqual([call[0] for call in rpc.calls],
+                                         ["preflight", "exchange", "exchange"] if action == "apply"
+                                         else ["preflight", "exchange"])
+
+    def test_preflight_and_preview_failure_before_apply_are_not_uncertain(self):
+        bridge, rpc, _transports, _jobs = self.bridge(preflight_error="ROOT_REQUIRED")
+        with self.assertRaises(module.AmneziaProvisionError) as error:
+            self.execute(bridge, "apply", **PARAMS, expected_state=STATE, confirm=True)
+        self.assertEqual(error.exception.code, "ROOT_REQUIRED")
+        self.assertEqual(rpc.calls, [("preflight",)])
+
+        bridge, rpc, _transports, _jobs = self.bridge(module.RPCError("SSH_FAILED"))
+        with self.assertRaises(module.AmneziaProvisionError) as error:
+            self.execute(bridge, "apply", **PARAMS, expected_state=STATE, confirm=True)
+        self.assertEqual(error.exception.code, "SSH_UNAVAILABLE")
+        self.assertEqual([call[0] for call in rpc.calls], ["preflight", "exchange"])
+
     def test_degraded_preview_has_no_secrets_or_revision(self):
         degraded = {"schema_version": 1, "action": "preview", "writes": False,
                     "target": "awg2", "container": "amnezia-awg2",
@@ -222,6 +252,10 @@ class ProvisionBridgeTests(unittest.TestCase):
             module._response(payload(degraded)[0], 0, "preview")
         full = preview(can_apply=False, reason="UDP_PORT_BUSY")[0]
         self.assertEqual(module._response(full, 0, "preview")["reason"], "UDP_PORT_BUSY")
+        for code in ("SOURCE_BUSY", "SOURCE_UNTRUSTED"):
+            with self.subTest(code=code):
+                degraded["reason"] = code
+                self.assertEqual(module._response(payload(degraded)[0], 0, "preview"), degraded)
 
     def test_preflight_requires_noninteractive_root(self):
         bridge, rpc, _transports, _jobs = self.bridge(preflight_error="ROOT_REQUIRED")
