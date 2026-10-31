@@ -18,6 +18,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import grp
+import pwd
 import re
 import shutil
 import stat
@@ -99,7 +101,7 @@ DIRECT_FILES = {
     "/etc/sovagrid-service-local": frozenset(("enabled", "units.json")),
     "/etc/sovagrid-journal": frozenset(("units.json",)),
     "/etc/sovagrid-local": frozenset(("agent.json", "agent.token", "hub-ca.pem")),
-    "/etc/sovagrid-vpn-routing": frozenset(("policy.json",)),
+    "/etc/sovagrid-vpn-routing": frozenset(("policy.json", "lock")),
     "/var/lib/sovagrid/vpn": frozenset(("status.json",)),
     "/var/lib/sovagrid-containers": frozenset(("snapshot.json",)),
     "/var/lib/sovagrid-containers-local": frozenset(("snapshot.json",)),
@@ -257,8 +259,11 @@ def _check_member(path: str, member: tarfile.TarInfo, directory: bool,
             raise Refused("INVALID_ARCHIVE")
         if backup._web_agent_nonempty(path) and member.size == 0:
             raise Refused("INVALID_ARCHIVE")
+        if path == "/etc/sovagrid-vpn-routing/lock" and member.size != 0:
+            raise Refused("INVALID_ARCHIVE")
     info = SimpleNamespace(st_mode=(stat.S_IFDIR if directory else stat.S_IFREG) |
-                          member.mode, st_uid=member.uid, st_gid=member.gid, st_nlink=1)
+                          member.mode, st_uid=member.uid, st_gid=member.gid,
+                          st_nlink=1, st_size=member.size)
     if path in DYNAMIC_GROUP_PATHS:
         local_snapshot_dir = path == "/var/lib/sovagrid-containers-local"
         if (directory != local_snapshot_dir or member.uid != backup.ROOT_UID or
@@ -348,6 +353,74 @@ def _required(layout: str, present: set[str]) -> set[str]:
     except backup.Refused as exc:
         raise Refused("INVALID_ARCHIVE") from exc
     return required
+
+
+def _identities(present: set[str], dynamic_gids: dict[str, int]) -> dict[str, dict[str, int]]:
+    """Return the identities an installer must reserve before restoring owners.
+
+    Agent group IDs are allocated dynamically. Their archived GIDs must be
+    reserved for the matching full or Hub-only identity, rather than silently
+    allocating different GIDs and making restored tokens inaccessible.
+    """
+    users = {"sovagrid-hub": backup.HUB_UID, "sovagrid-web": backup.WEB_UID}
+    groups = {"sovagrid-hub": backup.HUB_GID, "sovagrid-web": backup.WEB_GID}
+    if backup.WEB_AGENT_MARKER in present:
+        groups["sovagrid-web-agent"] = 10005
+    if "/etc/sovagrid/.terminal-unit-managed-by-run-sh" in present:
+        users["sovagrid-shell"] = groups["sovagrid-shell"] = 10003
+    if "/etc/sovagrid/.journal-managed-by-run-sh" in present:
+        users["sovagrid-journal"] = groups["sovagrid-journal"] = 10004
+    if "/etc/sovagrid/agent.json" in present:
+        groups["sovagrid"] = dynamic_gids["/etc/sovagrid/agent.json"]
+    elif "/etc/sovagrid-local/agent.json" in present:
+        groups["sovagrid-local"] = dynamic_gids["/etc/sovagrid-local/agent.json"]
+    return {"users": users, "groups": groups}
+
+
+def _identity_conflicts(identities: dict[str, dict[str, int]]) -> int:
+    """Consult NSS as run.sh does, including identities outside local files."""
+    collisions = 0
+    try:
+        for name, uid in identities["users"].items():
+            try:
+                named = pwd.getpwnam(name)
+            except KeyError:
+                named = None
+            try:
+                numbered = pwd.getpwuid(uid)
+            except KeyError:
+                numbered = None
+            if (named is not None and
+                    (named.pw_uid != uid or named.pw_gid != identities["groups"][name])):
+                collisions += 1
+            if numbered is not None and numbered.pw_name != name:
+                collisions += 1
+        for name, gid in identities["groups"].items():
+            try:
+                named = grp.getgrnam(name)
+            except KeyError:
+                named = None
+            try:
+                numbered = grp.getgrgid(gid)
+            except KeyError:
+                numbered = None
+            if named is not None and named.gr_gid != gid:
+                collisions += 1
+            if numbered is not None and numbered.gr_name != name:
+                collisions += 1
+        for agent_name in ("sovagrid", "sovagrid-local"):
+            if agent_name not in identities["groups"]:
+                continue
+            try:
+                agent = pwd.getpwnam(agent_name)
+            except KeyError:
+                agent = None
+            if agent is not None and (agent.pw_uid == 0 or
+                                      agent.pw_gid != identities["groups"][agent_name]):
+                collisions += 1
+    except (OSError, ValueError) as exc:
+        raise Refused("IDENTITY_CHECK_UNAVAILABLE") from exc
+    return collisions
 
 
 def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) -> dict:
@@ -443,7 +516,8 @@ def _inspect_tar(fd: int, manifest: dict, sources: tuple, *, deadline: float) ->
     _bundle(bundle_raw, source_hashes, generated, source_directories)
     return {"archive": backup._summary(manifest), "source_manifest_sha256": manifest[
                 "source_manifest_sha256"], "uncompressed_bytes": total,
-            "entries": count, "generated_bytecode_files": len(generated)}
+            "entries": count, "generated_bytecode_files": len(generated),
+            "identities": _identities(seen, dynamic_gids)}
 
 
 def verify(identity: str) -> dict:
@@ -558,13 +632,18 @@ def clean_plan(identity: str) -> dict:
         present, unsafe_path = _target_path(path)
         conflicts += int(present)
         unsafe += int(unsafe_path)
+    identity_conflicts = _identity_conflicts(result["identities"])
     blockers = ["APPLY_NOT_IMPLEMENTED", "DOCKER_IMAGES_NOT_INCLUDED"]
     if conflicts:
         blockers.append("TARGET_STATE_PRESENT")
     if unsafe:
         blockers.append("TARGET_PATH_UNSAFE")
-    return {**result, "target_kind": "clean", "target_empty": not conflicts and not unsafe,
+    if identity_conflicts:
+        blockers.append("TARGET_IDENTITY_CONFLICT")
+    return {**result, "target_kind": "clean",
+            "target_empty": not conflicts and not unsafe and not identity_conflicts,
             "target_conflicts": conflicts, "target_unsafe_paths": unsafe,
+            "target_identity_conflicts": identity_conflicts,
             "apply_available": False, "blockers": blockers}
 
 

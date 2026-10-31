@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import stat
 import tempfile
 import time
 from types import SimpleNamespace
@@ -157,6 +158,42 @@ class HostBackupTest(unittest.TestCase):
                              0o600)
         self.assertEqual(backup.verify(result["id"])["verified"], True)
         self.assertEqual(backup.list_archives()["archives"], [result])
+
+    def test_vpn_routing_lock_is_archived_only_with_exact_private_metadata(self) -> None:
+        directory = self.root / "etc/sovagrid-vpn-routing"
+        directory.mkdir(parents=True, mode=0o700)
+        directory.chmod(0o700)
+        lock = directory / "lock"
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+        self.sources += (backup.Source("/etc/sovagrid-vpn-routing", self.uid,
+                                       "dir", private=True, exact_mode=0o700,
+                                       gid=self.gid),)
+        result = self.archive()
+        archive = self.root / "var/lib/sovagrid-host-backups" / (result["id"] + ".tar.gz")
+        with tarfile.open(archive, "r:gz") as stream:
+            member = stream.getmember("etc/sovagrid-vpn-routing/lock")
+            self.assertEqual((member.uid, member.gid, member.mode, member.size),
+                             (self.uid, self.gid, 0o600, 0))
+
+        for uid, gid, mode in ((self.uid + 1, self.gid, 0o600),
+                               (self.uid, self.gid + 1, 0o600),
+                               (self.uid, self.gid, 0o640)):
+            with self.subTest(uid=uid, gid=gid, mode=mode):
+                info = SimpleNamespace(st_mode=stat.S_IFREG | mode, st_uid=uid,
+                                       st_gid=gid, st_nlink=1, st_size=0)
+                with self.assertRaisesRegex(backup.Refused, "UNSAFE_SOURCE"):
+                    backup._check(info, backup.Source("/etc/sovagrid-vpn-routing/lock"),
+                                  directory=False)
+        lock.write_bytes(b"unexpected")
+        with self.assertRaisesRegex(backup.Refused, "UNSAFE_SOURCE"):
+            backup._scan(self.sources, deadline=time.monotonic() + 5)
+        lock.write_bytes(b"")
+        foreign = directory / "foreign"
+        foreign.write_bytes(b"")
+        foreign.chmod(0o600)
+        with self.assertRaisesRegex(backup.Refused, "UNSAFE_SOURCE"):
+            backup._scan(self.sources, deadline=time.monotonic() + 5)
 
     def test_web_agent_bundle_journal_and_units_are_in_private_archive(self) -> None:
         self.web_agent_fixture()

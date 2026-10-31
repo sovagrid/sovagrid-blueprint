@@ -312,6 +312,11 @@ def _check(info: os.stat_result, source: Source, *, directory: bool) -> None:
     if source.path == "/etc/sovagrid-hub/hub-only-auto-update.json":
         source = Source(source.path, ROOT_UID, private=True, exact_mode=0o600,
                         gid=ROOT_GID)
+    if source.path == "/etc/sovagrid-vpn-routing/lock":
+        source = Source(source.path, ROOT_UID, private=True, exact_mode=0o600,
+                        gid=ROOT_GID)
+        if info.st_size != 0:
+            raise Refused("UNSAFE_SOURCE")
     if source.path in ("/var/lib/sovagrid/hub/hub.sqlite",
                        "/var/lib/sovagrid/hub/telegram-bot-token"):
         source = Source(source.path, HUB_UID, private=True, exact_mode=0o600,
@@ -505,7 +510,7 @@ def _scan(sources: tuple[Source, ...], *, deadline: float) -> tuple[list[Entry],
                         "/etc/sovagrid-service-local": {"enabled", "units.json"},
                         "/etc/sovagrid-journal": {"units.json"},
                         "/etc/sovagrid-local": {"agent.json", "agent.token", "hub-ca.pem"},
-                        "/etc/sovagrid-vpn-routing": {"policy.json"},
+                        "/etc/sovagrid-vpn-routing": {"policy.json", "lock"},
                         "/var/lib/sovagrid/vpn": {"status.json"},
                         "/var/lib/sovagrid-containers": {"snapshot.json"},
                         "/var/lib/sovagrid-containers-local": {"snapshot.json"},

@@ -15,6 +15,7 @@ import stat
 import tarfile
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -321,6 +322,23 @@ class RestoreInspectionTest(unittest.TestCase):
                     restore._check_member("/var/lib/sovagrid/hub/hub.sqlite",
                                           member, False, (source,), parent)
 
+    def test_vpn_routing_lock_requires_exact_private_metadata(self):
+        source = next(item for item in restore.backup.CORE
+                      if item.path == "/etc/sovagrid-vpn-routing")
+        member = tarfile.TarInfo("etc/sovagrid-vpn-routing/lock")
+        member.type = tarfile.REGTYPE
+        member.uid, member.gid, member.mode, member.size = 0, 0, 0o600, 0
+        directory = {"/etc/sovagrid-vpn-routing"}
+        restore._check_member("/etc/sovagrid-vpn-routing/lock", member,
+                              False, (source,), directory)
+        for uid, gid, mode, size in ((1, 0, 0o600, 0), (0, 1, 0o600, 0),
+                                    (0, 0, 0o640, 0), (0, 0, 0o600, 1)):
+            with self.subTest(uid=uid, gid=gid, mode=mode, size=size):
+                member.uid, member.gid, member.mode, member.size = uid, gid, mode, size
+                with self.assertRaisesRegex(restore.Refused, "INVALID_ARCHIVE"):
+                    restore._check_member("/etc/sovagrid-vpn-routing/lock", member,
+                                          False, (source,), directory)
+
     def test_agent_group_is_checked_from_archive_on_clean_target(self):
         full = restore.backup.CORE + restore.backup.FULL
         self.sources += tuple(next(source for source in full if source.path == path)
@@ -458,13 +476,15 @@ class RestoreInspectionTest(unittest.TestCase):
               patch.object(restore, "_require_root"),
               patch.object(restore.backup, "_sources", return_value=self.sources),
               patch.object(restore.backup, "ROOT", target),
-              patch.object(restore.backup, "ROOT_UID", os.geteuid())):
+              patch.object(restore.backup, "ROOT_UID", os.geteuid()),
+              patch.object(restore, "_identity_conflicts", return_value=0)):
             clean = restore.clean_plan("a" * 32)
             self.assertTrue(clean["verified"])
             self.assertTrue(clean["target_empty"])
             self.assertFalse(clean["apply_available"])
             self.assertEqual(clean["target_conflicts"], 0)
             self.assertEqual(clean["target_unsafe_paths"], 0)
+            self.assertEqual(clean["target_identity_conflicts"], 0)
             self.assertEqual(clean["blockers"], ["APPLY_NOT_IMPLEMENTED",
                                                   "DOCKER_IMAGES_NOT_INCLUDED"])
             self.assertEqual(list(target.iterdir()), [])
@@ -497,6 +517,89 @@ class RestoreInspectionTest(unittest.TestCase):
             unknown = restore.clean_plan("a" * 32)
             self.assertFalse(unknown["target_empty"])
             self.assertIn("TARGET_STATE_PRESENT", unknown["blockers"])
+
+    def test_clean_target_identity_collision_blocks_restore(self):
+        target = self.folder / "identity-root"
+        target.mkdir()
+        sample = {"ok": True, "protocol": restore.PROTOCOL, "verified": True,
+                  "archive": {"layout": "full"},
+                  "identities": {"users": {"sovagrid-hub": 10001},
+                                 "groups": {"sovagrid-hub": 10001}}}
+        with (patch.object(restore, "verify", return_value=sample),
+              patch.object(restore.backup, "_sources", return_value=()),
+              patch.object(restore.backup, "ROOT", target),
+              patch.object(restore.backup, "ROOT_UID", os.geteuid()),
+              patch.object(restore, "_identity_conflicts", return_value=1)):
+            result = restore.clean_plan("a" * 32)
+        self.assertFalse(result["target_empty"])
+        self.assertEqual(result["target_identity_conflicts"], 1)
+        self.assertIn("TARGET_IDENTITY_CONFLICT", result["blockers"])
+
+    def test_identity_plan_uses_archived_dynamic_gid_and_checks_nss(self):
+        present = {"/etc/sovagrid/agent.json", "/etc/sovagrid/agent.token",
+                   restore.backup.WEB_AGENT_MARKER,
+                   "/etc/sovagrid/.terminal-unit-managed-by-run-sh"}
+        identities = restore._identities(present, {
+            "/etc/sovagrid/agent.json": 12345,
+            "/etc/sovagrid/agent.token": 12345,
+        })
+        self.assertEqual(identities["groups"]["sovagrid"], 12345)
+        self.assertEqual(identities["groups"]["sovagrid-web-agent"], 10005)
+        self.assertEqual(identities["users"]["sovagrid-shell"], 10003)
+
+        def missing(_value):
+            raise KeyError
+
+        with (patch.object(restore.pwd, "getpwnam", side_effect=missing),
+              patch.object(restore.pwd, "getpwuid", side_effect=missing),
+              patch.object(restore.grp, "getgrnam", side_effect=missing),
+              patch.object(restore.grp, "getgrgid", side_effect=missing)):
+            self.assertEqual(restore._identity_conflicts(identities), 0)
+
+        # An existing unrelated group at the archived Agent GID cannot be
+        # silently reused, even when all SovaGrid names are still free.
+        def group_gid(gid):
+            if gid == 12345:
+                return SimpleNamespace(gr_name="other-service")
+            raise KeyError
+
+        with (patch.object(restore.pwd, "getpwnam", side_effect=missing),
+              patch.object(restore.pwd, "getpwuid", side_effect=missing),
+              patch.object(restore.grp, "getgrnam", side_effect=missing),
+              patch.object(restore.grp, "getgrgid", side_effect=group_gid)):
+            self.assertEqual(restore._identity_conflicts(identities), 1)
+
+    def test_hub_only_local_agent_gid_belongs_to_local_group(self):
+        identities = restore._identities({"/etc/sovagrid-local/agent.json"}, {
+            "/etc/sovagrid-local/agent.json": 12346,
+        })
+        self.assertEqual(identities["groups"]["sovagrid-local"], 12346)
+        self.assertNotIn("sovagrid", identities["groups"])
+
+        def missing(_value):
+            raise KeyError
+
+        def group_gid(gid):
+            if gid == 12346:
+                return SimpleNamespace(gr_name="foreign-group")
+            raise KeyError
+
+        with (patch.object(restore.pwd, "getpwnam", side_effect=missing),
+              patch.object(restore.pwd, "getpwuid", side_effect=missing),
+              patch.object(restore.grp, "getgrnam", side_effect=missing),
+              patch.object(restore.grp, "getgrgid", side_effect=group_gid)):
+            self.assertEqual(restore._identity_conflicts(identities), 1)
+
+        def local_user(name):
+            if name == "sovagrid-local":
+                return SimpleNamespace(pw_uid=12347, pw_gid=22222)
+            raise KeyError
+
+        with (patch.object(restore.pwd, "getpwnam", side_effect=local_user),
+              patch.object(restore.pwd, "getpwuid", side_effect=missing),
+              patch.object(restore.grp, "getgrnam", side_effect=missing),
+              patch.object(restore.grp, "getgrgid", side_effect=missing)):
+            self.assertEqual(restore._identity_conflicts(identities), 1)
 
     def test_clean_plan_cli_never_exposes_paths_or_enables_apply(self):
         sample = {"ok": True, "protocol": restore.PROTOCOL, "verified": True,
