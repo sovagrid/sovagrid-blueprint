@@ -721,10 +721,19 @@ class RestoreInspectionTest(unittest.TestCase):
               patch.object(restore, "_restore_scratch_free", return_value=10**10),
               patch.object(restore.shutil, "disk_usage",
                            return_value=SimpleNamespace(free=10**10))):
-            result = restore.portable_clean_plan(identity)
-            self.assertTrue(result["portable_verified"])
-            self.assertTrue(result["target_empty"])
-            self.assertEqual(result["blockers"], ["APPLY_NOT_IMPLEMENTED"])
+            reviews = []
+            for supported in (False, True):
+                with self.subTest(backend_supported=supported), patch.object(
+                        restore, "_portable_backend_supported", return_value=supported):
+                    result = restore.portable_clean_plan(identity)
+                self.assertTrue(result["portable_verified"])
+                self.assertTrue(result["target_empty"])
+                self.assertTrue(result["target_ready"])
+                self.assertIs(result["backend_supported"], supported)
+                self.assertFalse(result["apply_available"])  # Final review is still required.
+                self.assertEqual(result["blockers"], [] if supported else ["APPLY_NOT_IMPLEMENTED"])
+                reviews.append(result["review_sha256"])
+            self.assertEqual(reviews[0], reviews[1])
             self.assertEqual(result["image_count"], 1)
             self.assertEqual(result["required_free_bytes"],
                              128 + 4 * 1024 + exporter.MAX_IMAGE_BYTES + restore.MIN_RESTORE_FREE)

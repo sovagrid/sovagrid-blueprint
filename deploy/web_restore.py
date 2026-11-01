@@ -423,10 +423,16 @@ def safe_target(value):
         need(all(type(preview[key]) is int and 0 <= preview[key] <= 2**53 - 1
                  for key in ("target_free_bytes", "required_free_bytes") if key in preview) and
              ("target_empty" not in preview or type(preview["target_empty"]) is bool), "TARGET_UNAVAILABLE")
-        policy = result["preview"].get("policy")
-        if policy is not None:
-            need(policy == {"queued_jobs": "cancel", "telegram_confirmations": "cancel",
-                            "vpn": "restore_configuration_down", "public_address_override": False}, "TARGET_UNAVAILABLE")
+        if "policy" in preview:
+            policy = preview["policy"]
+            public_policy = {"queued_jobs": "cancel", "telegram_confirmations": "cancel",
+                             "vpn": "restore_configuration_down", "public_address_override": False}
+            # The target binds its full-layout/v2 policy into the apply review.
+            # Validate that whole contract before exposing the public subset.
+            need(type(policy) is dict and
+                 policy == {**public_policy, "layout": "full", "receipt": "v2"} and
+                 policy["public_address_override"] is False, "TARGET_UNAVAILABLE")
+            result["preview"]["policy"] = public_policy
     need(len(canonical(result)) <= 24 * 1024, "RESPONSE_TOO_LARGE")
     return result
 

@@ -23,8 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy"))
 sys.path.insert(0, str(ROOT / "vendor/connect"))
 from web_restore import (BrowserImports, CHUNK, ORDER, PrivateStore, PROTOCOL,
-                         RestoreError, TARGET, WebRestoreJobs, canonical, digest)
+                         RestoreError, TARGET, WebRestoreJobs, canonical, digest, safe_target)
 from sovagrid_connect.core import ConnectionOptions
+import portable_restore_apply as restore_core
 
 
 SOURCE, ARCHIVE, OP = "a" * 32, "b" * 32, "c" * 32
@@ -158,6 +159,52 @@ def target(record, phase="review", available=True):
             "worker_active": phase == "accepted", "retry_available": phase == "rolled_back", "error": None}
 
 
+def full_review_target(record, *, enabled=True):
+    """Real Core review payload, wrapped as portable_restore_target.preview does."""
+    with patch.object(restore_core, "APPLY_ENABLED", enabled):
+        review = restore_core._full_preview({"apply_review_sha256": "e" * 64,
+            "target_free_bytes": 8 * 1024**3, "required_free_bytes": 1024**3,
+            "target_empty": True}, None, [])
+    return {**target(record), "preview": review,
+            **{key: review[key] for key in ("backend_supported", "target_ready", "apply_available",
+                                            "blockers", "apply_review_sha256")}}
+
+
+class TargetPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.record = {"operation_id": OP, "request": {"archive_id": ARCHIVE}}
+        self.public_policy = {"queued_jobs": "cancel", "telegram_confirmations": "cancel",
+                              "vpn": "restore_configuration_down", "public_address_override": False}
+
+    def test_actual_core_review_is_validated_then_projected_without_changing_its_review(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                raw = full_review_target(self.record, enabled=enabled)
+                original = deepcopy(raw)
+                result = safe_target(raw)
+                self.assertEqual(set(raw["preview"]["policy"]),
+                                 {*self.public_policy, "layout", "receipt"})
+                self.assertEqual(result["preview"]["policy"], self.public_policy)
+                self.assertEqual(result["apply_review_sha256"], raw["apply_review_sha256"])
+                self.assertEqual(result["apply_available"], enabled)
+                self.assertEqual(result["backend_supported"], enabled)
+                self.assertEqual(result["blockers"], [] if enabled else ["APPLY_NOT_IMPLEMENTED"])
+                self.assertEqual(raw, original)
+
+    def test_unsupported_or_incomplete_core_policy_is_not_silently_projected(self):
+        valid = full_review_target(self.record)
+        policy = valid["preview"]["policy"]
+        for invalid in ({**policy, "layout": "hub-only"}, {**policy, "receipt": "v1"},
+                        {**policy, "unexpected": "ignored"}, self.public_policy,
+                        {key: value for key, value in policy.items() if key != "receipt"},
+                        {**policy, "public_address_override": 0},
+                        {**policy, "queued_jobs": "keep"}, None, []):
+            with self.subTest(policy=invalid):
+                raw = deepcopy(valid); raw["preview"]["policy"] = invalid
+                with self.assertRaisesRegex(RestoreError, "TARGET_UNAVAILABLE"):
+                    safe_target(raw)
+
+
 class JobTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -171,6 +218,7 @@ class JobTests(unittest.TestCase):
             archive.addfile(item, io.BytesIO(raw))
         self.calls, self.transports = [], []
         self.fail_start = False
+        self.preview_target = target
         owner = self
 
         class Transport:
@@ -185,7 +233,7 @@ class JobTests(unittest.TestCase):
                         owner.calls.append(("prepare", record["operation_id"]))
                         kwargs["store"].save(record)
                         kwargs["progress"]("Передача копии")
-                        return record, target(record)
+                        return record, owner.preview_target(record)
                     def action(self, record, action, **values):
                         owner.calls.append((action, values))
                         if action == "start" and owner.fail_start:
@@ -226,6 +274,18 @@ class JobTests(unittest.TestCase):
         self.assertNotIn(b'"password"', raw)
         self.assertNotIn(b'"session_token"', raw)
         self.assertEqual(self.transports[0].kwargs, {})
+
+    def test_actual_core_review_survives_background_prepare_and_durable_status(self):
+        self.preview_target = full_review_target
+        value = self.prepared()
+        self.assertIsNone(value["error"])
+        self.assertTrue(value["target"]["apply_available"])
+        self.assertEqual(value["target"]["preview"]["policy"],
+                         {"queued_jobs": "cancel", "telegram_confirmations": "cancel",
+                          "vpn": "restore_configuration_down", "public_address_override": False})
+        self.assertNotIn("layout", value["target"]["preview"]["policy"])
+        self.assertEqual(WebRestoreJobs(self.bundle, hashlib.sha256(self.bundle.read_bytes()).hexdigest(),
+            store=self.store, spool=self.spool).status(OP), value)
 
     def test_lost_start_reply_is_followed_by_status_and_never_repeats_forward_apply(self):
         value = self.prepared(); self.fail_start = True
