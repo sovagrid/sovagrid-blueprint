@@ -24,6 +24,10 @@ class PlatformPolicyTests(unittest.TestCase):
             minima, {"SOVAGRID_MIN_PYTHON": "3.10", "SOVAGRID_MIN_SYSTEMD": "247"}
         )
         self.assertNotIn("platforms", data)
+        self.assertNotIn("kernel", data["hub_runtime"])
+        self.assertNotIn("container_os", data["hub_runtime"])
+        self.assertNotIn("engine", data["hub_runtime"])
+        self.assertIn("fcntl", data["hub_runtime"]["required_python_modules"])
         self.assertNotIn("versions", data["managed_host"])
         self.assertEqual(data["managed_host"]["automatic_package_adapters"], ["apt"])
         self.assertEqual(

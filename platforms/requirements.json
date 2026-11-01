@@ -1,8 +1,24 @@
 {
   "format": 1,
   "hub_runtime": {
-    "container_os": "linux",
-    "python_minimum": "3.10"
+    "python_minimum": "3.10",
+    "required_python_modules": [
+      "sqlite3",
+      "ssl",
+      "fcntl",
+      "pwd"
+    ],
+    "required_crypto": [
+      "hashlib.scrypt"
+    ],
+    "filesystem_capabilities": [
+      "posix-ownership-and-modes",
+      "O_NOFOLLOW",
+      "dir_fd-operations"
+    ],
+    "network": [
+      "ipv4-tcp"
+    ]
   },
   "managed_host": {
     "kernel": "linux",

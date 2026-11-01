@@ -66,8 +66,11 @@ def policy(path):
     if not isinstance(host, dict) or set(host) != expected_host:
         raise ValueError("invalid managed host capabilities")
     if not isinstance(hub, dict) or set(hub) != {
-        "container_os",
         "python_minimum",
+        "required_python_modules",
+        "required_crypto",
+        "filesystem_capabilities",
+        "network",
     }:
         raise ValueError("invalid Hub runtime capabilities")
 
@@ -100,7 +103,11 @@ def policy(path):
         or host["docker_endpoint"] != "unix:///var/run/docker.sock"
         or type(host["compose_minimum_major"]) is not int
         or host["compose_minimum_major"] != 2
-        or hub["container_os"] != "linux"
+        or hub["required_python_modules"] != ["sqlite3", "ssl", "fcntl", "pwd"]
+        or hub["required_crypto"] != ["hashlib.scrypt"]
+        or hub["filesystem_capabilities"]
+        != ["posix-ownership-and-modes", "O_NOFOLLOW", "dir_fd-operations"]
+        or hub["network"] != ["ipv4-tcp"]
     ):
         raise ValueError("capability profile needs a runtime implementation")
     if (
