@@ -4,6 +4,7 @@
 """Rootless journal and interruption tests for managed host snapshots."""
 
 from contextlib import contextmanager, nullcontext
+import io
 import json
 import hashlib
 import os
@@ -37,6 +38,18 @@ PORTABLE_IMAGES = {
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_worker_diagnostics_only_log_stable_codes_and_cannot_block_restart(self):
+        for error in (RuntimeError("SUPERSECRET"), operation.Refused("private/credential")):
+            with patch.object(operation.sys, "stderr", new_callable=io.StringIO) as output:
+                operation._diagnostic("archive", error)
+            self.assertIn("UNEXPECTED", output.getvalue())
+            self.assertNotIn(str(error), output.getvalue())
+        with patch.object(operation.sys, "stderr", new_callable=io.StringIO) as output:
+            operation._diagnostic("archive", operation.backup.Refused("SOURCE_CHANGED"))
+        self.assertIn("SOURCE_CHANGED", output.getvalue())
+        with patch.object(operation, "print", side_effect=OSError("journal unavailable"), create=True):
+            operation._diagnostic("restart", operation.Refused("STATE_CHANGED"))
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

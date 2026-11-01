@@ -461,8 +461,10 @@ def snapshot(bundle, manifest):
         value = orchestrator.portable_status(request)
         if value["phase"] == "complete":
             break
+        error = value.get("error")
+        safe_error = error if isinstance(error, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", error) else "UNKNOWN"
         need(value["phase"] not in ("failed", "recovery_required") and time.monotonic() < deadline,
-             "portable snapshot did not complete")
+             "portable snapshot did not complete: " + value["phase"] + "/" + safe_error)
         time.sleep(0.5)
     # The record may be durable just before the worker releases its locks.
     while text("systemctl", "is-active", "sg-host-backup-" + request + ".service", accepted=(0, 3, 4)) == "active":

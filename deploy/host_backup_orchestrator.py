@@ -89,6 +89,21 @@ class Refused(RuntimeError):
     """Stable public error code without subprocess output or secret paths."""
 
 
+def _diagnostic(stage: str, error: Exception) -> None:
+    """Keep failure provenance in the root journal without logging payloads."""
+    kind = type(error).__name__
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", kind) is None:
+        kind = "Exception"
+    code = str(error) if isinstance(error, (Refused, backup.Refused, images.Refused, update.UpdateFailure)) else ""
+    if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) is None:
+        code = "UNEXPECTED"
+    try:
+        print("SOVAGRID_BACKUP_FAILURE " + stage + " " + kind + " " + code,
+              file=sys.stderr, flush=True)
+    except OSError:
+        pass  # Diagnostics must never suppress the best-effort restart.
+
+
 def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -783,21 +798,25 @@ def _worker(identity: str, *, recovery: bool) -> None:
                 if not isinstance(result, dict) or not _valid_archive(result.get("archive")):
                     raise Refused("ARCHIVE_FAILED")
                 value["archive"] = result["archive"]
-            except Exception:
+            except Exception as exc:
+                _diagnostic("archive", exc)
                 error = "ARCHIVE_FAILED"
             try:
                 _phase(value, "restarting", error=error)
-            except Exception:
+            except Exception as exc:
+                _diagnostic("journal", exc)
                 # Journal I/O must never suppress a best-effort restart.
                 error = "JOURNAL_FAILED"
             try:
                 if value["archive"] is None:
                     value["archive"] = _reconcile_archive(value)
-            except Exception:
+            except Exception as exc:
+                _diagnostic("reconcile", exc)
                 error = "ARCHIVE_UNSAFE"
             try:
                 _restart(value)
-            except Exception:
+            except Exception as exc:
+                _diagnostic("restart", exc)
                 _phase(value, "recovery_required", error="RESTART_INCOMPLETE",
                        archive=value["archive"])
                 return
@@ -812,7 +831,8 @@ def _worker(identity: str, *, recovery: bool) -> None:
                     receipt = _portable_receipt(value, artifact)
                     images._publish_portable_receipt_locked(value["archive_id"], receipt)
                     value["image_receipt"] = receipt
-                except Exception:
+                except Exception as exc:
+                    _diagnostic("images", exc)
                     error = "IMAGES_FAILED"
             _phase(value, "complete" if error is None else "failed", error=error,
                    archive=value["archive"])

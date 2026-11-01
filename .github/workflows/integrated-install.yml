@@ -297,6 +297,7 @@ jobs:
         run: |
           sudo -n systemctl status --no-pager --lines=12 sovagrid-hub-backup-control.service || true
           sudo -n journalctl --no-pager -n 40 -u sovagrid-hub-backup-control.service || true
+          sudo -n journalctl --no-pager -n 40 -u 'sg-host-backup-*.service' || true
       - name: Remove disposable server and SSH identities
         if: always()
         run: >-
