@@ -53,6 +53,7 @@ ROOTS = frozenset((
     "/var/lib/sovagrid", "/var/lib/sovagrid-agent", "/var/lib/sovagrid-shell",
     "/var/lib/sovagrid-containers", "/var/lib/sovagrid-vpn",
     "/var/lib/sovagrid-host-backup-operations", "/opt/sovagrid-src",
+    "/var/cache/sovagrid-web-restores",
     "/opt/sovagrid-agent", "/opt/sovagrid-vpn", "/opt/sovagrid-candidates",
     "/usr/local/bin/sovagrid-vpn-ctl", "/usr/local/libexec/sovagrid-vpn-broker",
     "/etc/sysctl.d/70-sovagrid-vpn-routing.conf",
@@ -125,6 +126,27 @@ def api(bundle):
     return restore, core, runtime
 
 
+@contextlib.contextmanager
+def enabled_vm_api(bundle):
+    """One verified, memory-only core binding for VM preview and apply."""
+    guard()
+    verified_bundle(bundle)  # Hash original production bytes before importing.
+    restore, core, runtime = api(bundle)
+    need(core.APPLY_ENABLED is False, "the production apply gate must remain disabled")
+    real_sibling = restore._sibling
+
+    def sibling(filename, name):
+        if filename == "portable_restore_apply.py":
+            return core
+        if filename == "portable_restore_runtime.py":
+            return runtime
+        return real_sibling(filename, name)
+
+    with (patch.object(restore, "_sibling", side_effect=sibling),
+          patch.object(core, "APPLY_ENABLED", True)):
+        yield restore, core, runtime
+
+
 def private_json(filename, maximum=512 * 1024):
     with os.fdopen(os.open(filename, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
         info = os.fstat(stream.fileno())
@@ -156,6 +178,7 @@ def initial_names(root, records, source):
         "/var/lib/sovagrid-agent": {"", "files"}, "/var/lib/sovagrid-shell": {""},
         "/opt/sovagrid-candidates": {"", ".lock"},
         "/var/lib/sovagrid-host-backup-operations": {"", ".lock"},
+        "/var/cache/sovagrid-web-restores": {"", "imports"},
         "/var/lib/sovagrid-containers": {"", "snapshot.json"},
         "/var/lib/sovagrid-vpn": {"", ".lock"},
         "/etc/sovagrid-hub": {"", "secret.key", "hub-secrets.key", "backup.key", "bot.token"},
@@ -170,6 +193,7 @@ def initial_names(root, records, source):
         leaves = {"", "hub", "hub/hub.sqlite", "hub/hub.sqlite-wal", "hub/hub.sqlite-shm", "vpn", "vpn/status.json",
                   "caddy", "backups", "backups/.lock", "backups/.broker-requests", "web-agent", "external-agent-operations",
                   "web-agent/.bundle.lock", "web-agent/jobs", "web-agent/jobs/.lock", "web-agent/jobs/.enrollment-web-mutation",
+                  "web-agent/restores", "web-agent/restores/imports", "web-agent/restores/operations",
                   ".managed-by-run-sh", ".hub-backup-broker-managed-by-run-sh", ".release-feed-units-managed-by-run-sh",
                   ".ssh-gateway-managed-by-run-sh", ".web-agent-installer-managed-by-run-sh",
                   ".public-web.lock", ".local-web.lock"}
@@ -723,29 +747,23 @@ def uninstall(bundle, identity, receipt, *, restore_id=None):
 
 
 def stage(bundle, identity):
-    restore, _core, _runtime = api(bundle)
-    plan = restore.portable_clean_plan(identity)
-    need(plan["target_empty"] and plan["blockers"] == ["APPLY_NOT_IMPLEMENTED"], "target is not clean")
-    restore.portable_stage(identity, plan["review_sha256"])
-    preview = restore.portable_apply_preview(identity)
-    need(preview["target_ready"], "staged target is not ready")
-    return preview["apply_review_sha256"]
+    with enabled_vm_api(bundle) as (restore, _core, _runtime):
+        plan = restore.portable_clean_plan(identity)
+        need(plan["target_empty"] and plan["target_ready"] and plan["blockers"] == [], "target is not clean")
+        restore.portable_stage(identity, plan["review_sha256"])
+        preview = restore.portable_apply_preview(identity)
+        need(preview["target_ready"] and preview["backend_supported"] and preview["apply_available"],
+             "staged target is not ready")
+        return preview["apply_review_sha256"]
 
 
 def child(identity, review, mode):
-    guard()
     bundle = Path(__file__).resolve().parents[2]
-    verified_bundle(bundle)
-    restore, core, runtime = api(bundle)
-    real_sibling = restore._sibling
+    with enabled_vm_api(bundle) as (restore, core, runtime):
+        return _enabled_child(restore, core, runtime, identity, review, mode)
 
-    def sibling(filename, name):
-        if filename == "portable_restore_apply.py":
-            return core
-        if filename == "portable_restore_runtime.py":
-            return runtime
-        return real_sibling(filename, name)
 
+def _enabled_child(restore, core, runtime, identity, review, mode):
     execute, health = runtime.Runtime.execute, runtime.Runtime.health
 
     def execute_with_exit(self, step, proof):
@@ -768,9 +786,7 @@ with sqlite3.connect('/var/lib/sovagrid/hub/hub.sqlite',timeout=15) as db:
             raise core.Refused("CI_HEALTH_FAILURE")
 
     output = io.StringIO()
-    with (patch.object(restore, "_sibling", side_effect=sibling),
-          patch.object(core, "APPLY_ENABLED", True),
-          patch.object(runtime.Runtime, "execute", execute_with_exit),
+    with (patch.object(runtime.Runtime, "execute", execute_with_exit),
           patch.object(runtime.Runtime, "health", failed_health), contextlib.redirect_stdout(output)):
         status = restore.main(["portable-apply", identity, review])
     value = json.loads(output.getvalue())

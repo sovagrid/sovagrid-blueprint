@@ -24,6 +24,46 @@ fixture = vm.fixture_module()
 
 
 class VmGuardTest(unittest.TestCase):
+    def test_vm_preview_and_child_use_same_enabled_core_without_changing_production_gate(self):
+        base = {"apply_review_sha256": "a" * 64}
+        resources = {"bindings": {"resource_manifest_sha256": "b" * 64}}
+        runtime = SimpleNamespace()
+        restore = SimpleNamespace(_sibling=lambda filename, name: None)
+        def preview(identity):
+            bound = restore._sibling("portable_restore_apply.py", "preview_core")
+            self.assertIs(bound, core)
+            return bound._full_preview(base, resources, [])
+        restore.portable_clean_plan = lambda identity: {"target_empty": True, "target_ready": core.APPLY_ENABLED,
+                                                       "blockers": [] if core.APPLY_ENABLED else ["APPLY_NOT_IMPLEMENTED"],
+                                                       "review_sha256": "c" * 64}
+        restore.portable_stage = lambda identity, review: self.assertTrue(core.APPLY_ENABLED)
+        restore.portable_apply_preview = preview
+        def child(restored, bound, actual_runtime, identity, review, mode):
+            self.assertIs(restored, restore)
+            self.assertIs(bound, core)
+            self.assertIs(restore._sibling("portable_restore_runtime.py", "runtime"), runtime)
+            self.assertEqual(preview(identity)["apply_review_sha256"], review)
+        with (patch.object(vm, "guard"), patch.object(vm, "verified_bundle") as verify,
+              patch.object(vm, "api", return_value=(restore, core, runtime)) as api,
+              patch.object(vm, "_enabled_child", side_effect=child), patch.object(core, "APPLY_ENABLED", False)):
+            review = vm.stage(Path("/unused"), "d" * 32)
+            self.assertFalse(core.APPLY_ENABLED)
+            vm.child("d" * 32, review, "success")
+            self.assertFalse(core.APPLY_ENABLED)
+            self.assertEqual(verify.call_count, 2)
+            self.assertEqual(api.call_count, 2)
+
+    def test_vm_enable_refuses_unverified_bytes_or_an_already_open_production_gate(self):
+        with (patch.object(vm, "guard"), patch.object(vm, "verified_bundle", side_effect=RuntimeError("pin mismatch")),
+              patch.object(vm, "api") as api):
+            with self.assertRaisesRegex(RuntimeError, "pin mismatch"):
+                with vm.enabled_vm_api(Path("/unused")): self.fail("unverified API enabled")
+            api.assert_not_called()
+        with (patch.object(vm, "guard"), patch.object(vm, "verified_bundle"),
+              patch.object(vm, "api", return_value=(None, core, None)), patch.object(core, "APPLY_ENABLED", True)):
+            with self.assertRaisesRegex(RuntimeError, "production apply gate must remain disabled"):
+                with vm.enabled_vm_api(Path("/unused")): self.fail("production gate accepted")
+
     def test_same_byte_unit_and_external_template_replacements_refuse_before_cleanup(self):
         for name in ("sovagrid-agent.service", "sovagrid-external-agent-apply@.service"):
             with self.subTest(unit=name), tempfile.TemporaryDirectory() as temporary:

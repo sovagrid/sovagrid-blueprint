@@ -356,7 +356,10 @@ def _public(value: dict) -> dict:
             "steps_done": sum(step["state"] == "done" for step in value["steps"]),
             "steps_reverted": sum(step["state"] == "reverted"
                                   for step in value["steps"]),
-            "error": value["error"], "apply_available": False}
+            "error": value["error"], "apply_available": False,
+            "retry_available": value["phase"] == "rolled_back",
+            "terminal_sha256": (hashlib.sha256(_canonical(value)).hexdigest()
+                                if value["phase"] in ("committed", "rolled_back") else None)}
 
 
 def status(journal: Journal) -> dict:
@@ -367,6 +370,20 @@ def status(journal: Journal) -> dict:
 
 
 def _refuse_other_journals(journal: Journal) -> None:
+    # An interrupted explicit retry must finish archiving its exact terminal
+    # metadata before a new forward transaction can create another journal.
+    for name in os.listdir(journal.fd):
+        match = re.fullmatch(r"\.retry-([0-9a-f]{32})\.json", name)
+        if match:
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=journal.fd)
+            try:
+                raw, _ = _read_private_fd(descriptor, maximum=16384, uid=journal.uid, gid=journal.gid)
+                retry = json.loads(raw, object_pairs_hook=_unique)
+            finally:
+                os.close(descriptor)
+            if (not isinstance(retry, dict) or retry.get("protocol") != "sovagrid-portable-restore-retry-v1" or
+                    retry.get("id") != match[1] or retry.get("phase") != "complete"):
+                raise Refused("RESTORE_RETRY_REQUIRED")
     with os.scandir(journal.fd) as entries:
         names = [entry.name for entry in entries if re.fullmatch(r"\.apply-[0-9a-f]{32}\.json", entry.name)]
     if len(names) > 1000:
@@ -1440,7 +1457,8 @@ class Inputs:
 
 
 @contextmanager
-def held_inputs(restore: Any, identity: str, expected_apply_review_sha256: str):
+def held_inputs(restore: Any, identity: str, expected_apply_review_sha256: str | None, *,
+                _for_preview: bool = False):
     """Recheck a full v2 pair under locks and pin all five transferred files.
 
     No user, live directory, image, container, or service is changed. Consumers
@@ -1448,10 +1466,16 @@ def held_inputs(restore: Any, identity: str, expected_apply_review_sha256: str):
     """
     restore._require_root()
     identity = _id(identity)
-    if (not isinstance(expected_apply_review_sha256, str) or
-            SHA.fullmatch(expected_apply_review_sha256) is None):
+    if not (_for_preview and expected_apply_review_sha256 is None) and (
+            not isinstance(expected_apply_review_sha256, str) or SHA.fullmatch(expected_apply_review_sha256) is None):
         raise Refused("INVALID_RESTORE_REVIEW")
     with transaction_locks(restore, images=True) as (stage_fd, exporter), ExitStack() as stack:
+        current_journal = Journal(stage_fd, identity, uid=restore.backup.ROOT_UID, gid=restore.backup.ROOT_GID)
+        _refuse_other_journals(current_journal)
+        current = current_journal.read()
+        if current is not None:
+            raise Refused("RESTORE_RETRY_REQUIRED" if current["phase"] == "rolled_back" else
+                          "RESTORE_ALREADY_COMMITTED" if current["phase"] == "committed" else "RESTORE_RECOVERY_REQUIRED")
         host_fd, host = restore._archive_fd(identity)
         stack.callback(os.close, host_fd)
         _folder, image_directory, images_fd, images = exporter._artifact(identity)
@@ -1494,11 +1518,6 @@ def held_inputs(restore: Any, identity: str, expected_apply_review_sha256: str):
         # This path explicitly passes the owned stage FD. A second flock via a
         # separately opened FD would refuse the exclusive lock held above.
         preview = restore.portable_apply_preview(identity, _root_fd=stage_fd)
-        if preview["apply_review_sha256"] != expected_apply_review_sha256:
-            raise Refused("STALE_RESTORE_REVIEW")
-        if (preview.get("target_ready") is not True or
-                preview.get("blockers") != ["APPLY_NOT_IMPLEMENTED"]):
-            raise Refused("RESTORE_TARGET_NOT_READY")
         retained = Inputs(restore, identity, stage_fd, exporter, host_fd, host,
                           images_fd, images, metadata, preview)
         retained.unchanged(hash_contents=True)
@@ -1507,7 +1526,76 @@ def held_inputs(restore: Any, identity: str, expected_apply_review_sha256: str):
                 retained.bindings["portable_receipt_sha256"] !=
                 restore._portable_metadata_hashes(exporter, identity)["portable_receipt_sha256"]):
             raise Refused("RESTORE_INPUT_CHANGED")
+        physical = [code for code in preview["blockers"] if code != "APPLY_NOT_IMPLEMENTED"]
+        plan = None
+        if not physical:
+            try:
+                plan = build_resource_plan(retained)
+            except RuntimeError as exc:
+                code = str(exc)
+                if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) is None:
+                    raise Refused("RESTORE_PREVIEW_FAILED") from None
+                physical.append(code)
+        retry_name = ".retry-" + identity + ".json"
+        attempt_revision = None
+        try:
+            descriptor = os.open(retry_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=stage_fd)
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                raw, _ = _read_private_fd(descriptor, maximum=16384,
+                    uid=restore.backup.ROOT_UID, gid=restore.backup.ROOT_GID)
+                retry = json.loads(raw, object_pairs_hook=_unique)
+                if (not isinstance(retry, dict) or retry.get("protocol") != "sovagrid-portable-restore-retry-v1" or retry.get("id") != identity or
+                        retry.get("phase") != "complete" or not isinstance(retry.get("nonce"), str) or
+                        ID.fullmatch(retry["nonce"]) is None):
+                    raise Refused("RESTORE_RETRY_REQUIRED")
+                attempt_revision = retry["nonce"]
+            finally:
+                os.close(descriptor)
+        retained.public_preview = _full_preview(preview, plan, physical, attempt_revision=attempt_revision)
+        retained.bindings["apply_review_sha256"] = retained.public_preview["apply_review_sha256"]
+        if not _for_preview:
+            if retained.public_preview["apply_review_sha256"] != expected_apply_review_sha256:
+                raise Refused("STALE_RESTORE_REVIEW")
+            if retained.public_preview["target_ready"] is not True:
+                raise Refused("RESTORE_TARGET_NOT_READY")
         yield retained
+
+
+def _full_preview(base, plan, blockers, *, attempt_revision=None):
+    physical = list(dict.fromkeys(blockers))
+    resource = None if plan is None else plan["bindings"]["resource_manifest_sha256"]
+    policy = {"queued_jobs": "cancel", "telegram_confirmations": "cancel", "vpn": "restore_configuration_down",
+              "public_address_override": False, "layout": "full", "receipt": "v2"}
+    review = {"protocol": "sovagrid-portable-restore-apply-review-v2",
+              "base_review_sha256": base["apply_review_sha256"], "resource_manifest_sha256": resource,
+              "backend_supported": APPLY_ENABLED, "policy": policy, "blockers": physical,
+              "attempt_revision": attempt_revision}
+    return {**base, "protocol": review["protocol"], "backend_supported": APPLY_ENABLED,
+            "target_ready": not physical, "apply_available": APPLY_ENABLED and not physical,
+            "resource_manifest_sha256": resource, "policy": policy,
+            "attempt_revision": attempt_revision,
+            "blockers": ([] if APPLY_ENABLED else ["APPLY_NOT_IMPLEMENTED"]) + physical,
+            "apply_review_sha256": hashlib.sha256(_canonical(review)).hexdigest()}
+
+
+def preview_host(restore, identity):
+    restore._require_root()
+    identity = _id(identity)
+    try:
+        with held_inputs(restore, identity, None, _for_preview=True) as inputs:
+            return inputs.public_preview
+    except RuntimeError as exc:
+        code = str(exc)
+        if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) is None:
+            raise Refused("RESTORE_PREVIEW_FAILED") from None
+        # Unsupported v1/layout/state is a reviewable blocker, not an opaque
+        # failure after the administrator has already confirmed installation.
+        base = restore._portable_apply_preview_base(identity)
+        blockers = [item for item in base["blockers"] if item != "APPLY_NOT_IMPLEMENTED"]
+        return _full_preview(base, None, [*blockers, code])
 
 
 def _resource_root(path: str) -> str:
@@ -1751,6 +1839,30 @@ def build_resource_plan(inputs: Inputs, *, check_public: bool = True) -> dict:
             "": {"kind": "dir", "uid": 10003, "gid": 10003, "mode": 0o700, "mtime": 0}}
     receipt = json.loads(inputs.metadata["portable_receipt"][1], object_pairs_hook=_unique)
     states = receipt["unit_states"]
+    workspaces = []
+    if "sovagrid-hub-backup-control.service" in states:
+        # These empty installer workspaces are intentionally outside the
+        # archive. The restored broker nevertheless requires their exact RW
+        # mounts, including when a currently inactive socket starts later.
+        workspaces.extend(("/opt/sovagrid-candidates", "/var/lib/sovagrid-host-backup-operations"))
+    if "sovagrid-web-agent-control.service" in states:
+        # Bulk restore-upload cache is excluded from archives. Claim a fresh
+        # private directory before service activation instead of letting
+        # systemd adopt or recursively chown an unrelated existing cache.
+        workspaces.append("/var/cache/sovagrid-web-restores")
+    for target in workspaces:
+        descriptor, name = _safe_parent(backup.ROOT, target, uid=backup.ROOT_UID)
+        try:
+            try:
+                os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise Refused("RESTORE_RUNTIME_STATE_PRESENT")
+        finally:
+            os.close(descriptor)
+        resources[target] = {"": {"kind": "dir", "uid": 0, "gid": 0,
+                                   "mode": 0o700, "mtime": 0}}
     for unit in states:
         Services(backup.ROOT, states, uid=backup.ROOT_UID, gid=backup.ROOT_GID).audit(unit)
     if any(state["enablement"] not in ("enabled", "disabled", "static")
@@ -1907,6 +2019,16 @@ def recover_host(restore: Any, identity: str) -> dict:
         return result
 
 
+def host_retry_status(restore: Any, identity: str) -> dict | None:
+    helper = restore._sibling("portable_restore_retry.py", "_sovagrid_portable_restore_retry_status")
+    return helper.inspect(restore, sys.modules[__name__], identity)
+
+
+def retry_host(restore: Any, identity: str, expected_terminal_sha256: str) -> dict:
+    helper = restore._sibling("portable_restore_retry.py", "_sovagrid_portable_restore_retry")
+    return helper.retry(restore, sys.modules[__name__], identity, expected_terminal_sha256)
+
+
 def _apply_host_checked(restore: Any, identity: str, expected_apply_review_sha256: str) -> dict:
     """Internal disposable-VM entry until APPLY_ENABLED can truthfully be set."""
     restore._require_root()
@@ -1933,6 +2055,8 @@ def _apply_host_checked(restore: Any, identity: str, expected_apply_review_sha25
             return _public(old)
     with held_inputs(restore, identity, expected_apply_review_sha256) as inputs:
         plan = build_resource_plan(inputs)
+        if plan["bindings"]["resource_manifest_sha256"] != inputs.public_preview["resource_manifest_sha256"]:
+            raise Refused("STALE_RESTORE_REVIEW")
         runtime = _host_runtime(restore)
         runtime.persist(restore, sys.modules[__name__], inputs.stage_fd, plan)
         journal = Journal(inputs.stage_fd, identity, uid=restore.backup.ROOT_UID,

@@ -46,9 +46,38 @@ jobs:
     steps:
       - name: Require a disposable GitHub-hosted Ubuntu runner
         run: |
+          test "$GITHUB_ACTIONS" = true
           test "$RUNNER_ENVIRONMENT" = github-hosted
           test "$RUNNER_OS" = Linux
+          test "$(cat /proc/1/comm)" = systemd
+          test ! -e /etc/sovagrid
+          test ! -e /opt/sovagrid-src
+          test ! -e /var/lib/sovagrid
           test ! -e /var/lib/sovagrid/.managed-by-run-sh
+          # Hosted images permit runner writes in /usr/local. Prepare the fixed
+          # broker/terminal parents for the entire disposable test, including
+          # the later installer and signed update, without changing run.sh.
+          sudo -n python3 - <<'PY'
+          import os
+          import stat
+          for path in ("/usr/local", "/usr/local/bin", "/usr/local/libexec"):
+              try:
+                  os.mkdir(path, 0o755)
+              except FileExistsError:
+                  pass
+              descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+              try:
+                  info = os.fstat(descriptor)
+                  if not stat.S_ISDIR(info.st_mode):
+                      raise SystemExit("fixed fixture parent is not a directory")
+                  os.fchown(descriptor, 0, 0)
+                  os.fchmod(descriptor, 0o755)
+                  current = os.stat(path, follow_symlinks=False)
+                  if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                      raise SystemExit("fixed fixture parent changed during setup")
+              finally:
+                  os.close(descriptor)
+          PY
           sudo -n install -d -o root -g root -m 0755 /opt
           test "$(stat -c '%u:%a' /opt)" = 0:755
           sudo -n systemctl start docker
@@ -139,6 +168,15 @@ jobs:
             -C /root/sovagrid-reviewed-dependencies --no-same-owner --same-permissions
           sudo -n bash /root/sovagrid-reviewed-dependencies/sovagrid-blueprint/tests/restore_dependencies_vm.sh \
             "$SOVAGRID_EXPECTED_MANIFEST"
+      - name: Verify pinned restore bootstrap, resume and binary SSH framing
+        if: inputs.release_validation
+        run: >-
+          sudo -n env GITHUB_ACTIONS="$GITHUB_ACTIONS"
+          RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS"
+          SOVAGRID_PORTABLE_RESTORE_DISPOSABLE=1
+          SOVAGRID_RESTORE_EXPECTED_MANIFEST="$SOVAGRID_EXPECTED_MANIFEST"
+          python3 -B -I /root/sovagrid-reviewed-dependencies/sovagrid-blueprint/tests/portable_restore_bootstrap_vm.py
+          "$RUNNER_TEMP/SovaGrid-server-source.tar.gz"
       - name: Verify VPN source maintenance and restart recovery with real systemd
         if: inputs.release_validation
         run: >-

@@ -210,6 +210,90 @@ class HostBackupTest(unittest.TestCase):
             self.assertIn(path.lstrip("/"), names)
         self.assertTrue(backup.verify(result["id"])["verified"])
 
+    def test_web_agent_canonical_and_legacy_uuid_jobs_survive_backup(self) -> None:
+        self.web_agent_fixture()
+        name = "01234567-89ab-4cde-8fab-0123456789ab.json"
+        job = self.web_agent_root / "jobs" / name
+        job.write_bytes(b'{"phase":"complete"}\n')
+        job.chmod(0o600)
+        result = self.archive()
+        archive = self.root / "var/lib/sovagrid-host-backups" / (result["id"] + ".tar.gz")
+        with tarfile.open(archive, "r:gz") as stream:
+            names = set(stream.getnames())
+        prefix = backup.WEB_AGENT_JOBS.lstrip("/") + "/"
+        self.assertIn(prefix + name, names)
+        self.assertIn(prefix + "a" * 32 + ".json", names)
+        self.assertTrue(backup.verify(result["id"])["verified"])
+
+    def test_web_restore_metadata_survives_backup_but_bulk_cache_is_excluded(self) -> None:
+        self.web_agent_fixture()
+        prefix = self.web_agent_root / "restores"
+        prefix.mkdir(mode=0o700)
+        expected = []
+        for kind in ("imports", "operations"):
+            collection = prefix / kind
+            collection.mkdir(mode=0o700)
+            operation = collection / ("f" * 32)
+            operation.mkdir(mode=0o700)
+            for name, raw in ((".lock", b""), ("state.json", b'{"phase":"review"}\n'),
+                              ("." + "e" * 32 + ".tmp", b"")):
+                path = operation / name
+                path.write_bytes(raw)
+                path.chmod(0o600)
+                expected.append(str(path.relative_to(self.root)))
+        cache = self.root / "var/cache/sovagrid-web-restores/imports"
+        cache.mkdir(parents=True)
+        (cache / "never-archive-payload.bin").write_bytes(b"bulk transfer bytes")
+        result = self.archive()
+        archive = self.root / "var/lib/sovagrid-host-backups" / (result["id"] + ".tar.gz")
+        with tarfile.open(archive, "r:gz") as stream:
+            names = set(stream.getnames())
+        self.assertTrue(set(expected) <= names)
+        self.assertFalse(any(name.startswith("var/cache/") for name in names))
+        self.assertTrue(backup.verify(result["id"])["verified"])
+
+    def test_web_restore_metadata_has_closed_names_private_modes_and_size_bound(self) -> None:
+        base = backup.WEB_RESTORE_STATE
+        for path in (base + "/payloads", base + "/imports/not-an-id", base + "/operations/" + "a" * 32 + "/key.pem",
+                     base + "/operations/" + "a" * 32 + "/state.json/extra",
+                     base + "/imports/../state.json"):
+            with self.subTest(path=path), self.assertRaisesRegex(backup.Refused, "UNSAFE_SOURCE"):
+                backup._web_agent_source(path)
+        self.web_agent_fixture()
+        directory = self.web_agent_root / "restores/operations" / ("f" * 32)
+        directory.mkdir(parents=True, mode=0o700)
+        for path in (directory.parent.parent, directory.parent, directory):
+            path.chmod(0o700)
+        state = directory / "state.json"
+        state.write_bytes(b"{}\n")
+        state.chmod(0o644)
+        with patch.object(backup.grp, "getgrnam", return_value=SimpleNamespace(gr_gid=self.gid)):
+            with self.assertRaisesRegex(backup.Refused, "UNSAFE_SOURCE"):
+                backup._scan(self.sources, deadline=time.monotonic() + 5)
+            state.chmod(0o600)
+            state.write_bytes(b"x" * (backup.WEB_RESTORE_MAX_STATE + 1))
+            with self.assertRaisesRegex(backup.Refused, "SIZE_LIMIT"):
+                backup._scan(self.sources, deadline=time.monotonic() + 5)
+
+    def test_web_agent_noncanonical_uuid_and_path_forms_are_rejected(self) -> None:
+        self.web_agent_fixture()
+        for name in ("01234567-89AB-4cde-8fab-0123456789ab.json",
+                     "01234567-89ab-4cde-8fab0123456789ab.json",
+                     "01234567--89ab-4cde-8fab-0123456789ab.json",
+                     "01234567-89ab-4cde-8fab-0123456789ab.json.bak",
+                     "a" * 32 + ".json\n"):
+            with self.subTest(name=name):
+                job = self.web_agent_root / "jobs" / name
+                job.write_bytes(b"{}\n")
+                job.chmod(0o600)
+                with self.assertRaisesRegex(backup.Refused, "UNSAFE_SOURCE"):
+                    backup._scan(self.sources, deadline=time.monotonic() + 5)
+                job.unlink()
+        for name in ("../" + "a" * 32 + ".json", "sub/" + "a" * 32 + ".json",
+                     "a" * 32 + ".json/extra"):
+            with self.subTest(path=name), self.assertRaisesRegex(backup.Refused, "UNSAFE_SOURCE"):
+                backup._web_agent_source(backup.WEB_AGENT_JOBS + "/" + name)
+
     def test_web_agent_inventory_refuses_foreign_or_damaged_state(self) -> None:
         self.web_agent_fixture()
         foreign = self.web_agent_root / "ssh-password.txt"

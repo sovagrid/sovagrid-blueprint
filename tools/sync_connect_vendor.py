@@ -27,14 +27,18 @@ VENDOR = ROOT / "vendor/connect"
 PACKAGE = VENDOR / "sovagrid_connect"
 LOCK = VENDOR / "SOURCE.json"
 UPSTREAM = "https://github.com/sovagrid/sovagrid-connect"
-UPSTREAM_COMMIT = "959c22693358d518b3a2776fcd2a976ef733f336"
-# Runtime-only Ubuntu closure for AgentEnrollment, EnrollmentAPI and AgentRPC.
+UPSTREAM_COMMIT = "68e7d2d56f3766ea248045aa71967968599b1650"
+# Runtime-only Ubuntu closure for Agent enrollment and portable restore.
 # core.ssh_grant and enrollment_journal.keygen are used only by the desktop UI
 # and Windows branches; the server worker never invokes those paths.
 SELECTED_FILES = frozenset("sovagrid_connect/" + name for name in (
     "__init__.py", "agent_enrollment.py", "agent_rpc.py", "askpass.py", "core.py",
     "enrollment_api.py", "enrollment_journal.py", "enrollment_protocol.py",
     "installer.py", "remote_update.py", "server_status.py", "server_timer.py",
+    "approved_manifest.py", "auto_update.py", "host_backup.py", "host_backup_remote.py",
+    "host_backup_request.py", "host_backup_transfer.py", "hub_backup.py", "hub_backup_remote.py",
+    "local_operations.py", "portable_restore.py", "promotion.py", "promotion_protocol.py",
+    "promotion_remote.py", "release_feed_remote.py",
     "theme.py", "legal/LICENSE", "legal/ATTRIBUTION.md", "legal/NOTICE",
 ))
 _SAFE_PART = re.compile(r"[A-Za-z0-9_.-]+\Z")

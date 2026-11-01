@@ -30,7 +30,7 @@ class ResourcePlanTest(unittest.TestCase):
         self.folder = Path(temporary.name)
         self.root = self.folder / "root"
         self.root.mkdir()
-        for absolute in ("/etc/systemd/system", "/etc/sysctl.d", "/opt", "/var/lib", "/run",
+        for absolute in ("/etc/systemd/system", "/etc/sysctl.d", "/opt", "/var/lib", "/var/cache", "/run",
                          "/usr/local/bin", "/usr/local/libexec"):
             (self.root / absolute.lstrip("/")).mkdir(parents=True, exist_ok=True)
         self.staged = self.root / "var/lib/.sovagrid-host-restore-staging" / IDENTITY
@@ -119,6 +119,37 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(resources["/var/lib/sovagrid-shell"]["entries"][""]["uid"], 10003)
         self.assertFalse((self.root / "etc/sovagrid").exists())
         self.assertFalse((self.root / "var/lib/sovagrid").exists())
+
+    def test_backup_broker_workspaces_are_planned_empty_private_and_never_adopted(self):
+        self.add_unit("sovagrid-hub-backup-control.service", None, active=False)
+        result = apply.build_resource_plan(self.inputs())
+        resources = {resource["target"]: resource for resource in result["resources"]}
+        for absolute in ("/opt/sovagrid-candidates", "/var/lib/sovagrid-host-backup-operations"):
+            self.assertEqual(resources[absolute]["entries"], {
+                "": {"kind": "dir", "uid": 0, "gid": 0, "mode": 0o700, "mtime": 0}})
+            path = self.root / absolute.lstrip("/")
+            self.assertFalse(path.exists())
+            path.mkdir(mode=0o700)
+            (path / "foreign-data").write_bytes(b"preserve")
+            with self.assertRaisesRegex(apply.Refused, "RESTORE_RUNTIME_STATE_PRESENT"):
+                apply.build_resource_plan(self.inputs())
+            self.assertEqual((path / "foreign-data").read_bytes(), b"preserve")
+            (path / "foreign-data").unlink()
+            path.rmdir()
+
+    def test_web_restore_cache_is_fresh_journaled_and_existing_data_is_not_adopted(self):
+        result = apply.build_resource_plan(self.inputs())
+        resource = next(item for item in result["resources"] if item["target"] == "/var/cache/sovagrid-web-restores")
+        self.assertEqual(resource["entries"], {"": {"kind": "dir", "uid": 0, "gid": 0,
+                                                     "mode": 0o700, "mtime": 0}})
+        cache = self.root / "var/cache/sovagrid-web-restores"
+        self.assertFalse(cache.exists())
+        cache.mkdir(mode=0o700)
+        foreign = cache / "foreign-file"
+        foreign.write_bytes(b"preserve")
+        with self.assertRaisesRegex(apply.Refused, "RESTORE_RUNTIME_STATE_PRESENT"):
+            apply.build_resource_plan(self.inputs())
+        self.assertEqual(foreign.read_bytes(), b"preserve")
 
     def test_unit_order_is_socket_then_consumers_then_timers(self):
         result = apply.build_resource_plan(self.inputs())

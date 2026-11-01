@@ -1,7 +1,7 @@
 {
-  "commit": "959c22693358d518b3a2776fcd2a976ef733f336",
-  "file_count": 16,
+  "commit": "68e7d2d56f3766ea248045aa71967968599b1650",
+  "file_count": 30,
   "format": 1,
   "repository": "https://github.com/sovagrid/sovagrid-connect",
-  "tree_sha256": "a5bcdf2f6f47d65dff44db6ac94936b9e8aa29140f267ff07debc6158014a960"
+  "tree_sha256": "cf2a18ca796ff8e5540a3916898b20d4e3b78be217c5930371d926368f784851"
 }

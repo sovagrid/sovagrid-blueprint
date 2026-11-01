@@ -1126,7 +1126,7 @@ class RestoreInspectionTest(unittest.TestCase):
         identity = "a" * 32
         image_digest = "d" * 64
         reviewed = "e" * 64
-        plan = {"review_sha256": reviewed, "target_empty": True,
+        plan = {"review_sha256": reviewed, "target_empty": True, "target_ready": True,
                 "blockers": ["APPLY_NOT_IMPLEMENTED"],
                 "host_archive_sha256": manifest["sha256"],
                 "source_manifest_sha256": self.source_sha,
@@ -1187,7 +1187,7 @@ class RestoreInspectionTest(unittest.TestCase):
     def test_portable_stage_resumes_an_existing_verified_host_stage(self):
         archive, target, manifest = self._stage_fixture()
         identity = "a" * 32
-        plan = {"review_sha256": "e" * 64, "target_empty": True,
+        plan = {"review_sha256": "e" * 64, "target_empty": True, "target_ready": True,
                 "blockers": ["APPLY_NOT_IMPLEMENTED"],
                 "host_archive_sha256": manifest["sha256"],
                 "source_manifest_sha256": self.source_sha,
@@ -1245,14 +1245,14 @@ class RestoreInspectionTest(unittest.TestCase):
         with (patch.object(restore, "_require_root"),
               patch.object(restore, "portable_stage_status", return_value=staged),
               patch.object(restore, "portable_clean_plan", return_value=target)):
-            result = restore.portable_apply_preview(identity)
+            result = restore._portable_apply_preview_base(identity)
             self.assertTrue(result["target_ready"])
             self.assertFalse(result["apply_available"])
             self.assertEqual(result["blockers"], ["APPLY_NOT_IMPLEMENTED"])
             self.assertRegex(result["apply_review_sha256"], r"^[0-9a-f]{64}$")
             original = result["apply_review_sha256"]
             staged["receipt_protocol"] = "sovagrid-portable-host-receipt-v1"
-            legacy = restore.portable_apply_preview(identity)
+            legacy = restore._portable_apply_preview_base(identity)
             self.assertFalse(legacy["target_ready"])
             self.assertFalse(legacy["apply_available"])
             self.assertIn("RECEIPT_V1_UNSUPPORTED", legacy["blockers"])
@@ -1261,7 +1261,7 @@ class RestoreInspectionTest(unittest.TestCase):
             target["target_conflicts"] = 1
             target["target_empty"] = False
             target["blockers"].append("TARGET_STATE_PRESENT")
-            changed = restore.portable_apply_preview(identity)
+            changed = restore._portable_apply_preview_base(identity)
             self.assertFalse(changed["target_ready"])
             self.assertIn("STALE_REVIEW", changed["blockers"])
             self.assertIn("TARGET_STATE_PRESENT", changed["blockers"])

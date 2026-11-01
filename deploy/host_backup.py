@@ -59,13 +59,17 @@ WEB_AGENT_UNITS = ("sovagrid-web-agent-control.socket",
 WEB_AGENT_UNIT_PATHS = tuple("/etc/systemd/system/" + unit
                              for unit in WEB_AGENT_UNITS)
 WEB_AGENT_BUNDLE = re.compile(r"source-([0-9a-f]{64})\.tar\.gz\Z")
-WEB_AGENT_JOB = re.compile(r"[0-9a-f]{32}\.json\Z")
+WEB_AGENT_JOB = re.compile(
+    r"(?:[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.json\Z")
 WEB_AGENT_SOURCE_TEMP = re.compile(r"\.source-[A-Za-z0-9_]{6,31}\Z")
 WEB_AGENT_VPN_STAGE_TEMP = re.compile(r"\.vpn-stage-[0-9a-f]{32}\Z")
 WEB_AGENT_JOB_TEMP = re.compile(r"\.enrollment-[A-Za-z0-9_]{6,31}\Z")
 WEB_AGENT_MAX_BUNDLE = 64 * 1024**2
 WEB_AGENT_MAX_JOB = 32 * 1024
 WEB_AGENT_MAX_LOCK = 128
+WEB_RESTORE_STATE = WEB_AGENT_DIR + "/restores"
+WEB_RESTORE_MAX_STATE = 2 * 1024**2
+WEB_RESTORE_TEMP = re.compile(r"\.[0-9a-f]{32}\.tmp\Z")
 ID = re.compile(r"[0-9a-f]{32}\Z")
 ROOT_UID = 0
 ROOT_GID = 0
@@ -358,6 +362,18 @@ def _skip_container_temp(path: str, name: str, info: os.stat_result) -> bool:
 
 def _web_agent_source(path: str) -> Source | None:
     """Accept only the installer's private bundle and journal inventory."""
+    if path == WEB_RESTORE_STATE:
+        return Source(path, ROOT_UID, kind="dir", private=True, exact_mode=0o700, gid=ROOT_GID)
+    if path.startswith(WEB_RESTORE_STATE + "/"):
+        parts = path[len(WEB_RESTORE_STATE) + 1:].split("/")
+        valid = bool(parts and parts[0] in ("imports", "operations"))
+        directory = valid and (len(parts) == 1 or len(parts) == 2 and ID.fullmatch(parts[1]))
+        regular = (valid and len(parts) == 3 and ID.fullmatch(parts[1]) and
+                   (parts[2] in (".lock", "state.json") or WEB_RESTORE_TEMP.fullmatch(parts[2])))
+        if not directory and not regular:
+            raise Refused("UNSAFE_SOURCE")
+        return Source(path, ROOT_UID, kind="dir" if directory else "file", private=True,
+                      exact_mode=0o700 if directory else 0o600, gid=ROOT_GID)
     if path == WEB_AGENT_DIR or path == WEB_AGENT_JOBS:
         return Source(path, ROOT_UID, kind="dir", private=True, exact_mode=0o700,
                       gid=ROOT_GID)
@@ -375,6 +391,10 @@ def _web_agent_source(path: str) -> Source | None:
 
 
 def _web_agent_limit(path: str) -> int | None:
+    if path.startswith(WEB_RESTORE_STATE + "/"):
+        selected = _web_agent_source(path)
+        if selected is not None and selected.kind == "file":
+            return WEB_AGENT_MAX_LOCK if path.endswith("/.lock") else WEB_RESTORE_MAX_STATE
     if path == WEB_AGENT_AUDIT:
         return WEB_AGENT_MAX_BUNDLE
     if path.startswith(WEB_AGENT_DIR + "/source-"):
@@ -391,6 +411,8 @@ def _web_agent_limit(path: str) -> int | None:
 
 def _web_agent_nonempty(path: str) -> bool:
     name = path.rsplit("/", 1)[1]
+    if path.startswith(WEB_RESTORE_STATE + "/"):
+        return name == "state.json"
     return bool((path.startswith(WEB_AGENT_DIR + "/") and
                  WEB_AGENT_BUNDLE.fullmatch(name)) or
                 (path.startswith(WEB_AGENT_JOBS + "/") and

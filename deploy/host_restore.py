@@ -89,6 +89,7 @@ TARGET_NAMESPACES = frozenset((
     "/var/lib/sovagrid-promotion", "/var/lib/sovagrid-agent",
     "/var/lib/sovagrid-agent-local",
     "/var/lib/sovagrid-host-backup-operations",
+    "/var/cache/sovagrid-web-restores",
     "/opt/sovagrid-src", "/opt/sovagrid-vpn", "/opt/sovagrid-agent",
     "/opt/sovagrid-agent-local",
 ))
@@ -1026,7 +1027,7 @@ def portable_clean_plan(identity: str) -> dict:
                                        "architecture": docker["architecture"]}
                           for platform in artifact["platforms"].values()))
     blockers = [code for code in clean["blockers"]
-                if code != "DOCKER_IMAGES_NOT_INCLUDED"]
+                if code not in ("DOCKER_IMAGES_NOT_INCLUDED", "APPLY_NOT_IMPLEMENTED")]
     if not docker["available"]:
         blockers.append("DOCKER_UNAVAILABLE")
     elif not platform_match:
@@ -1047,6 +1048,8 @@ def portable_clean_plan(identity: str) -> dict:
                                     docker["root_free_bytes"] < 4 * artifact["bytes"] +
                                     MIN_RESTORE_FREE):
         blockers.append("DISK_SPACE")
+    physical_blockers = list(dict.fromkeys(blockers))
+    supported = _portable_backend_supported()
     result = {**clean, "portable_verified": True,
             "host_archive_sha256": receipt["host_archive_sha256"],
             "images_sha256": receipt["images_sha256"],
@@ -1062,7 +1065,9 @@ def portable_clean_plan(identity: str) -> dict:
             "target_empty": clean["target_empty"] and not docker["conflicts"] and
                             ports == 0 and vpn_ports == 0 and
                             clean.get("vpn_ports_verified", True),
-            "apply_available": False, "blockers": list(dict.fromkeys(blockers))}
+            "backend_supported": supported, "target_ready": not physical_blockers,
+            "apply_available": False,  # A final staged resource review is still required.
+            "blockers": ([] if supported else ["APPLY_NOT_IMPLEMENTED"]) + physical_blockers}
     result["review_sha256"] = _portable_review_sha256(identity, result)
     return result
 
@@ -1090,7 +1095,7 @@ def _portable_review_sha256(identity: str, plan_result: dict) -> str:
               "target_docker_conflicts": plan_result["target_docker_conflicts"],
               "target_ports_in_use": plan_result["target_ports_in_use"],
               "target_vpn_ports_in_use": plan_result["target_vpn_ports_in_use"],
-              "blockers": plan_result["blockers"]}
+              "blockers": [code for code in plan_result["blockers"] if code != "APPLY_NOT_IMPLEMENTED"]}
     raw = json.dumps(review, sort_keys=True, separators=(",", ":"),
                      ensure_ascii=True).encode("ascii")
     return hashlib.sha256(raw).hexdigest()
@@ -1619,6 +1624,10 @@ def _verify_staged_units(identity: str, receipt: dict) -> list[str]:
     return sorted(units)
 
 
+def _portable_backend_supported() -> bool:
+    return getattr(_sibling("portable_restore_apply.py", "_sovagrid_restore_capabilities"), "APPLY_ENABLED", False) is True
+
+
 def portable_stage_status(identity: str, *, _root_fd: int | None = None) -> dict:
     """Recheck the sealed host tree and exact image pair without applying it."""
     _require_root()
@@ -1672,10 +1681,10 @@ def portable_stage_status(identity: str, *, _root_fd: int | None = None) -> dict
             "image_manifest_sha256": marker["image_manifest_sha256"],
             "portable_receipt_sha256": marker["portable_receipt_sha256"],
             "image_bytes": marker["image_bytes"],
+            "backend_supported": _portable_backend_supported(),
             "apply_available": False,
-            "blockers": (["APPLY_NOT_IMPLEMENTED", "RECEIPT_V1_UNSUPPORTED"]
-                         if receipt.get("protocol") == PORTABLE_RECEIPT_V1 else
-                         ["APPLY_NOT_IMPLEMENTED"])}
+            "blockers": ([] if _portable_backend_supported() else ["APPLY_NOT_IMPLEMENTED"]) +
+                        (["RECEIPT_V1_UNSUPPORTED"] if receipt.get("protocol") == PORTABLE_RECEIPT_V1 else [])}
 
 
 def portable_stage(identity: str, expected_review_sha256: str) -> dict:
@@ -1688,8 +1697,7 @@ def portable_stage(identity: str, expected_review_sha256: str) -> dict:
     preview = portable_clean_plan(identity)
     if preview["review_sha256"] != expected_review_sha256:
         raise Refused("STALE_REVIEW")
-    if (not preview["target_empty"] or
-            preview["blockers"] != ["APPLY_NOT_IMPLEMENTED"]):
+    if not preview["target_empty"] or preview.get("target_ready") is not True:
         raise Refused("TARGET_NOT_READY")
     try:
         staged = stage_status(identity)
@@ -1765,13 +1773,8 @@ def portable_stage(identity: str, expected_review_sha256: str) -> dict:
     return portable_stage_status(identity)
 
 
-def portable_apply_preview(identity: str, *, _root_fd: int | None = None) -> dict:
-    """Recheck a sealed pair and fresh target state; issue an apply-phase CAS.
-
-    There is deliberately no command that consumes this digest yet. It gives
-    the operator a stable description of the exact staged generation and
-    currently observed target before any future destructive transaction.
-    """
+def _portable_apply_preview_base(identity: str, *, _root_fd: int | None = None) -> dict:
+    """Internal sealed-pair/target observation, extended by the common planner."""
     _require_root()
     identity = _id(identity)
     staged = (portable_stage_status(identity) if _root_fd is None else
@@ -1819,6 +1822,18 @@ def portable_apply_preview(identity: str, *, _root_fd: int | None = None) -> dic
             "blockers": ["APPLY_NOT_IMPLEMENTED", *bounded]}
 
 
+def portable_apply_preview(identity: str, *, _root_fd: int | None = None) -> dict:
+    # The internal base reads use an already held stage descriptor. The
+    # public preview also checks the exact live resource/dependency policy.
+    if _root_fd is not None:
+        return _portable_apply_preview_base(identity, _root_fd=_root_fd)
+    transaction = _sibling("portable_restore_apply.py", "_sovagrid_portable_restore_preview")
+    try:
+        return transaction.preview_host(sys.modules[__name__], identity)
+    except transaction.Refused as exc:
+        raise Refused(str(exc)) from None
+
+
 def _portable_transaction(command: str, identity: str, review: str | None = None) -> dict:
     transaction = _sibling("portable_restore_apply.py", "_sovagrid_portable_restore_apply")
     try:
@@ -1826,6 +1841,8 @@ def _portable_transaction(command: str, identity: str, review: str | None = None
             return transaction.apply_host(sys.modules[__name__], identity, review)
         if command == "portable-apply-recover":
             return transaction.recover_host(sys.modules[__name__], identity)
+        if command == "portable-apply-retry":
+            return transaction.retry_host(sys.modules[__name__], identity, review)
         return transaction.host_status(sys.modules[__name__], identity)
     except transaction.Refused as exc:
         raise Refused(str(exc)) from None
@@ -1843,14 +1860,14 @@ def main(argv: list[str]) -> int:
              ("verify", "plan", "clean-plan", "portable-clean-plan",
               "stage", "stage-status", "portable-stage-status",
               "portable-apply-preview", "portable-apply-status", "portable-apply-recover")) and
-            (len(argv) != 3 or argv[0] not in ("portable-stage", "portable-apply"))):
+            (len(argv) != 3 or argv[0] not in ("portable-stage", "portable-apply", "portable-apply-retry"))):
             raise Refused("USAGE")
         result = (verify(argv[1]) if argv[0] == "verify" else
                   clean_plan(argv[1]) if argv[0] == "clean-plan" else
                   portable_clean_plan(argv[1]) if argv[0] == "portable-clean-plan" else
                   portable_stage(argv[1], argv[2]) if argv[0] == "portable-stage" else
                   _portable_transaction(argv[0], argv[1], argv[2] if len(argv) == 3 else None)
-                  if argv[0] in ("portable-apply", "portable-apply-status", "portable-apply-recover") else
+                  if argv[0] in ("portable-apply", "portable-apply-status", "portable-apply-recover", "portable-apply-retry") else
                   portable_apply_preview(argv[1]) if argv[0] == "portable-apply-preview" else
                   portable_stage_status(argv[1]) if argv[0] == "portable-stage-status" else
                   stage(argv[1]) if argv[0] == "stage" else
