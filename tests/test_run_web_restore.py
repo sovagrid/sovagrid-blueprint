@@ -52,6 +52,7 @@ die() { printf '%s\\n' "$*" >&2; exit 1; }
     def test_unsafe_existing_mode_identity_link_and_ancestor_refuse_without_changing_them(self):
         for path in self.namespaces:
             path.mkdir(mode=0o755)
+            path.chmod(0o755)
             self.assertNotEqual(self.invoke().returncode, 0)
             self.assertEqual(path.stat().st_mode & 0o777, 0o755)
             path.chmod(0o700)

@@ -1615,7 +1615,8 @@ def _resource_root(path: str) -> str:
     if (len(parts) == 5 and parts[1:4] == ("etc", "systemd", "system") and
             re.fullmatch(r"sovagrid-[a-z0-9-]{1,80}\.(?:service|socket|timer)", parts[4])):
         return path
-    if path in ("/etc/sysctl.d/70-sovagrid-vpn-routing.conf",
+    if path in ("/var/cache/sovagrid-web-restores",
+                "/etc/sysctl.d/70-sovagrid-vpn-routing.conf",
                 "/usr/local/bin/sovagrid-vpn-ctl", "/usr/local/libexec/sovagrid-vpn-broker"):
         return path
     raise Refused("INVALID_RESTORE_PATH")
