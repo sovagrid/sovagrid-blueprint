@@ -270,8 +270,9 @@ install_compose_binary() (
 )
 
 install_core_dependencies() {
-  local restore_mode=${1:-0} docker_available=0 package
+  local restore_mode=${1:-0} docker_available=0 package policy field candidate rest
   local -a missing=()
+  local -a docker_packages=(docker.io)
   local -a docker_command=(restore_local_docker)
   if [[ -x /usr/bin/docker ]]; then
     docker_available=1
@@ -303,7 +304,18 @@ install_core_dependencies() {
 
   if (( ! docker_available )); then
     say 'installing Docker from Linux distribution packages'
-    install_packages 'Docker CLI and Engine' docker.io
+    apt_refresh
+    # Some repositories split the CLI from docker.io and only recommend it.
+    # Select this by actual package metadata, independently of distro names.
+    if command -v apt-cache >/dev/null 2>&1 && policy=$(LC_ALL=C apt-cache policy docker-cli); then
+      while read -r field candidate rest; do
+        [[ $field == Candidate: ]] || continue
+        if [[ -n $candidate && $candidate != '(none)' ]]; then docker_packages+=(docker-cli); fi
+        break
+      done <<< "$policy"
+    fi
+    install_packages 'Docker CLI and Engine' "${docker_packages[@]}"
+    [[ -x /usr/bin/docker ]] || die 'missing dependency after package installation: /usr/bin/docker; Docker was not enabled'
     systemctl enable --now docker
   fi
   "${docker_command[@]}" info >/dev/null || die 'Docker daemon is unavailable; existing containers were not changed'

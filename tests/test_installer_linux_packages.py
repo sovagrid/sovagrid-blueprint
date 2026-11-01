@@ -250,6 +250,7 @@ systemctl() { printf 'systemctl %s\n' "$*" >> "$TEST_LOG"; }
 apt-cache() {
   printf 'apt-cache %s\n' "$*" >> "$TEST_LOG"
   case $2 in
+    docker-cli) printf '  Candidate: %s\n' "${TEST_APT_DOCKER_CLI:-(none)}" ;;
     docker-compose-v2) printf '  Candidate: %s\n' "${TEST_APT_V2:-(none)}" ;;
     docker-compose-plugin) printf '  Candidate: %s\n' "${TEST_APT_PLUGIN:-(none)}" ;;
     docker-compose) printf '  Candidate: %s\n' "${TEST_APT_COMPOSE:-(none)}" ;;
@@ -260,7 +261,9 @@ apt-get() {
   printf 'apt-get %s\n' "$*" >> "$TEST_LOG"
   if [[ $1 == --simulate ]]; then printf '%s\n' "${TEST_APT_PLAN:-}"; return; fi
   case ${*: -1} in
-    docker.io) TEST_DOCKER_PRESENT=1; touch "$TEST_DOCKER_BINARY"; chmod 0755 "$TEST_DOCKER_BINARY" ;;
+    docker.io|docker-cli)
+      TEST_DOCKER_PRESENT=1
+      if [[ ${TEST_INSTALLED_DOCKER_CLI:-1} == 1 ]]; then touch "$TEST_DOCKER_BINARY"; chmod 0755 "$TEST_DOCKER_BINARY"; fi ;;
     python3) TEST_PYTHON_PRESENT=1 ;;
     iproute2) TEST_IP_PRESENT=1; TEST_SS_PRESENT=1 ;;
     docker-compose-v2|docker-compose-plugin|docker-compose)
@@ -338,6 +341,19 @@ install_core_dependencies
         self.assertIn("apt-get install -y --no-install-recommends --no-remove docker.io\n", commands)
         self.assertIn("systemctl enable --now docker\n", commands)
         self.assertLess(commands.index("docker.io\n"), commands.index("systemctl enable --now docker\n"))
+
+    def test_fresh_docker_includes_split_cli_when_apt_candidate_exists(self) -> None:
+        result = self.dependency_fixture(TEST_DOCKER_PRESENT="0", TEST_APT_DOCKER_CLI="26.1.5+dfsg1-9",
+                                         TEST_APT_COMPOSE="2.26.1-4")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("apt-get install -y --no-install-recommends --no-remove docker.io docker-cli\n", self.commands())
+        self.assertLess(self.commands().index("docker.io docker-cli\n"), self.commands().index("systemctl enable --now docker\n"))
+
+    def test_fresh_docker_missing_cli_after_apt_refuses_before_enabling_daemon(self) -> None:
+        result = self.dependency_fixture(TEST_DOCKER_PRESENT="0", TEST_INSTALLED_DOCKER_CLI="0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing dependency after package installation", result.stderr)
+        self.assertNotIn("systemctl", self.commands())
 
     def test_configured_compose_packages_are_preferred_and_checked(self) -> None:
         for variable, candidate, package in (("TEST_APT_V2", "2.24.6+ds1-0ubuntu2", "docker-compose-v2"),
