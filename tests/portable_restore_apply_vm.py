@@ -584,6 +584,7 @@ def transition_fixture(action, old, target, candidate):
     fixture.source_pin(staged / "source", target)
     additions = {"/var/lib/sovagrid": {".auto-update.lock", "auto-update-status.json", "vpn-source", "vpn-source/.lock"},
                  "/etc/sovagrid": {"auto-update.json"}, "/var/lib/sovagrid-vpn": {".lock"}}
+    retirements = None
     for root, expected in value["trees"].items():
         actual = fixture.inventory(Path(root))
         if root == str(SOURCE):
@@ -603,6 +604,8 @@ def transition_fixture(action, old, target, candidate):
                         permitted.add(name)
             permitted |= {str(Path(name).relative_to(root)) for name in fixture.OPTIONAL if Path(name).is_relative_to(root)}
             need(set(actual) <= permitted, "unknown descendant created during transition")
+            if root == "/var/lib/sovagrid":
+                retirements = seal_web_bundle_retirements(fixture, expected, actual, old, target)
         value["trees"][root] = actual
     for root, names in (("/etc/sovagrid-vpn-routing", {"", "lock"}),
                         ("/etc/sovagrid-service-setup.lock", {""})):
@@ -615,11 +618,123 @@ def transition_fixture(action, old, target, candidate):
                  for record in actual.values()), "unowned transition lock")
             value["trees"][root] = actual
     value["manifest_sha256"] = target
+    if retirements is not None:
+        need("web_bundle_retirements" not in value, "Web archive retirement was already sealed")
+        value["web_bundle_retirements"] = retirements
     units = fixture.unit_inventory()
     need(set(units) == set(value["units"]), "transition changed the declared unit set")
     value["units"] = units  # Only this known signed installer advances inodes.
     del value["transition"]
     fixture.save(value)
+
+
+def web_bundle_jobs(fixture, records, *, root=Path("/var/lib/sovagrid")):
+    """Read only byte/metadata-proven producer journals, never discovered jobs."""
+    result = {}
+    for name, record in records.items():
+        match = re.fullmatch(r"web-agent/jobs/([0-9a-f-]{36})\.json", name)
+        if match is None:
+            continue
+        need(str(uuid.UUID(match[1])) == match[1] and record["kind"] == "file" and
+             record["uid"] == record["gid"] == 0 and record["mode"] == 0o600 and record["size"] <= 32 * 1024,
+             "invalid producer Web journal")
+        # inventory() proves no links and stable bytes; this second read must
+        # match those exact bytes before they can authorize a missing archive.
+        with os.fdopen(os.open(root / name, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+                 (info.st_dev, info.st_ino, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode), info.st_size) ==
+                 tuple(record[key] for key in ("dev", "ino", "uid", "gid", "mode", "size")),
+                 "producer Web journal identity changed")
+            raw = stream.read(32 * 1024 + 1)
+            after = os.fstat(stream.fileno())
+            keys = ("st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+            need(all(getattr(info, key) == getattr(after, key) for key in keys),
+                 "producer Web journal changed during read")
+        need(len(raw) == record["size"] and hashlib.sha256(raw).hexdigest() == record["sha256"],
+             "producer Web journal changed")
+        value = json.loads(raw)
+        need(value.get("request_id") == match[1] and type(value.get("bundle")) is dict and
+             set(value["bundle"]) == {"path", "sha256"}, "invalid producer Web bundle reference")
+        result[name] = value
+    return result
+
+
+def seal_web_bundle_retirements(fixture, expected, actual, old, target, *, root=Path("/var/lib/sovagrid")):
+    """The signed-transition producer seals only completed old runner archives.
+
+    Startup pruning is suppressed while the updater owns the enrollment lock.
+    A later restore starts without that lock and legitimately retires these
+    archives. Pending enrollment/cleanup and restore-history pins stay required.
+    """
+    archives = {name for name in actual if re.fullmatch(r"web-agent/source-[0-9a-f]{64}\.tar\.gz", name)}
+    current = archives - set(expected)
+    need(len(current) == 1, "transition current Web archive is not unique")
+    current, = current
+    need(actual[current]["kind"] == "file" and actual[current]["uid"] == actual[current]["gid"] == 0 and
+         actual[current]["mode"] == 0o600 and actual[current]["sha256"] == Path(current).name[7:-7],
+         "invalid transition current Web archive")
+    fixture.archive_pin(root / current, target)
+    job_records = {name: record for name, record in actual.items()
+                   if re.fullmatch(r"web-agent/jobs/[0-9a-f-]{36}\.json", name)}
+    need(all(name in expected and record == expected[name] for name, record in job_records.items()),
+         "producer Web journal changed during transition")
+    jobs = web_bundle_jobs(fixture, job_records, root=root)
+    retired = {}
+    for name in sorted(archives & set(expected)):
+        need(actual[name] == expected[name], "old producer Web archive changed")
+        fixture.archive_pin(root / name, old)
+        sha = Path(name).name.removeprefix("source-").removesuffix(".tar.gz")
+        references = {path: job for path, job in jobs.items()
+                      if job["bundle"] == {"path": str(Path("/var/lib/sovagrid") / name), "sha256": sha}}
+        # 'active' means completed enrollment, not an in-progress operation.
+        if references and all(job.get("phase") == "active" and job.get("cleanup_required") is False
+                              for job in references.values()):
+            retired[name] = sorted(references)
+    need(not any(name.startswith("web-agent/restores/operations/") for name in actual),
+         "Web restore history requires its pinned runner")
+    return {"old_manifest_sha256": old, "target_manifest_sha256": target,
+            "current": current, "archives": retired}
+
+
+def retired_web_bundles(fixture, value, entries, actual, *, root=Path("/var/lib/sovagrid")):
+    """An absent completed runner is optional only with its transition proof."""
+    proof = value.get("web_bundle_retirements")
+    if proof is None:
+        return set()
+    need(set(proof) == {"old_manifest_sha256", "target_manifest_sha256", "current", "archives"} and
+         proof["old_manifest_sha256"] == value["initial_manifest_sha256"] and
+         proof["target_manifest_sha256"] == expected_manifest() and
+         proof["old_manifest_sha256"] != proof["target_manifest_sha256"], "invalid Web archive retirement proof")
+    sealed = value["trees"]["/var/lib/sovagrid"]
+    current = proof["current"]
+    need(current in actual and current in entries and current in sealed and
+         re.fullmatch(r"web-agent/source-[0-9a-f]{64}\.tar\.gz", current), "current Web archive disappeared")
+    keys = ("kind", "uid", "gid", "mode", "size", "sha256")
+    need(all(actual[current][key] == entries[current][key] == sealed[current][key] for key in keys),
+         "current Web archive changed")
+    fixture.archive_pin(root / current, expected_manifest())
+    need(not any(name.startswith("web-agent/restores/operations/") for name in set(entries) | set(actual)),
+         "Web restore history requires its pinned runner")
+    jobs = web_bundle_jobs(fixture, {name: record for name, record in actual.items()
+        if name in sealed and name in entries and record["kind"] == "file" and
+        all(record[key] == sealed[name][key] == entries[name][key] for key in keys)}, root=root)
+    retired = set()
+    for name, references in proof["archives"].items():
+        need(name != current and name in sealed and name in entries and
+             re.fullmatch(r"web-agent/source-[0-9a-f]{64}\.tar\.gz", name) and
+             all(sealed[name][key] == entries[name][key] for key in keys) and
+             sealed[name]["sha256"] == Path(name).name[7:-7] and
+             sealed[name]["kind"] == "file" and sealed[name]["uid"] == sealed[name]["gid"] == 0 and
+             sealed[name]["mode"] == 0o600, "unproven retired Web archive")
+        matches = sorted(path for path, job in jobs.items() if job["bundle"] == {
+            "path": str(Path("/var/lib/sovagrid") / name), "sha256": sealed[name]["sha256"]})
+        need(references and matches == references and all(jobs[path].get("phase") == "active" and
+             jobs[path].get("cleanup_required") is False for path in references),
+             "retired Web archive is still needed by enrollment")
+        if name not in actual:
+            retired.add(name)
+    return retired
 
 
 def record_restored(bundle, identity):
@@ -647,6 +762,8 @@ def record_restored(bundle, identity):
         need(set(actual) <= permitted, "restored fixture has an undeclared descendant")
         required = {name for name in resources.get(root, {}).get("entries", {})
                     if str(Path(root) / name) not in fixture.OPTIONAL}
+        if root == "/var/lib/sovagrid":
+            required -= retired_web_bundles(fixture, value, resources[root]["entries"], actual)
         need(required <= set(actual), "restored fixture lost a declared descendant")
         need(root in publications and [actual[""][key] for key in ("dev", "ino")] ==
              [publications[root][key] for key in ("device", "inode")], "restored fixture root was replaced")

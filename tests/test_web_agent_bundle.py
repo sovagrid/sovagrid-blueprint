@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import base64
 import hashlib
 import fcntl
 import json
 import os
 from pathlib import Path
 import stat
+import struct
 import sys
 import tarfile
 import tempfile
@@ -26,6 +28,7 @@ sys.path.insert(0, str(ROOT / "deploy"))
 from sovagrid_connect.agent_enrollment import source_bundle
 from sovagrid_connect.core import ConnectionOptions
 from sovagrid_connect.enrollment_journal import EnrollmentJournal
+from sovagrid_connect.enrollment_protocol import public_key_fingerprint
 from web_agent_bundle import BundleError, COMPONENTS, REQUIRED, ensure_managed_bundle
 
 
@@ -139,6 +142,33 @@ class BundleTests(unittest.TestCase):
         journal.remove(pending["request_id"], expected_revision=pending["revision"])
         self.assertEqual(self.ensure(), (new_path, new_digest))
         self.assertFalse(old_path.exists())
+
+    def test_updater_lock_retains_completed_runner_until_next_unlocked_startup(self):
+        old_path, old_digest = self.ensure()
+        journal, pending = self.pending_journal(old_path, old_digest)
+        raw_key = struct.pack(">I", 11) + b"ssh-ed25519" + struct.pack(">I", 32) + bytes(range(32))
+        public = "ssh-ed25519 " + base64.b64encode(raw_key).decode("ascii")
+        enrollment, server = str(uuid.uuid4()), str(uuid.uuid4())
+        completed = journal.update(pending["request_id"], {
+            "phase": "active", "target": {"request_id": pending["request_id"], "enrollment_id": enrollment,
+                "server_id": server, "phase": "active", "agent_token_sha256": "a" * 64,
+                "ssh_public_key": public, "ssh_key_fingerprint": public_key_fingerprint(public), "local_port": 18767},
+            "registration": {"id": enrollment, "server_id": server, "name": pending["name"],
+                "state": "active", "revision": 1, "created_at": 100, "last_seen": 101}},
+            expected_revision=pending["revision"])
+        name = "sovagrid-web/Dockerfile"
+        self.files[name] = b"new source while signed updater holds enrollment lock\n"
+        (self.source / name).write_bytes(self.files[name])
+        self.write_manifest()
+        with (journal.root / ".enrollment-web-mutation").open("rb+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            new_path, new_digest = self.ensure()
+            self.assertTrue(old_path.is_file())
+            self.assertNotEqual(new_digest, old_digest)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        self.assertEqual(self.ensure(), (new_path, new_digest))
+        self.assertFalse(old_path.exists())
+        self.assertEqual(journal.load(completed["request_id"]), completed)
 
     def test_unlisted_file_and_symlink_are_rejected(self):
         extra = self.source / "sovagrid-web" / "unexpected.txt"
