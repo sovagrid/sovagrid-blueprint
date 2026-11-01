@@ -896,6 +896,7 @@ class Images:
 
     def __init__(self, inputs: Any):
         self.inputs = inputs
+        self._converted_cache = None
 
     @staticmethod
     def _environment():
@@ -923,16 +924,22 @@ class Images:
         services = step["desired"]["services"]
         if (not isinstance(services, dict) or set(services) not in (
                 {"hub", "web"}, set(self.SERVICES)) or any(
-                not isinstance(value, dict) or set(value) != {"config", "rootfs_sha256", "platform"} or
+                not isinstance(value, dict) or set(value) != {"config", "rootfs_sha256", "platform", "runtime_ids"} or
                 not isinstance(value["config"], str) or self.CONFIG.fullmatch(value["config"]) is None or
                 not isinstance(value["rootfs_sha256"], str) or SHA.fullmatch(value["rootfs_sha256"]) is None or
                 value["platform"] not in ({"os": "linux", "architecture": "amd64"},
-                                            {"os": "linux", "architecture": "arm64"})
+                                            {"os": "linux", "architecture": "arm64"}) or
+                not isinstance(value["runtime_ids"], list) or not 1 <= len(value["runtime_ids"]) <= 3 or
+                any(not isinstance(identity, str) or self.CONFIG.fullmatch(identity) is None
+                    for identity in value["runtime_ids"]) or
+                value["runtime_ids"] != sorted(set(value["runtime_ids"])) or
+                value["config"] not in value["runtime_ids"]
                 for value in services.values())):
             raise Refused("INVALID_RESTORE_IMAGES")
         expected = {service: {"config": digest,
                               "rootfs_sha256": self.inputs.images["rootfs_sha256"][service],
-                              "platform": self.inputs.platforms[service]}
+                              "platform": self.inputs.platforms[service],
+                              "runtime_ids": self.inputs.runtime_ids[service]}
                     for service, digest in self.inputs.images["exported_configs"].items()}
         if services != expected:
             raise Refused("RESTORE_IMAGE_RECEIPT_MISMATCH")
@@ -952,6 +959,83 @@ class Images:
                 found[tag] = image
         return found
 
+    def _inventory(self):
+        values = self._capture(["image", "ls", "--all", "--no-trunc", "--quiet"]).splitlines()
+        if (any(self.CONFIG.fullmatch(value) is None for value in values) or
+                len(set(values)) > 96):
+            raise Refused("RESTORE_IMAGE_INVENTORY_LIMIT")
+        return sorted({value[7:] for value in values})
+
+    def _proof(self, proof, services):
+        if (not isinstance(proof, dict) or set(proof) != {"absent", "services", "preexisting_ids"} or
+                proof["absent"] is not True or proof["services"] != services or
+                not isinstance(proof["preexisting_ids"], list) or len(proof["preexisting_ids"]) > 96 or
+                any(not isinstance(value, str) or SHA.fullmatch(value) is None for value in proof["preexisting_ids"]) or
+                proof["preexisting_ids"] != sorted(set(proof["preexisting_ids"])) or
+                len(_canonical(proof)) > MAX_PROOF):
+            raise Refused("INVALID_RESTORE_PROOF")
+
+    def _scratch(self):
+        """An anonymous file cannot survive process death or replace any path."""
+        if not getattr(os, "O_TMPFILE", 0):
+            raise Refused("RESTORE_IMAGE_REEXPORT_UNAVAILABLE")
+        uid, gid = self.inputs.root_uid, self.inputs.root_gid
+        _private(os.fstat(self.inputs.stage_fd), directory=True, uid=uid, gid=gid)
+        try:
+            fd = os.open(".", os.O_RDWR | os.O_CLOEXEC | os.O_TMPFILE, 0o600,
+                         dir_fd=self.inputs.stage_fd)
+        except OSError as exc:
+            raise Refused("RESTORE_IMAGE_REEXPORT_UNAVAILABLE") from exc
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 0 or
+                    (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (uid, gid, 0o600)):
+                raise Refused("UNSAFE_RESTORE_IMAGE_SCRATCH")
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _space(self):
+        try:
+            info = os.fstatvfs(self.inputs.stage_fd)
+        except OSError as exc:
+            raise Refused("RESTORE_DISK_SPACE") from exc
+        if info.f_bavail * info.f_frsize < self.inputs.exporter.MAX_IMAGE_BYTES + self.inputs.exporter.MIN_FREE:
+            raise Refused("RESTORE_DISK_SPACE")
+
+    def _converted_ids(self):
+        tags = self._tags()
+        key = tuple(sorted(tags.items()))
+        if self._converted_cache is not None and self._converted_cache[0] == key:
+            return self._converted_cache[1]
+        services = {name: tags["sovagrid-" + name + ":local"]
+                    for name in self.inputs.images["exported_configs"] if "sovagrid-" + name + ":local" in tags}
+        if not services:
+            raise Refused("RESTORE_IMAGE_CHANGED")
+        self._space()
+        descriptor = self._scratch()
+        exporter = self.inputs.exporter
+        try:
+            deadline = time.monotonic() + exporter.MAX_IMAGE_SECONDS
+            exporter._save_images(["sovagrid-" + name + ":local" for name in sorted(services)],
+                                  descriptor, descriptor, deadline=deadline)
+            exported, platforms, runtime_ids = {}, {}, {}
+            exporter._inspect_image_tar(descriptor, services, deadline=deadline,
+                source_rootfs={name: self.inputs.images["rootfs_sha256"][name] for name in services},
+                exported_configs=exported, platforms=platforms, runtime_ids=runtime_ids)
+            if (exported != {name: self.inputs.images["exported_configs"][name] for name in services} or
+                    platforms != {name: self.inputs.platforms[name] for name in services} or
+                    set(runtime_ids) != set(services) or
+                    any(identity not in runtime_ids[name] for name, identity in services.items()) or self._tags() != tags):
+                raise Refused("RESTORE_IMAGE_CHANGED")
+        except (exporter.Refused, OSError) as exc:
+            raise Refused("RESTORE_IMAGE_REEXPORT_FAILED") from exc
+        finally:
+            os.close(descriptor)
+        self._converted_cache = key, runtime_ids
+        return runtime_ids
+
     def _check(self, service, desired):
         tag = "sovagrid-" + service + ":local"
         projection = '{"id":{{json .Id}},"os":{{json .Os}},"arch":{{json .Architecture}},"layers":{{json .RootFS.Layers}}}'
@@ -960,26 +1044,70 @@ class Images:
                                object_pairs_hook=_unique)
         except (ValueError, UnicodeError) as exc:
             raise Refused("RESTORE_IMAGE_CHANGED") from exc
+        if not isinstance(value, dict):
+            raise Refused("RESTORE_IMAGE_CHANGED")
         layers = value.get("layers")
         if (not isinstance(layers, list) or not 1 <= len(layers) <= 256 or
                 any(not isinstance(layer, str) or self.CONFIG.fullmatch(layer) is None for layer in layers) or
-                value.get("id") != desired["config"] or
                 {"os": value.get("os"), "architecture": value.get("arch")} != desired["platform"] or
                 hashlib.sha256("\n".join(layers).encode("ascii")).hexdigest() != desired["rootfs_sha256"]):
             raise Refused("RESTORE_IMAGE_CHANGED")
+        if value.get("id") not in desired["runtime_ids"] and value.get("id") not in self._converted_ids().get(service, []):
+            raise Refused("RESTORE_IMAGE_CHANGED")
+        return value["id"]
+
+    def resolved(self, services):
+        """Return runnable daemon IDs after verifying their archive DAG binding."""
+        tags = self._tags()
+        if set(tags) != {"sovagrid-" + service + ":local" for service in services}:
+            raise Refused("RESTORE_IMAGE_CHANGED")
+        result = {}
+        for service, desired in services.items():
+            identity = self._check(service, desired)
+            if tags["sovagrid-" + service + ":local"] != identity:
+                raise Refused("RESTORE_IMAGE_CHANGED")
+            result[service] = identity
+        return result
+
+    def _owned_references(self, identity, tag):
+        projection = '{"id":{{json .Id}},"tags":{{json .RepoTags}},"digests":{{json .RepoDigests}}}'
+        try:
+            value = json.loads(self._capture(["image", "inspect", "--format", projection, identity]),
+                               object_pairs_hook=_unique)
+        except (ValueError, UnicodeError) as exc:
+            raise Refused("RESTORE_IMAGE_CHANGED") from exc
+        repository = tag.removesuffix(":local")
+        expected = {name + "@" + identity for name in
+                    (repository, tag, "docker.io/library/" + repository, "docker.io/library/" + tag)}
+        digests = value.get("digests") if isinstance(value, dict) else None
+        if digests is None:
+            digests = []
+        if (not isinstance(value, dict) or value.get("id") != identity or value.get("tags") != [tag] or
+                not isinstance(digests, list) or len(digests) > len(expected) or
+                any(not isinstance(ref, str) or ref not in expected for ref in digests) or
+                len(set(digests)) != len(digests)):
+            raise Refused("RESTORE_IMAGE_CHANGED")
+        if self._capture(["ps", "-a", "--no-trunc", "--filter", "ancestor=" + identity,
+                          "--format", "{{.ID}}"]):
+            raise Refused("RESTORE_IMAGE_IN_USE")
 
     def prepare(self, step):
         services = self._desired(step)
         self.inputs.unchanged()
         if self._tags():
             raise Refused("RESTORE_IMAGE_EXISTS")
-        return {"absent": True, "services": services}
+        self._space()
+        descriptor = self._scratch()
+        os.close(descriptor)
+        proof = {"absent": True, "services": services, "preexisting_ids": self._inventory()}
+        self._proof(proof, services)
+        return proof
 
     def execute(self, step, proof):
         services = self._desired(step)
-        if proof != {"absent": True, "services": services}:
-            raise Refused("INVALID_RESTORE_PROOF")
-        self.prepare(step)
+        self._proof(proof, services)
+        if self.prepare(step) != proof:
+            raise Refused("RESTORE_IMAGE_CHANGED")
         os.lseek(self.inputs.images_fd, 0, os.SEEK_SET)
         try:
             result = subprocess.run([*self.DOCKER, "image", "load"], stdin=self.inputs.images_fd,
@@ -993,33 +1121,36 @@ class Images:
 
     def verify(self, step, proof):
         services = self._desired(step)
-        if proof != {"absent": True, "services": services}:
-            raise Refused("INVALID_RESTORE_PROOF")
-        tags = self._tags()
-        if tags != {"sovagrid-" + service + ":local": desired["config"]
-                    for service, desired in services.items()}:
-            raise Refused("RESTORE_IMAGE_CHANGED")
-        for service, desired in services.items():
-            self._check(service, desired)
+        self._proof(proof, services)
+        self.resolved(services)
 
     def undo(self, step, proof):
         services = self._desired(step)
-        if proof != {"absent": True, "services": services}:
-            raise Refused("INVALID_RESTORE_PROOF")
+        self._proof(proof, services)
         tags = self._tags()
         # Inspect ALL matching tags before removing any: a foreign replacement
         # must not lose a prerequisite merely because another tag still matches.
         for service, desired in services.items():
             tag = "sovagrid-" + service + ":local"
             if tag in tags:
-                if tags[tag] != desired["config"]:
+                if tags[tag] != self._check(service, desired):
                     raise Refused("RESTORE_IMAGE_CHANGED")
-                self._check(service, desired)
+                if tags[tag][7:] in proof["preexisting_ids"]:
+                    raise Refused("RESTORE_IMAGE_PREEXISTED")
+                self._owned_references(tags[tag], tag)
         for service, desired in services.items():
             tag = "sovagrid-" + service + ":local"
             if tag in tags:
-                self._check(service, desired)
-                self._capture(["image", "rm", "--no-prune", tag])
+                identity = self._check(service, desired)
+                if identity != tags[tag]:
+                    raise Refused("RESTORE_IMAGE_CHANGED")
+                if identity[7:] in proof["preexisting_ids"]:
+                    raise Refused("RESTORE_IMAGE_PREEXISTED")
+                self._owned_references(identity, tag)
+                # A concurrent retag must never redirect deletion to a foreign
+                # image. The daemon receives the proven newly imported ID;
+                # new aliases or consumers cause refusal without --force.
+                self._capture(["image", "rm", "--no-prune", identity])
         if any("sovagrid-" + service + ":local" in self._tags() for service in services):
             raise Refused("RESTORE_IMAGE_CHANGED")
 
@@ -1402,15 +1533,17 @@ class Inputs:
         self.exporter, self.host_fd, self.host = exporter, host_fd, host
         self.images_fd, self.images, self.metadata = images_fd, images, metadata
         self.preview = preview
+        self.root_uid, self.root_gid = restore.backup.ROOT_UID, restore.backup.ROOT_GID
         self.host_fingerprint = _fingerprint(os.fstat(host_fd))
         self.images_fingerprint = _fingerprint(os.fstat(images_fd))
         self.stage_fingerprint = (os.fstat(stage_fd).st_dev, os.fstat(stage_fd).st_ino)
         self.platforms = {}
+        self.runtime_ids = {}
         exported = {}
         count = exporter._inspect_image_tar(
             images_fd, images["images"], deadline=time.monotonic() + 1200,
             platforms=self.platforms, source_rootfs=images["rootfs_sha256"],
-            exported_configs=exported)
+            exported_configs=exported, runtime_ids=self.runtime_ids)
         if count != images["files"] or exported != images["exported_configs"]:
             raise Refused("RESTORE_INPUT_CHANGED")
         self.bindings = {
@@ -1972,7 +2105,8 @@ def build_resource_plan(inputs: Inputs, *, check_public: bool = True) -> dict:
             "compose_services": sorted(inputs.images["exported_configs"]),
             "images": {service: {"config": digest,
                                   "rootfs_sha256": inputs.images["rootfs_sha256"][service],
-                                  "platform": inputs.platforms[service]}
+                                  "platform": inputs.platforms[service],
+                                  "runtime_ids": inputs.runtime_ids[service]}
                        for service, digest in inputs.images["exported_configs"].items()}}
     if len(_canonical(plan)) > 8 * 1024**2 or len(planned) > 100:
         raise Refused("RESTORE_RESOURCE_PLAN_LIMIT")

@@ -718,6 +718,7 @@ class RestoreInspectionTest(unittest.TestCase):
                            side_effect=lambda _exporter, _identity: (artifact, metadata)),
               patch.object(restore, "_docker_target", return_value=docker),
               patch.object(restore, "_occupied_restore_ports", return_value=0),
+              patch.object(restore, "_restore_scratch_free", return_value=10**10),
               patch.object(restore.shutil, "disk_usage",
                            return_value=SimpleNamespace(free=10**10))):
             result = restore.portable_clean_plan(identity)
@@ -725,6 +726,12 @@ class RestoreInspectionTest(unittest.TestCase):
             self.assertTrue(result["target_empty"])
             self.assertEqual(result["blockers"], ["APPLY_NOT_IMPLEMENTED"])
             self.assertEqual(result["image_count"], 1)
+            self.assertEqual(result["required_free_bytes"],
+                             128 + 4 * 1024 + exporter.MAX_IMAGE_BYTES + restore.MIN_RESTORE_FREE)
+            with patch.object(restore, "_restore_scratch_free", return_value=result["required_free_bytes"] - 1):
+                short = restore.portable_clean_plan(identity)
+            self.assertFalse(short["target_ready"])
+            self.assertIn("DISK_SPACE", short["blockers"])
             self.assertEqual(result["images_sha256"], "d" * 64)
             self.assertEqual(result["portable_receipt_sha256"], "2" * 64)
             self.assertRegex(result["review_sha256"], r"^[0-9a-f]{64}$")
@@ -1266,6 +1273,33 @@ class RestoreInspectionTest(unittest.TestCase):
             self.assertIn("STALE_REVIEW", changed["blockers"])
             self.assertIn("TARGET_STATE_PRESENT", changed["blockers"])
             self.assertNotEqual(changed["apply_review_sha256"], original)
+
+
+class RestoreScratchSpaceTests(unittest.TestCase):
+    def test_space_is_read_from_the_held_staging_filesystem_without_creating_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            parent = root / "var/lib"
+            parent.mkdir(parents=True)
+            staging = root / str(restore.STAGING).lstrip("/")
+            seen = []
+            def space(descriptor):
+                seen.append(os.fstat(descriptor).st_ino)
+                return SimpleNamespace(f_bavail=123, f_frsize=4096)
+            with (patch.object(restore.backup, "ROOT", root),
+                  patch.object(restore.backup, "ROOT_UID", os.getuid()),
+                  patch.object(restore.os, "fstatvfs", side_effect=space)):
+                self.assertEqual(restore._restore_scratch_free(), 123 * 4096)
+                self.assertEqual(seen.pop(), parent.stat().st_ino)
+                self.assertFalse(staging.exists())
+                staging.mkdir(mode=0o700)
+                self.assertEqual(restore._restore_scratch_free(), 123 * 4096)
+                self.assertEqual(seen.pop(), staging.stat().st_ino)
+                staging.rmdir()
+                staging.symlink_to(parent, target_is_directory=True)
+                with self.assertRaisesRegex(restore.Refused, "TARGET_CHECK_UNAVAILABLE"):
+                    restore._restore_scratch_free()
+                self.assertTrue(staging.is_symlink())
 
 
 if __name__ == "__main__":

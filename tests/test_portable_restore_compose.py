@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,8 +21,13 @@ class ComposeTest(unittest.TestCase):
     def setUp(self):
         self.plan = {"id": "a" * 32, "bindings": {"apply_review_sha256": "b" * 64},
                      "compose_services": ["hub", "web"],
-                     "images": {name: {"config": "sha256:" + digit * 64} for name, digit in (("hub", "c"), ("web", "d"))}}
+                     "images": {name: {"config": "sha256:" + digit * 64,
+                         "runtime_ids": ["sha256:" + digit * 64],
+                         "rootfs_sha256": hashlib.sha256(("sha256:" + "f" * 64).encode()).hexdigest(),
+                         "platform": {"os": "linux", "architecture": "amd64"}}
+                         for name, digit in (("hub", "c"), ("web", "d"))}}
         self.driver = compose.Compose(SimpleNamespace(), core, self.plan, Path("/ignored"))
+        self.runtime_images = {name: value["config"] for name, value in self.plan["images"].items()}
         self.hashes = {"hub": "e" * 64, "web": "f" * 64}
         self.config = {"name": "sovagrid", "services": {}, "networks": {"private": {
             "name": "sovagrid_private", "driver": "bridge", "labels": self.driver.labels,
@@ -40,6 +46,7 @@ class ComposeTest(unittest.TestCase):
         self.step = {"kind": "compose", "resource": "sovagrid", "desired": {
             "services": self.plan["compose_services"], "images": self.plan["images"]}}
         patchers = [patch.object(self.driver, "_args", return_value=["docker", "compose"]),
+                    patch.object(self.driver.image_adapter, "resolved", side_effect=lambda _images: dict(self.runtime_images)),
                     patch.object(self.driver, "_capture", side_effect=self.capture)]
         for patcher in patchers:
             patcher.start()
@@ -48,13 +55,18 @@ class ComposeTest(unittest.TestCase):
     def capture(self, args, **kwargs):
         self.calls.append(args)
         if args[:2] == ["docker", "compose"]:
+            config = copy.deepcopy(self.config)
+            if kwargs.get("data") is not None:
+                for name, value in json.loads(kwargs["data"])["services"].items():
+                    config["services"][name].update(value)
             if "config" in args:
                 if "--hash" in args:
                     return "\n".join(name + " " + value for name, value in self.hashes.items()).encode()
-                return json.dumps(self.config).encode()
+                return json.dumps(config).encode()
             if "up" in args:
                 self.assertIn("--no-build", args)
                 self.assertEqual(args[args.index("--pull") + 1], "never")
+                self.up_data = kwargs.get("data")
                 self.start()
                 return b""
         self.assertEqual(args[:3], list(compose.DOCKER))
@@ -84,7 +96,7 @@ class ComposeTest(unittest.TestCase):
 
     def start(self):
         for name, digit in (("hub", "1"), ("web", "2")):
-            self.records[name] = {"id": digit * 64, "image": self.plan["images"][name]["config"], "running": True,
+            self.records[name] = {"id": digit * 64, "image": self.runtime_images[name], "running": True,
                 "health": "healthy" if name == "hub" else None,
                 "labels": {**self.driver.labels, "com.docker.compose.project": "sovagrid", "com.docker.compose.service": name,
                     "com.docker.compose.container-number": "1", "com.docker.compose.config-hash": self.hashes[name]}}
@@ -129,6 +141,59 @@ class ComposeTest(unittest.TestCase):
         self.records["hub"]["image"] = "sha256:" + "0" * 64
         self.calls.clear()
         with self.assertRaisesRegex(core.Refused, "RESTORE_CONTAINER_CHANGED"):
+            self.driver.undo(self.step, proof)
+        self.assertFalse(self.mutations())
+
+    def test_compose_pins_loaded_index_ids_and_never_uses_unavailable_config_digests(self):
+        for name, digit in (("hub", "7"), ("web", "8")):
+            identity = "sha256:" + digit * 64
+            self.plan["images"][name]["runtime_ids"].append(identity)
+            self.plan["images"][name]["runtime_ids"].sort()
+            self.runtime_images[name] = identity
+        proof = self.driver.prepare(self.step)
+        self.driver.execute(self.step, proof)
+        self.assertEqual(json.loads(self.up_data), {"services": {
+            name: {"image": identity} for name, identity in self.runtime_images.items()}})
+        self.assertEqual(proof["runtime_images"], self.runtime_images)
+        self.driver.verify(self.step, proof)
+        # Recovery can remove only the recorded labelled containers even if
+        # their former tags have changed or disappeared independently.
+        with patch.object(self.driver.image_adapter, "resolved", side_effect=core.Refused("RESTORE_IMAGE_CHANGED")):
+            self.driver.undo(self.step, proof)
+        self.assertFalse(self.records)
+
+    def test_a_different_valid_dag_id_after_prepare_does_not_change_the_confirmed_compose_image(self):
+        proof = self.driver.prepare(self.step)
+        replacement = "sha256:" + "8" * 64
+        self.plan["images"]["web"]["runtime_ids"].append(replacement)
+        self.plan["images"]["web"]["runtime_ids"].sort()
+        self.runtime_images["web"] = replacement
+        self.calls.clear()
+        with self.assertRaisesRegex(core.Refused, "RESTORE_COMPOSE_CHANGED"):
+            self.driver.execute(self.step, proof)
+        self.assertFalse(self.mutations())
+
+    def test_verified_cross_store_identity_is_proof_bound_without_mutating_the_reviewed_plan(self):
+        before = copy.deepcopy(self.plan)
+        self.runtime_images["hub"] = "sha256:" + "7" * 64
+        self.runtime_images["web"] = "sha256:" + "8" * 64
+        # The shared image adapter already proved these converted IDs through
+        # a strict daemon re-export with the original config/rootfs hashes.
+        proof = self.driver.prepare(self.step)
+        self.driver.execute(self.step, proof)
+        self.driver.verify(self.step, proof)
+        self.assertEqual(self.plan, before)
+        self.assertEqual(proof["image_content_sha256"], hashlib.sha256(core._canonical(before["images"])).hexdigest())
+        self.assertEqual(json.loads(self.up_data)["services"]["hub"]["image"], self.runtime_images["hub"])
+        self.driver.undo(self.step, proof)
+        self.assertFalse(self.records)
+
+    def test_changed_image_content_binding_refuses_rollback_before_stopping_anything(self):
+        proof = self.driver.prepare(self.step)
+        self.start()
+        proof["image_content_sha256"] = "0" * 64
+        self.calls.clear()
+        with self.assertRaisesRegex(core.Refused, "INVALID_RESTORE_PROOF"):
             self.driver.undo(self.step, proof)
         self.assertFalse(self.mutations())
 

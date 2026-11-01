@@ -24,6 +24,7 @@ import ssl
 import stat
 import subprocess
 import time
+from types import SimpleNamespace
 from typing import Any
 import urllib.request
 
@@ -42,20 +43,26 @@ def override(plan: dict) -> bytes:
 
 
 class Compose:
-    def __init__(self, restore: Any, core: Any, plan: dict, overlay: Path):
+    def __init__(self, restore: Any, core: Any, plan: dict, overlay: Path, *, image_adapter=None):
         self.restore, self.core, self.plan, self.overlay = restore, core, plan, overlay
         self.labels = {LABEL: plan["id"], REVIEW_LABEL: plan["bindings"]["apply_review_sha256"]}
         self.services = plan["compose_services"]
         self.images = plan["images"]
+        self.image_adapter = image_adapter or core.Images(SimpleNamespace(
+            images={"exported_configs": {name: value["config"] for name, value in self.images.items()},
+                    "rootfs_sha256": {name: value["rootfs_sha256"] for name, value in self.images.items()}},
+            platforms={name: value["platform"] for name, value in self.images.items()},
+            runtime_ids={name: value["runtime_ids"] for name, value in self.images.items()}))
 
     @staticmethod
     def _environment():
         return {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C",
                 "SOVAGRID_BOT_TOKEN_FILE": "/etc/sovagrid-hub/bot.token"}
 
-    def _capture(self, args, *, timeout=20, maximum=512 * 1024):
+    def _capture(self, args, *, timeout=20, maximum=512 * 1024, data=None):
         try:
-            result = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            input_options = {"stdin": subprocess.DEVNULL} if data is None else {"input": data}
+            result = subprocess.run(args, **input_options, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, timeout=timeout, check=False,
                                     env=self._environment())
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -81,7 +88,29 @@ class Compose:
             raise self.core.Refused("RESTORE_COMPOSE_FAILED")
         return [*DOCKER, *args[1:], "--project-name", "sovagrid", "-f", str(self.restore.backup._host(self.overlay))]
 
-    def _configuration(self):
+    def _runtime_images(self, expected=None, *, loaded=True):
+        self.image_adapter._desired({"kind": "images", "resource": "sovagrid-compose-images",
+                                     "desired": {"services": self.images}})
+        if expected is not None and (not isinstance(expected, dict) or set(expected) != set(self.services) or
+                any(not isinstance(value, str) or self.core.Images.CONFIG.fullmatch(value) is None
+                    for name, value in expected.items())):
+            raise self.core.Refused("INVALID_RESTORE_PROOF")
+        if not loaded:
+            if expected is None:
+                raise self.core.Refused("INVALID_RESTORE_PROOF")
+            return expected
+        actual = self.image_adapter.resolved(self.images)
+        if expected is not None and actual != expected:
+            raise self.core.Refused("RESTORE_IMAGE_CHANGED")
+        return actual
+
+    def _proof_images(self, proof):
+        if proof.get("image_content_sha256") != hashlib.sha256(self.core._canonical(self.images)).hexdigest():
+            raise self.core.Refused("INVALID_RESTORE_PROOF")
+        return self._runtime_images(proof.get("runtime_images"), loaded=False)
+
+    def _configuration(self, runtime_images):
+        self._runtime_images(runtime_images, loaded=False)
         args = self._args()
         raw = self._capture([*args, "config", "--format", "json"])
         try:
@@ -137,17 +166,34 @@ class Compose:
                 if (mount.get("type") != "bind" or expected is None or
                         (mount.get("target"), mount.get("read_only", False)) != expected):
                     raise self.core.Refused("RESTORE_COMPOSE_CONFIGURATION_INVALID")
+        # Pin immutable daemon IDs selected only after the archive-bound images
+        # were loaded. Stdin supplies the small override without another file or
+        # silently changing the reviewed resource plan's engine-independent DAG.
+        data = self.core._canonical({"services": {name: {"image": runtime_images[name]}
+                                                   for name in self.services}}) + b"\n"
+        args = [*args, "-f", "-"]
+        pinned_raw = self._capture([*args, "config", "--format", "json"], data=data)
+        try:
+            pinned = json.loads(pinned_raw, object_pairs_hook=self.core._unique)
+        except (ValueError, UnicodeError) as exc:
+            raise self.core.Refused("RESTORE_COMPOSE_CONFIGURATION_INVALID") from exc
+        for name in self.services:
+            config["services"][name]["image"] = runtime_images[name]
+        if pinned != config:
+            raise self.core.Refused("RESTORE_COMPOSE_CONFIGURATION_INVALID")
         hashes = {}
-        for row in self._capture([*args, "config", "--hash", "*"]).decode("ascii").splitlines():
+        for row in self._capture([*args, "config", "--hash", "*"], data=data).decode("ascii").splitlines():
             fields = row.split()
             if len(fields) != 2 or fields[0] in hashes or self.core.SHA.fullmatch(fields[1]) is None:
                 raise self.core.Refused("RESTORE_COMPOSE_CONFIGURATION_INVALID")
             hashes[fields[0]] = fields[1]
         if not set(self.services) <= set(hashes):
             raise self.core.Refused("RESTORE_COMPOSE_CONFIGURATION_INVALID")
-        return args, hashlib.sha256(self.core._canonical(config)).hexdigest(), {name: hashes[name] for name in self.services}
+        return (args, hashlib.sha256(self.core._canonical(pinned)).hexdigest(),
+                {name: hashes[name] for name in self.services}, data)
 
     def _containers(self, proof):
+        runtime_images = self._proof_images(proof)
         ids = self._capture([*DOCKER, "ps", "-a", "--no-trunc", "--filter",
                              "label=com.docker.compose.project=sovagrid", "--format", "{{.ID}}"], maximum=4096).decode("ascii").splitlines()
         if len(ids) > len(self.services) or len(ids) != len(set(ids)) or any(CONTAINER.fullmatch(value) is None for value in ids):
@@ -166,7 +212,7 @@ class Compose:
                         labels.get("com.docker.compose.container-number") != "1" or
                         labels.get("com.docker.compose.config-hash") != proof["config_hashes"][service] or
                         any(labels.get(key) != label for key, label in self.labels.items()) or
-                        value["image"] != self.images[service]["config"] or type(value["running"]) is not bool):
+                        value["image"] != runtime_images[service] or type(value["running"]) is not bool):
                     raise self.core.Refused("RESTORE_CONTAINER_CHANGED")
                 records[service] = value
             except (ValueError, TypeError, KeyError, UnicodeError) as exc:
@@ -199,9 +245,11 @@ class Compose:
 
     def prepare(self, step):
         self._desired(step)
-        _args, digest, hashes = self._configuration()
+        runtime_images = self._runtime_images()
+        _args, digest, hashes, _data = self._configuration(runtime_images)
         proof = {"config_sha256": digest, "config_hashes": hashes,
-                 "labels": self.labels, "absent": True}
+                 "labels": self.labels, "absent": True, "runtime_images": runtime_images,
+                 "image_content_sha256": hashlib.sha256(self.core._canonical(self.images)).hexdigest()}
         if self._containers(proof) or self._networks([]):
             raise self.core.Refused("RESTORE_PROJECT_EXISTS")
         return proof
@@ -210,14 +258,17 @@ class Compose:
         self._desired(step)
         if proof != self.prepare(step):
             raise self.core.Refused("RESTORE_COMPOSE_CHANGED")
-        args, _digest, _hashes = self._configuration()
-        self._capture([*args, "up", "-d", "--no-build", "--pull", "never", *self.services], timeout=180)
+        args, _digest, _hashes, data = self._configuration(proof["runtime_images"])
+        self._runtime_images(proof["runtime_images"])
+        self._capture([*args, "up", "-d", "--no-build", "--pull", "never", *self.services], timeout=180, data=data)
 
     def verify(self, step, proof):
         self._desired(step)
         if proof.get("labels") != self.labels or proof.get("absent") is not True:
             raise self.core.Refused("INVALID_RESTORE_PROOF")
-        _args, digest, hashes = self._configuration()
+        self._proof_images(proof)
+        self._runtime_images(proof.get("runtime_images"))
+        _args, digest, hashes, _data = self._configuration(proof["runtime_images"])
         if digest != proof.get("config_sha256") or hashes != proof.get("config_hashes"):
             raise self.core.Refused("RESTORE_COMPOSE_CHANGED")
         records = self._containers(proof)
@@ -230,6 +281,7 @@ class Compose:
         self._desired(step)
         if proof.get("labels") != self.labels or proof.get("absent") is not True or set(proof.get("config_hashes", {})) != set(self.services):
             raise self.core.Refused("INVALID_RESTORE_PROOF")
+        self._proof_images(proof)
         records = self._containers(proof)
         identities = [value["id"] for value in records.values()]
         self._networks(identities)

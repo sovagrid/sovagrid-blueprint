@@ -143,13 +143,16 @@ class Runtime:
         image_inputs = inputs or SimpleNamespace(
             images={"exported_configs": {name: value["config"] for name, value in plan["images"].items()},
                     "rootfs_sha256": {name: value["rootfs_sha256"] for name, value in plan["images"].items()}},
-            platforms={name: value["platform"] for name, value in plan["images"].items()})
+            platforms={name: value["platform"] for name, value in plan["images"].items()},
+            runtime_ids={name: value["runtime_ids"] for name, value in plan["images"].items()},
+            exporter=restore._sibling("host_image_export.py", "_sovagrid_restore_reexport"),
+            stage_fd=journal.fd, root_uid=restore.backup.ROOT_UID, root_gid=restore.backup.ROOT_GID)
         self.images = core.Images(image_inputs)
         self.services = core.Services(restore.backup.ROOT, plan["unit_states"],
                                       uid=restore.backup.ROOT_UID, gid=restore.backup.ROOT_GID)
         self.reload = Reload(core, self.services, plan["unit_states"])
         self.compose = compose.Compose(restore, core, plan,
-            restore.STAGING / (".apply-compose-" + plan["id"] + ".json"))
+            restore.STAGING / (".apply-compose-" + plan["id"] + ".json"), image_adapter=self.images)
 
     def _adapter(self, step):
         if step["kind"] in ("group", "user"):
@@ -193,6 +196,10 @@ class Runtime:
         quarantine = [step for step in value["steps"] if step["kind"] == "queue"]
         if len(quarantine) != 1 or quarantine[0]["state"] != "done":
             raise self.core.Refused("RESTORE_QUEUE_NOT_QUARANTINED")
+        imported = [step for step in value["steps"] if step["kind"] == "images"]
+        if len(imported) != 1 or imported[0]["state"] != "done":
+            raise self.core.Refused("INVALID_RESTORE_JOURNAL")
+        self.images.verify(imported[0], imported[0]["proof"])
         self.compose.health(compose[0]["proof"])
         mutable = {"/var/lib/sovagrid", "/var/lib/sovagrid-vpn", "/var/lib/sovagrid-containers",
                    *self.shadow_api.PARENTS}

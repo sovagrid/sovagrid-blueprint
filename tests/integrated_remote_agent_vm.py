@@ -440,6 +440,8 @@ def browser_ssh_request(path: str, body: dict, token: str, *, timeout: int = 30)
             code = payload.get("error") if isinstance(payload, dict) else None
         except (ValueError, UnicodeError, TypeError):
             code = None
+        finally:
+            error.close()
         raise RuntimeError("Browser SSH route refused " + path.rsplit("/", 1)[-1] +
                            ": " + (code if isinstance(code, str) and
                                    re.fullmatch(r"[A-Z_]{3,48}", code) else "HTTP_ERROR")) from None

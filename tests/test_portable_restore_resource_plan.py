@@ -103,7 +103,8 @@ class ResourcePlanTest(unittest.TestCase):
             metadata={"portable_receipt": (None, json.dumps({"unit_states": self.states}).encode(), None)},
             images={"exported_configs": {"hub": "sha256:" + "a" * 64, "web": "sha256:" + "b" * 64},
                     "rootfs_sha256": {"hub": "c" * 64, "web": "d" * 64}},
-            platforms={service: {"os": "linux", "architecture": "amd64"} for service in ("hub", "web")})
+            platforms={service: {"os": "linux", "architecture": "amd64"} for service in ("hub", "web")},
+            runtime_ids={"hub": ["sha256:" + "a" * 64], "web": ["sha256:" + "b" * 64]})
 
     def test_implicit_live_parents_and_runtime_paths_use_installer_contract(self):
         result = apply.build_resource_plan(self.inputs())

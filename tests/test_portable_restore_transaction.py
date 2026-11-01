@@ -13,6 +13,7 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -544,6 +545,7 @@ class ImageAdapterTest(unittest.TestCase):
     def setUp(self):
         self.layer = "sha256:" + "f" * 64
         self.services = {service: {"config": "sha256:" + digit * 64,
+                                   "runtime_ids": ["sha256:" + digit * 64],
                                    "rootfs_sha256": hashlib.sha256(self.layer.encode()).hexdigest(),
                                    "platform": {"os": "linux", "architecture": "amd64"}}
                          for service, digit in (("hub", "a"), ("web", "b"))}
@@ -551,28 +553,50 @@ class ImageAdapterTest(unittest.TestCase):
             images={"exported_configs": {service: value["config"] for service, value in self.services.items()},
                     "rootfs_sha256": {service: value["rootfs_sha256"] for service, value in self.services.items()}},
             platforms={service: value["platform"] for service, value in self.services.items()},
+            runtime_ids={service: value["runtime_ids"] for service, value in self.services.items()},
             unchanged=lambda: None)
         self.driver = apply.Images(self.inputs)
         self.step = {"kind": "images", "resource": "sovagrid-compose-images", "desired": {"services": self.services}}
         self.tags = {}
         self.removed = []
+        self.remove_args = []
+        self.foreign_alias = False
+        self.foreign_consumer = False
         self.bad_layers = False
         patcher = patch.object(self.driver, "_capture", side_effect=self.capture)
         patcher.start()
         self.addCleanup(patcher.stop)
+        for patcher in (patch.object(self.driver, "_space"),
+                        patch.object(self.driver, "_scratch", side_effect=lambda: os.open(os.devnull, os.O_RDONLY)),
+                        patch.object(self.driver, "_converted_ids", return_value={})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.preexisting = []
 
     def capture(self, args):
         if args[:2] == ["image", "ls"]:
+            if "--quiet" in args:
+                return "\n".join(self.preexisting)
             return "\n".join(tag + "|" + digest for tag, digest in self.tags.items())
         if args[:2] == ["image", "inspect"]:
+            if '"tags"' in args[args.index("--format") + 1]:
+                identity = args[-1]
+                tags = [tag for tag, value in self.tags.items() if value == identity]
+                if self.foreign_alias:
+                    tags.append("foreign:retained")
+                return json.dumps({"id": identity, "tags": tags, "digests": []})
             tag = args[-1]
             return json.dumps({"id": self.tags[tag], "os": "linux", "arch": "amd64",
                                "layers": ["sha256:" + "e" * 64 if self.bad_layers else self.layer]})
         if args[:2] == ["image", "rm"]:
             self.assertEqual(args[2], "--no-prune")
-            self.removed.append(args[-1])
-            self.tags.pop(args[-1])
+            self.remove_args.append(args[-1])
+            for tag in [tag for tag, value in self.tags.items() if value == args[-1]]:
+                self.removed.append(tag)
+                self.tags.pop(tag)
             return ""
+        if args[0] == "ps":
+            return "9" * 64 if self.foreign_consumer else ""
         raise AssertionError(args)
 
     def load(self):
@@ -587,6 +611,7 @@ class ImageAdapterTest(unittest.TestCase):
         self.driver.undo(self.step, proof)
         self.assertFalse(self.tags)
         self.assertEqual(set(self.removed), {"sovagrid-hub:local", "sovagrid-web:local"})
+        self.assertTrue(all(apply.Images.CONFIG.fullmatch(value) for value in self.remove_args))
 
     def test_changed_tag_or_rootfs_prevents_removal_of_all_tags(self):
         proof = self.driver.prepare(self.step)
@@ -608,9 +633,102 @@ class ImageAdapterTest(unittest.TestCase):
         self.driver.undo(self.step, proof)
         self.assertEqual(self.removed, ["sovagrid-hub:local"])
 
+    def test_containerd_index_and_classic_config_ids_are_both_bound_to_the_same_archive(self):
+        indexes = {name: "sha256:" + digit * 64 for name, digit in (("hub", "c"), ("web", "d"))}
+        for name, identity in indexes.items():
+            self.services[name]["runtime_ids"].append(identity)
+            self.services[name]["runtime_ids"].sort()
+        proof = self.driver.prepare(self.step)
+        self.tags = {"sovagrid-" + name + ":local": identity for name, identity in indexes.items()}
+        self.driver.verify(self.step, proof)
+        self.assertEqual(self.driver.resolved(self.services), indexes)
+        self.load()  # A classic engine legitimately uses the same config ID.
+        self.driver.verify(self.step, proof)
+        self.driver.undo(self.step, proof)
+        self.assertFalse(self.tags)
+
+    def test_foreign_runtime_id_cannot_be_added_to_the_receipt_dag(self):
+        step = copy.deepcopy(self.step)
+        step["desired"]["services"]["hub"]["runtime_ids"].append("sha256:" + "f" * 64)
+        step["desired"]["services"]["hub"]["runtime_ids"].sort()
+        with self.assertRaisesRegex(apply.Refused, "RESTORE_IMAGE_RECEIPT_MISMATCH"):
+            self.driver.prepare(step)
+
+    def test_preexisting_untagged_image_is_never_removed_by_rollback(self):
+        self.preexisting = [self.services["web"]["config"]]
+        proof = self.driver.prepare(self.step)
+        self.load()
+        with self.assertRaisesRegex(apply.Refused, "RESTORE_IMAGE_PREEXISTED"):
+            self.driver.undo(self.step, proof)
+        self.assertFalse(self.removed)
+        self.assertEqual(set(self.tags), {"sovagrid-hub:local", "sovagrid-web:local"})
+
+    def test_changed_preload_inventory_blocks_load_before_mutation(self):
+        proof = self.driver.prepare(self.step)
+        self.preexisting.append("sha256:" + "9" * 64)
+        with patch.object(apply.subprocess, "run") as command:
+            with self.assertRaisesRegex(apply.Refused, "RESTORE_IMAGE_CHANGED"):
+                self.driver.execute(self.step, proof)
+        command.assert_not_called()
+
+    def test_foreign_alias_or_container_prevents_any_image_removal(self):
+        proof = self.driver.prepare(self.step)
+        self.load()
+        self.foreign_alias = True
+        with self.assertRaisesRegex(apply.Refused, "RESTORE_IMAGE_CHANGED"):
+            self.driver.undo(self.step, proof)
+        self.foreign_alias = False
+        self.foreign_consumer = True
+        with self.assertRaisesRegex(apply.Refused, "RESTORE_IMAGE_IN_USE"):
+            self.driver.undo(self.step, proof)
+        self.assertFalse(self.removed)
+        self.assertFalse(self.remove_args)
+
+    def test_tag_changed_to_a_preexisting_valid_dag_node_at_the_removal_check_is_preserved(self):
+        preexisting = "sha256:" + "d" * 64
+        self.services["hub"]["runtime_ids"].append(preexisting)
+        self.services["hub"]["runtime_ids"].sort()
+        self.preexisting.append(preexisting)
+        proof = self.driver.prepare(self.step)
+        self.load()
+        inspections = []
+        original = self.capture
+        def raced(args):
+            if args[:2] == ["image", "inspect"] and args[-1].startswith("sovagrid-"):
+                inspections.append(args[-1])
+                if len(inspections) == 3:
+                    self.tags["sovagrid-hub:local"] = preexisting
+            return original(args)
+        with patch.object(self.driver, "_capture", side_effect=raced):
+            with self.assertRaisesRegex(apply.Refused, "RESTORE_IMAGE_CHANGED"):
+                self.driver.undo(self.step, proof)
+        self.assertFalse(self.removed)
+        self.assertEqual(self.tags["sovagrid-hub:local"], preexisting)
+
+    def test_retag_at_final_delete_cannot_redirect_the_command_to_a_preexisting_image(self):
+        preexisting = "sha256:" + "d" * 64
+        self.services["hub"]["runtime_ids"].append(preexisting)
+        self.services["hub"]["runtime_ids"].sort()
+        self.preexisting.append(preexisting)
+        proof = self.driver.prepare(self.step)
+        self.load()
+        imported = self.tags["sovagrid-hub:local"]
+        original = self.capture
+        def raced(args):
+            if args[:2] == ["image", "rm"] and args[-1] == imported:
+                self.tags["sovagrid-hub:local"] = preexisting
+            return original(args)
+        with patch.object(self.driver, "_capture", side_effect=raced):
+            with self.assertRaisesRegex(apply.Refused, "RESTORE_IMAGE_CHANGED"):
+                self.driver.undo(self.step, proof)
+        self.assertIn(imported, self.remove_args)
+        self.assertNotIn(preexisting, self.remove_args)
+        self.assertEqual(self.tags["sovagrid-hub:local"], preexisting)
+
     def test_arbitrary_config_outside_retained_receipt_is_refused(self):
         step = copy.deepcopy(self.step)
         step["desired"]["services"]["hub"]["config"] = "sha256:" + "e" * 64
+        step["desired"]["services"]["hub"]["runtime_ids"] = ["sha256:" + "e" * 64]
         with self.assertRaisesRegex(apply.Refused, "RESTORE_IMAGE_RECEIPT_MISMATCH"):
             self.driver.prepare(step)
 
@@ -628,6 +746,104 @@ class ImageAdapterTest(unittest.TestCase):
                 self.assertEqual(os.read(source.fileno(), 32), b"verified-image-tar")
                 self.assertNotIn("DOCKER_HOST", kwargs["env"])
                 self.assertNotIn("DOCKER_CONTEXT", kwargs["env"])
+
+
+class ImageConversionProofTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.folder = Path(temporary.name)
+        self.folder.chmod(0o700)
+        stage_fd = os.open(self.folder, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, stage_fd)
+        self.configs = {"hub": "sha256:" + "a" * 64, "web": "sha256:" + "b" * 64}
+        self.layer = "sha256:" + "f" * 64
+        self.rootfs = {name: hashlib.sha256(self.layer.encode()).hexdigest() for name in self.configs}
+        self.platforms = {name: {"os": "linux", "architecture": "amd64"} for name in self.configs}
+        self.tags = {"sovagrid-hub:local": "sha256:" + "5" * 64,
+                     "sovagrid-web:local": "sha256:" + "6" * 64}
+        self.saves = []
+        self.descriptors = []
+        self.corrupt_config = self.race = False
+        class ExportRefused(RuntimeError):
+            pass
+        self.exporter = SimpleNamespace(Refused=ExportRefused, MAX_IMAGE_BYTES=8 * 1024**3,
+            MIN_FREE=256 * 1024**2, MAX_IMAGE_SECONDS=1200,
+            _save_images=self.save, _inspect_image_tar=self.inspect)
+        self.inputs = SimpleNamespace(stage_fd=stage_fd, root_uid=os.getuid(), root_gid=os.getgid(),
+            exporter=self.exporter, images={"exported_configs": self.configs, "rootfs_sha256": self.rootfs},
+            platforms=self.platforms, runtime_ids={name: [value] for name, value in self.configs.items()})
+        self.driver = apply.Images(self.inputs)
+        self.services = {name: {"config": value, "runtime_ids": [value],
+            "rootfs_sha256": self.rootfs[name], "platform": self.platforms[name]} for name, value in self.configs.items()}
+        for patcher in (patch.object(self.driver, "_capture", side_effect=self.capture),
+                        patch.object(self.driver, "_scratch", side_effect=self.scratch)):
+            patcher.start(); self.addCleanup(patcher.stop)
+
+    def scratch(self):
+        source = tempfile.TemporaryFile(dir=self.folder)
+        self.addCleanup(source.close)
+        descriptor = os.dup(source.fileno())
+        self.descriptors.append(descriptor)
+        return descriptor
+
+    def capture(self, args):
+        if args[:2] == ["image", "ls"]:
+            return "\n".join(tag + "|" + identity for tag, identity in self.tags.items())
+        if args[:2] == ["image", "inspect"]:
+            return json.dumps({"id": self.tags[args[-1]], "os": "linux", "arch": "amd64", "layers": [self.layer]})
+        raise AssertionError(args)
+
+    def save(self, refs, descriptor, destination, *, deadline):
+        self.assertEqual(descriptor, destination)
+        self.assertEqual(refs, sorted(self.tags))
+        self.assertEqual(os.fstat(descriptor).st_nlink, 0)
+        self.assertGreater(deadline, time.monotonic())
+        self.saves.append(list(refs))
+        os.write(descriptor, b"bounded-export-fixture")
+        if self.race:
+            self.tags["sovagrid-web:local"] = "sha256:" + "8" * 64
+
+    def inspect(self, descriptor, source_ids, **kwargs):
+        self.assertEqual(os.pread(descriptor, 64, 0), b"bounded-export-fixture")
+        self.assertEqual(kwargs["source_rootfs"], self.rootfs)
+        kwargs["exported_configs"].update(self.configs)
+        kwargs["platforms"].update(self.platforms)
+        kwargs["runtime_ids"].update({name: sorted([value, self.configs[name]]) for name, value in source_ids.items()})
+        if self.corrupt_config:
+            kwargs["exported_configs"]["hub"] = "sha256:" + "9" * 64
+
+    def test_conversion_reexports_fixed_tags_and_binds_exact_original_config_without_changing_the_plan(self):
+        before = copy.deepcopy(self.services)
+        resolved = self.driver.resolved(self.services)
+        self.assertEqual(resolved, {name: self.tags["sovagrid-" + name + ":local"] for name in self.configs})
+        self.assertEqual(self.services, before)
+        self.assertEqual(len(self.saves), 1)
+        self.assertEqual(self.driver.resolved(self.services), resolved)
+        self.assertEqual(len(self.saves), 1)  # Same immutable daemon IDs reuse the held proof.
+        for descriptor in self.descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_reexport_of_a_foreign_config_cannot_authorize_a_new_engine_id(self):
+        self.corrupt_config = True
+        with self.assertRaisesRegex(apply.Refused, "RESTORE_IMAGE_CHANGED"):
+            self.driver.resolved(self.services)
+        self.assertIsNone(self.driver._converted_cache)
+
+    def test_tag_replacement_during_reexport_is_not_cached_as_owned(self):
+        self.race = True
+        with self.assertRaisesRegex(apply.Refused, "RESTORE_IMAGE_CHANGED"):
+            self.driver.resolved(self.services)
+        self.assertIsNone(self.driver._converted_cache)
+
+    def test_scratch_reserve_uses_the_held_staging_filesystem_before_export(self):
+        with patch.object(apply.os, "fstatvfs", return_value=SimpleNamespace(f_bavail=1, f_frsize=4096)) as space:
+            with self.assertRaisesRegex(apply.Refused, "RESTORE_DISK_SPACE"):
+                self.driver.resolved(self.services)
+        space.assert_called_once_with(self.inputs.stage_fd)
+        self.assertFalse(self.saves)
+        self.assertFalse(self.descriptors)
 
 
 class ServiceAdapterTest(unittest.TestCase):

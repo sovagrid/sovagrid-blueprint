@@ -17,6 +17,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -73,7 +74,11 @@ def image_archive(services=("hub", "web"), *, changed_layer=None,
 
 def oci_image_archive(services=("hub", "web"), *, extra=None,
                       foreign_tag=False, wrong_diff=False, attestation=True,
-                      bad_descriptor=False):
+                      bad_descriptor=False, direct_manifest=False,
+                      layer_media_type=None, architecture="amd64",
+                      legacy_attestation=False, bad_attestation_config=False,
+                      predicate="https://slsa.dev/provenance/v1",
+                      manifest_media_type=None, config_media_type=None):
     blobs = {}
     docker_manifest = []
     top = []
@@ -89,20 +94,23 @@ def oci_image_archive(services=("hub", "web"), *, extra=None,
     ids = {}
     for service in services:
         layer = (service + " OCI layer\n").encode()
-        packed = gzip.compress(layer, mtime=0)
+        packed = (layer if layer_media_type in (images.OCI_RAW_LAYER, images.DOCKER_RAW_LAYER)
+                  else gzip.compress(layer, mtime=0))
         layer_descriptor = blob(packed)
-        layer_descriptor["mediaType"] = images.OCI_GZIP_LAYER
+        layer_descriptor["mediaType"] = layer_media_type or images.OCI_GZIP_LAYER
         diff_id = hashlib.sha256(layer + (b"changed" if wrong_diff else b"")).hexdigest()
-        config = {"os": "linux", "architecture": "amd64",
+        config = {"os": "linux", "architecture": architecture,
                   "rootfs": {"type": "layers", "diff_ids": ["sha256:" + diff_id]}}
         config_descriptor = json_blob(config)
-        config_descriptor["mediaType"] = images.OCI_CONFIG
+        manifest_type = manifest_media_type or images.OCI_MANIFEST
+        config_descriptor["mediaType"] = config_media_type or (
+            images.DOCKER_CONFIG if manifest_type == images.DOCKER_MANIFEST else images.OCI_CONFIG)
         ids[service] = config_descriptor["digest"]
-        manifest = {"schemaVersion": 2, "mediaType": images.OCI_MANIFEST,
+        manifest = {"schemaVersion": 2, "mediaType": manifest_type,
                     "config": config_descriptor, "layers": [layer_descriptor]}
         primary = json_blob(manifest)
-        primary["mediaType"] = images.OCI_MANIFEST
-        primary["platform"] = {"os": "linux", "architecture": "amd64"}
+        primary["mediaType"] = manifest_type
+        primary["platform"] = {"os": "linux", "architecture": architecture}
         if bad_descriptor and service == "hub":
             primary["size"] += 1
         nested = [primary]
@@ -111,15 +119,28 @@ def oci_image_archive(services=("hub", "web"), *, extra=None,
             statement = json_blob({"_type": "https://in-toto.io/Statement/v1"})
             statement["mediaType"] = "application/vnd.in-toto+json"
             statement["annotations"] = {
-                "in-toto.io/predicate-type": "https://slsa.dev/provenance/v1"}
-            att_manifest = {
-                "schemaVersion": 2, "mediaType": images.OCI_MANIFEST,
-                "artifactType": "application/vnd.docker.attestation.manifest.v1+json",
-                "config": {"mediaType": "application/vnd.oci.empty.v1+json",
-                           **{key: empty[key] for key in ("digest", "size")},
-                           "data": "e30="},
-                "layers": [statement],
-                "subject": {key: primary[key] for key in ("mediaType", "digest", "size")}}
+                "in-toto.io/predicate-type": predicate}
+            if legacy_attestation:
+                # Real BuildKit --provenance=mode=min defaults to an ordinary
+                # non-runnable config, rather than the optional OCI artifact.
+                blobs.pop(empty["digest"][7:])
+                config = {"architecture": "unknown", "os": "unknown", "config": {},
+                          "rootfs": {"type": "layers", "diff_ids": [statement["digest"]]}}
+                if bad_attestation_config:
+                    config["config"] = {"Entrypoint": ["/untrusted"]}
+                att_config = json_blob(config)
+                att_config["mediaType"] = images.OCI_CONFIG
+                att_manifest = {"schemaVersion": 2, "mediaType": images.OCI_MANIFEST,
+                                "config": att_config, "layers": [statement]}
+            else:
+                att_manifest = {
+                    "schemaVersion": 2, "mediaType": images.OCI_MANIFEST,
+                    "artifactType": "application/vnd.docker.attestation.manifest.v1+json",
+                    "config": {"mediaType": "application/vnd.oci.empty.v1+json",
+                               **{key: empty[key] for key in ("digest", "size")},
+                               "data": "e30="},
+                    "layers": [statement],
+                    "subject": {key: primary[key] for key in ("mediaType", "digest", "size")}}
             att = json_blob(att_manifest)
             att["mediaType"] = images.OCI_MANIFEST
             att["platform"] = {"os": "unknown", "architecture": "unknown"}
@@ -127,9 +148,13 @@ def oci_image_archive(services=("hub", "web"), *, extra=None,
                 "vnd.docker.reference.digest": primary["digest"],
                 "vnd.docker.reference.type": "attestation-manifest"}
             nested.append(att)
-        nested_index = json_blob({"schemaVersion": 2, "mediaType": images.OCI_INDEX,
-                                  "manifests": nested})
-        nested_index["mediaType"] = images.OCI_INDEX
+        if direct_manifest:
+            assert not attestation
+            nested_index = {key: primary[key] for key in ("mediaType", "digest", "size")}
+        else:
+            nested_index = json_blob({"schemaVersion": 2, "mediaType": images.OCI_INDEX,
+                                      "manifests": nested})
+            nested_index["mediaType"] = images.OCI_INDEX
         nested_index["annotations"] = {
             "io.containerd.image.name": "docker.io/library/sovagrid-" + service + ":local",
             "org.opencontainers.image.ref.name": "local"}
@@ -158,6 +183,15 @@ def oci_image_archive(services=("hub", "web"), *, extra=None,
     return output.getvalue(), ids
 
 
+def oci_daemon_ids(raw):
+    """Containerd reports the named top descriptor as the daemon image ID."""
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+        top = json.load(archive.extractfile("index.json"))
+    return {item["annotations"]["io.containerd.image.name"].removeprefix(
+                "docker.io/library/sovagrid-").removesuffix(":local"): item["digest"]
+            for item in top["manifests"]}
+
+
 class ImageExportTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -167,6 +201,35 @@ class ImageExportTest(unittest.TestCase):
     def test_export_is_pinned_to_the_local_docker_socket(self):
         self.assertEqual(images.DOCKER,
                          ("/usr/bin/docker", "--host", "unix:///run/docker.sock"))
+
+    def test_anonymous_export_checks_available_blocks_via_the_held_output_fd(self):
+        script = self.path / "stream.py"
+        payload = b"anonymous docker stream\x00\xff"
+        script.write_text("import os\nos.write(1," + repr(payload) + ")\n")
+        for blocks in (0, images.MIN_FREE // 4096 + 2):
+            with self.subTest(blocks=blocks):
+                descriptor, name = tempfile.mkstemp(dir=self.path)
+                os.unlink(name)
+                try:
+                    self.assertEqual(os.fstat(descriptor).st_nlink, 0)
+                    with (patch.object(images, "DOCKER", (sys.executable, str(script))),
+                          patch.object(images.os, "fstatvfs", return_value=SimpleNamespace(
+                              f_bavail=blocks, f_frsize=4096)) as space,
+                          patch.object(images.shutil, "disk_usage", side_effect=AssertionError(
+                              "anonymous export must not resolve a filesystem path"))):
+                        if blocks == 0:
+                            with self.assertRaisesRegex(images.Refused, "DISK_SPACE"):
+                                images._save_images([], descriptor, descriptor,
+                                                    deadline=time.monotonic() + 10)
+                            self.assertEqual(os.fstat(descriptor).st_size, 0)
+                        else:
+                            self.assertEqual(images._save_images([], descriptor, descriptor,
+                                deadline=time.monotonic() + 10),
+                                (len(payload), hashlib.sha256(payload).hexdigest()))
+                            self.assertEqual(os.pread(descriptor, len(payload), 0), payload)
+                    space.assert_called_once_with(descriptor)
+                finally:
+                    os.close(descriptor)
 
     def inspect(self, raw, identities, **kwargs):
         path = self.path / "inspect.tar"
@@ -240,8 +303,7 @@ class ImageExportTest(unittest.TestCase):
 
     def test_oci_export_config_may_differ_from_pinned_daemon_image_id(self):
         raw, exported = oci_image_archive()
-        source = {"hub": "sha256:" + "1" * 64,
-                  "web": "sha256:" + "2" * 64}
+        source = oci_daemon_ids(raw)
         rootfs = {service: images._rootfs_digest([
             "sha256:" + hashlib.sha256((service + " OCI layer\n").encode()).hexdigest()])
             for service in source}
@@ -249,11 +311,94 @@ class ImageExportTest(unittest.TestCase):
         self.assertGreater(self.inspect(raw, source, source_rootfs=rootfs,
                                         exported_configs=captured), 0)
         self.assertEqual(captured, exported)
+        with self.assertRaisesRegex(images.Refused, "IMAGE_ID_MISMATCH"):
+            self.inspect(raw, {**source, "web": "sha256:" + "2" * 64}, source_rootfs=rootfs)
         with self.assertRaisesRegex(images.Refused, "ROOTFS_MISMATCH"):
             self.inspect(raw, source, source_rootfs={**rootfs, "web": "0" * 64})
         malformed, _ = oci_image_archive(bad_descriptor=True)
         with self.assertRaisesRegex(images.Refused, "INVALID_IMAGE_ARCHIVE"):
             self.inspect(malformed, source, source_rootfs=rootfs)
+
+    def test_real_containerd_direct_manifest_and_docker_gzip_layer_shape(self):
+        for architecture in ("amd64", "arm64"):
+            with self.subTest(architecture=architecture):
+                raw, ids = oci_image_archive(("hub", "web", "ssh-gateway"),
+                    attestation=False, direct_manifest=True,
+                    layer_media_type=images.DOCKER_GZIP_LAYER, architecture=architecture)
+                self.assertGreater(self.inspect(raw, ids), 0)
+        for options in ({"foreign_tag": True}, {"wrong_diff": True},
+                        {"architecture": "riscv64"}, {"layer_media_type": "application/unknown"}):
+            with self.subTest(options=options), self.assertRaises(images.Refused):
+                self.inspect(*oci_image_archive(attestation=False, direct_manifest=True,
+                                                **options))
+
+    def test_real_buildkit_legacy_attestation_config_stays_non_runnable_and_hash_bound(self):
+        for predicate in ("https://slsa.dev/provenance/v0.2", "https://slsa.dev/provenance/v1"):
+            with self.subTest(predicate=predicate):
+                self.assertGreater(self.inspect(*oci_image_archive(
+                    legacy_attestation=True, predicate=predicate)), 0)
+        for options in ({"bad_attestation_config": True}, {"wrong_diff": True},
+                        {"predicate": "https://untrusted.invalid/predicate"},
+                        {"extra": ("blobs/sha256/" + hashlib.sha256(b"foreign").hexdigest(), b"foreign")}):
+            with self.subTest(options=options), self.assertRaises(images.Refused):
+                self.inspect(*oci_image_archive(legacy_attestation=True, **options))
+
+    def test_real_containerd_reexport_of_legacy_docker_manifest_has_exact_media_pair(self):
+        options = {"attestation": False, "direct_manifest": True,
+                   "manifest_media_type": images.DOCKER_MANIFEST,
+                   "layer_media_type": images.DOCKER_GZIP_LAYER}
+        raw, configs = oci_image_archive(**options)
+        source = oci_daemon_ids(raw)
+        runtime = {}
+        self.assertGreater(self.inspect(raw, source, runtime_ids=runtime), 0)
+        self.assertEqual(runtime, {service: sorted((source[service], configs[service]))
+                                   for service in configs})
+        for changes in ({"config_media_type": images.OCI_CONFIG},
+                        {"layer_media_type": images.OCI_GZIP_LAYER},
+                        {"manifest_media_type": "application/unknown"}):
+            with self.subTest(changes=changes), self.assertRaises(images.Refused):
+                self.inspect(*oci_image_archive(**{**options, **changes}))
+
+    def test_uncompressed_oci_and_docker_layers_bind_the_raw_bytes_to_diff_id(self):
+        for manifest_type, layer_type in ((images.OCI_MANIFEST, images.OCI_RAW_LAYER),
+                                         (images.OCI_MANIFEST, images.DOCKER_RAW_LAYER),
+                                         (images.DOCKER_MANIFEST, images.DOCKER_RAW_LAYER)):
+            options = {"attestation": False, "direct_manifest": True,
+                       "manifest_media_type": manifest_type, "layer_media_type": layer_type}
+            with self.subTest(manifest=manifest_type, layer=layer_type):
+                raw, configs = oci_image_archive(**options)
+                self.assertGreater(self.inspect(raw, oci_daemon_ids(raw)), 0)
+                with self.assertRaisesRegex(images.Refused, "LAYER_DIGEST_MISMATCH"):
+                    self.inspect(*oci_image_archive(**options, wrong_diff=True))
+
+    def test_runtime_ids_are_only_this_services_verified_runnable_dag(self):
+        for options, count in (({"attestation": False, "direct_manifest": True}, 2),
+                               ({"attestation": False}, 3),
+                               ({"legacy_attestation": True}, 3), ({}, 3)):
+            with self.subTest(options=options):
+                raw, configs = oci_image_archive(**options)
+                source = oci_daemon_ids(raw)
+                runtime = {}
+                self.assertGreater(self.inspect(raw, source, runtime_ids=runtime), 0)
+                with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+                    top = json.load(archive.extractfile("index.json"))
+                    for descriptor in top["manifests"]:
+                        service = descriptor["annotations"]["io.containerd.image.name"].removeprefix(
+                            "docker.io/library/sovagrid-").removesuffix(":local")
+                        value = json.load(archive.extractfile("blobs/sha256/" + descriptor["digest"][7:]))
+                        expected = {configs[service], descriptor["digest"]}
+                        if "manifests" in value:
+                            expected.add(value["manifests"][0]["digest"])
+                            if len(value["manifests"]) == 2:
+                                self.assertNotIn(value["manifests"][1]["digest"], runtime[service])
+                        self.assertEqual(runtime[service], sorted(expected))
+                        self.assertEqual(len(runtime[service]), count)
+                with self.assertRaisesRegex(images.Refused, "IMAGE_ID_MISMATCH"):
+                    self.inspect(raw, {**source, "web": source["hub"]})
+        raw, configs = image_archive()
+        runtime = {}
+        self.inspect(raw, configs, runtime_ids=runtime)
+        self.assertEqual(runtime, {service: [digest] for service, digest in configs.items()})
 
     def test_unreferenced_legacy_metadata_cannot_exhaust_capture_memory(self):
         foreign = hashlib.sha256(b"unreferenced layer").hexdigest()
@@ -284,8 +429,7 @@ class ImageExportTest(unittest.TestCase):
     def _export_fixture(self, *, oci=False):
         if oci:
             raw, _exported = oci_image_archive()
-            ids = {"hub": "sha256:" + "1" * 64,
-                   "web": "sha256:" + "2" * 64}
+            ids = oci_daemon_ids(raw)
         else:
             raw, ids = image_archive()
         docker_tar = self.path / "docker-save.tar"

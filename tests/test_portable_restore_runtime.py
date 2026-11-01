@@ -99,12 +99,14 @@ class RuntimePlanTest(unittest.TestCase):
         journal = core.Journal(self.fd, self.plan["id"], uid=os.getuid(), gid=os.getgid())
         driver = runtime.Runtime(restore, core, self.plan, journal, inputs=self.inputs)
         value = {"steps": [
+            {"kind": "images", "state": "done", "proof": {}},
             {"kind": "compose", "state": "done", "proof": {}},
             {"kind": "queue", "state": "done", "proof": {}},
             {"kind": "publish", "resource": "/var/lib/sovagrid", "proof": {}},
             {"kind": "publish", "resource": "/etc/sovagrid", "proof": {}}]}
         with (patch.object(self.inputs, "unchanged") as unchanged,
               patch.object(driver.compose, "health"),
+              patch.object(driver.images, "verify"),
               patch.object(driver, "_socket_health"),
               patch.object(driver.publisher, "verify") as verify):
             driver.health(value)

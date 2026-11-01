@@ -973,6 +973,22 @@ def _occupied_vpn_ports(ports: list[int]) -> int | None:
     return len(occupied)
 
 
+def _restore_scratch_free() -> int:
+    """Read the staging filesystem through a safe FD without creating state."""
+    try:
+        try:
+            descriptor = backup._safe_open(STAGING, directory=True)
+        except FileNotFoundError:
+            descriptor = backup._safe_open(STAGING.parent, directory=True)
+        try:
+            info = os.fstatvfs(descriptor)
+            return info.f_bavail * info.f_frsize
+        finally:
+            os.close(descriptor)
+    except (backup.Refused, OSError) as exc:
+        raise Refused("TARGET_CHECK_UNAVAILABLE") from exc
+
+
 def portable_clean_plan(identity: str) -> dict:
     """Verify a transferred host+image pair and inspect clean-host conflicts.
 
@@ -1017,11 +1033,11 @@ def portable_clean_plan(identity: str) -> dict:
     vpn_ports = (_occupied_vpn_ports(clean.get("vpn_udp_ports", []))
                  if clean.get("vpn_ports_verified", True) else None)
     try:
-        root_free = shutil.disk_usage(backup.ROOT).free
+        root_free = min(shutil.disk_usage(backup.ROOT).free, _restore_scratch_free())
     except OSError as exc:
         raise Refused("TARGET_CHECK_UNAVAILABLE") from exc
     required_free = (clean["uncompressed_bytes"] +
-                     4 * artifact["bytes"] + MIN_RESTORE_FREE)
+                     4 * artifact["bytes"] + exporter.MAX_IMAGE_BYTES + MIN_RESTORE_FREE)
     platform_match = (docker["available"] and
                       all(platform == {"os": "linux",
                                        "architecture": docker["architecture"]}

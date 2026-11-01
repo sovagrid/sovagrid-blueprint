@@ -98,6 +98,14 @@ preserved even when its bytes match. All five final files are root-private.
 
 ## Review, detached execution and retry
 
+The required-space preview includes an additional 8 GiB reserve for bounded
+image-content verification across Docker storage formats. If a daemon assigns
+a new image ID during import, the runner re-exports only the fixed service
+tags into an anonymous private staging file and verifies the exact original
+configuration digest, RootFS and platform. Only a digest bound by that verified
+image graph may become a Compose image reference. This requires no new public
+manifest or receipt field and never permits pruning unrelated daemon data.
+
 `preview` stages the verified inputs and checks the complete common resource
 plan, dependencies, identities, unit graph, endpoint and free space. Its reply
 has `phase:review`, nested `preview`, `backend_supported`, `target_ready`,

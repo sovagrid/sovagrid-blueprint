@@ -68,7 +68,12 @@ OCI_BLOB = re.compile(r"blobs/sha256/([0-9a-f]{64})\Z")
 OCI_INDEX = "application/vnd.oci.image.index.v1+json"
 OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
+DOCKER_MANIFEST = "application/vnd.docker.distribution.manifest.v2+json"
+DOCKER_CONFIG = "application/vnd.docker.container.image.v1+json"
 OCI_GZIP_LAYER = "application/vnd.oci.image.layer.v1.tar+gzip"
+DOCKER_GZIP_LAYER = "application/vnd.docker.image.rootfs.diff.tar.gzip"
+OCI_RAW_LAYER = "application/vnd.oci.image.layer.v1.tar"
+DOCKER_RAW_LAYER = "application/vnd.docker.image.rootfs.diff.tar"
 MAX_IMAGE_BYTES = 8 * 1024**3
 MAX_IMAGE_FILES = 20_000
 MAX_IMAGE_SECONDS = 1200
@@ -245,8 +250,10 @@ def _write_all(fd: int, raw: bytes) -> None:
         view = view[count:]
 
 
-def _save_images(refs: list[str], fd: int, destination: Path, *, deadline: float) -> tuple[int, str]:
+def _save_images(refs: list[str], fd: int, destination: Path | int, *, deadline: float) -> tuple[int, str]:
     """Stream Docker stdout with time, byte and free-space limits."""
+    if type(destination) is int and os.fstat(destination).st_dev != os.fstat(fd).st_dev:
+        raise Refused("UNSAFE_OUTPUT")
     try:
         process = subprocess.Popen([*DOCKER, "image", "save", *refs],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -272,7 +279,12 @@ def _save_images(refs: list[str], fd: int, destination: Path, *, deadline: float
                 total += len(block)
                 if total > MAX_IMAGE_BYTES:
                     raise Refused("SIZE_LIMIT")
-                if shutil.disk_usage(destination).free < len(block) + MIN_FREE:
+                if type(destination) is int:
+                    usage = os.fstatvfs(destination)
+                    free = usage.f_bavail * usage.f_frsize
+                else:
+                    free = shutil.disk_usage(destination).free
+                if free < len(block) + MIN_FREE:
                     raise Refused("DISK_SPACE")
                 _write_all(fd, block)
                 digest.update(block)
@@ -391,7 +403,8 @@ def _inspect_oci_tar(fd: int, image_ids: dict[str, str], files: dict,
                      offsets: dict, seen: set[str], captured: dict,
                      *, deadline: float, platforms: dict | None = None,
                      source_rootfs: dict | None = None,
-                     exported_configs: dict | None = None) -> int:
+                     exported_configs: dict | None = None,
+                     runtime_ids: dict[str, list[str]] | None = None) -> int:
     if (set(seen) - set(files) != {"blobs", "blobs/sha256"} or
             not {"index.json", "manifest.json", "oci-layout"} <= set(files)):
         raise Refused("INVALID_IMAGE_ARCHIVE")
@@ -432,44 +445,65 @@ def _inspect_oci_tar(fd: int, image_ids: dict[str, str], files: dict,
             raise Refused("INVALID_IMAGE_ARCHIVE")
         service = names[0]
         services.add(service)
+        if top["mediaType"] not in (OCI_INDEX, OCI_MANIFEST, DOCKER_MANIFEST):
+            raise Refused("INVALID_IMAGE_ARCHIVE")
         top_name = _oci_blob({key: top[key] for key in ("mediaType", "digest", "size")},
-                             files, media_type=OCI_INDEX)
+                             files, media_type=top["mediaType"])
         referenced.add(top_name)
-        nested = _oci_json(fd, top_name, files, offsets, metadata)
-        if (not isinstance(nested, dict) or set(nested) !=
-                {"schemaVersion", "mediaType", "manifests"} or
-                nested["schemaVersion"] != 2 or nested["mediaType"] != OCI_INDEX or
-                not isinstance(nested["manifests"], list) or
-                len(nested["manifests"]) not in (1, 2)):
-            raise Refused("INVALID_IMAGE_ARCHIVE")
-        primary = nested["manifests"][0]
-        if (not isinstance(primary, dict) or set(primary) !=
-                {"mediaType", "digest", "size", "platform"} or
-                not isinstance(primary["platform"], dict) or
-                set(primary["platform"]) != {"os", "architecture"} or
-                primary["platform"]["os"] != "linux" or
-                primary["platform"]["architecture"] not in ("amd64", "arm64")):
-            raise Refused("INVALID_IMAGE_ARCHIVE")
-        primary_name = _oci_blob({key: primary[key] for key in
-                                  ("mediaType", "digest", "size")},
-                                 files, media_type=OCI_MANIFEST)
-        referenced.add(primary_name)
-        manifest = _oci_json(fd, primary_name, files, offsets, metadata)
+        top_value = _oci_json(fd, top_name, files, offsets, metadata)
+        nested = None
+        declared_platform = None
+        if top["mediaType"] == OCI_INDEX:
+            nested = top_value
+            if (not isinstance(nested, dict) or set(nested) !=
+                    {"schemaVersion", "mediaType", "manifests"} or
+                    nested["schemaVersion"] != 2 or nested["mediaType"] != OCI_INDEX or
+                    not isinstance(nested["manifests"], list) or
+                    len(nested["manifests"]) not in (1, 2)):
+                raise Refused("INVALID_IMAGE_ARCHIVE")
+            primary = nested["manifests"][0]
+            if (not isinstance(primary, dict) or set(primary) !=
+                    {"mediaType", "digest", "size", "platform"} or
+                    not isinstance(primary["platform"], dict) or
+                    set(primary["platform"]) != {"os", "architecture"} or
+                    primary["platform"]["os"] != "linux" or
+                    primary["platform"]["architecture"] not in ("amd64", "arm64")):
+                raise Refused("INVALID_IMAGE_ARCHIVE")
+            declared_platform = primary["platform"]
+            if primary["mediaType"] not in (OCI_MANIFEST, DOCKER_MANIFEST):
+                raise Refused("INVALID_IMAGE_ARCHIVE")
+            primary_name = _oci_blob({key: primary[key] for key in
+                                      ("mediaType", "digest", "size")},
+                                     files, media_type=primary["mediaType"])
+            referenced.add(primary_name)
+            manifest = _oci_json(fd, primary_name, files, offsets, metadata)
+        else:
+            # Containerd can export a tagged image manifest directly. Its
+            # hashed config supplies the platform when no nested index exists.
+            manifest = top_value
         if (not isinstance(manifest, dict) or set(manifest) !=
                 {"schemaVersion", "mediaType", "config", "layers"} or
                 manifest["schemaVersion"] != 2 or
-                manifest["mediaType"] != OCI_MANIFEST or
+                manifest["mediaType"] != (primary["mediaType"] if nested is not None else top["mediaType"]) or
                 not isinstance(manifest["layers"], list) or
                 not 1 <= len(manifest["layers"]) <= MAX_IMAGE_FILES):
             raise Refused("INVALID_IMAGE_ARCHIVE")
-        config_name = _oci_blob(manifest["config"], files, media_type=OCI_CONFIG)
-        if source_rootfs is None and config_name != (
-                "blobs/sha256/" + image_ids[service][7:]):
+        config_type = OCI_CONFIG if manifest["mediaType"] == OCI_MANIFEST else DOCKER_CONFIG
+        config_name = _oci_blob(manifest["config"], files, media_type=config_type)
+        # Engine image IDs may name the config, platform manifest or index.
+        # Each permitted identity is an independently hashed node in this
+        # service's closed DAG, never an attestation or an arbitrary source ID.
+        identities = {"sha256:" + config_name.rsplit("/", 1)[1], top["digest"]}
+        if nested is not None:
+            identities.add(primary["digest"])
+        if image_ids[service] not in identities:
             raise Refused("IMAGE_ID_MISMATCH")
         referenced.add(config_name)
         config = _oci_json(fd, config_name, files, offsets, metadata)
         if (not isinstance(config, dict) or config.get("os") != "linux" or
-                config.get("architecture") != primary["platform"]["architecture"] or
+                config.get("architecture") not in ("amd64", "arm64") or
+                declared_platform is not None and
+                config.get("architecture") != declared_platform["architecture"] or
                 not isinstance(config.get("rootfs"), dict) or
                 config["rootfs"].get("type") != "layers" or
                 not isinstance(config["rootfs"].get("diff_ids"), list) or
@@ -481,14 +515,31 @@ def _inspect_oci_tar(fd: int, image_ids: dict[str, str], files: dict,
             raise Refused("ROOTFS_MISMATCH")
         if exported_configs is not None:
             exported_configs[service] = "sha256:" + config_name.rsplit("/", 1)[1]
+        if runtime_ids is not None:
+            runtime_ids[service] = sorted(identities)
         if platforms is not None:
             platforms[service] = {"os": "linux",
                                   "architecture": config["architecture"]}
         layer_names = []
         for descriptor, diff_id in zip(manifest["layers"], config["rootfs"]["diff_ids"]):
-            name = _oci_blob(descriptor, files, media_type=OCI_GZIP_LAYER)
-            if not _sha(diff_id) or _oci_diff_id(fd, name, files, offsets, expanded,
-                                                 deadline=deadline) != diff_id[7:]:
+            if (not isinstance(descriptor, dict) or
+                    descriptor.get("mediaType") not in (
+                        OCI_GZIP_LAYER, DOCKER_GZIP_LAYER, OCI_RAW_LAYER, DOCKER_RAW_LAYER) or
+                    manifest["mediaType"] == DOCKER_MANIFEST and
+                    descriptor["mediaType"] not in (DOCKER_GZIP_LAYER, DOCKER_RAW_LAYER)):
+                raise Refused("INVALID_IMAGE_ARCHIVE")
+            name = _oci_blob(descriptor, files, media_type=descriptor["mediaType"])
+            if not _sha(diff_id):
+                raise Refused("LAYER_DIGEST_MISMATCH")
+            if descriptor["mediaType"] in (OCI_RAW_LAYER, DOCKER_RAW_LAYER):
+                # A raw descriptor already names the uncompressed layer bytes.
+                expanded[0] += files[name][0]
+                if expanded[0] > MAX_IMAGE_BYTES:
+                    raise Refused("SIZE_LIMIT")
+                layer_diff = files[name][1]
+            else:
+                layer_diff = _oci_diff_id(fd, name, files, offsets, expanded, deadline=deadline)
+            if layer_diff != diff_id[7:]:
                 raise Refused("LAYER_DIGEST_MISMATCH")
             referenced.add(name)
             layer_names.append(name)
@@ -499,7 +550,7 @@ def _inspect_oci_tar(fd: int, image_ids: dict[str, str], files: dict,
                 matching[0]["Config"] != config_name or
                 matching[0]["Layers"] != layer_names):
             raise Refused("INVALID_IMAGE_ARCHIVE")
-        if len(nested["manifests"]) == 2:
+        if nested is not None and len(nested["manifests"]) == 2:
             att = nested["manifests"][1]
             if (not isinstance(att, dict) or set(att) !=
                     {"mediaType", "digest", "size", "platform", "annotations"} or
@@ -513,42 +564,54 @@ def _inspect_oci_tar(fd: int, image_ids: dict[str, str], files: dict,
                                  files, media_type=OCI_MANIFEST)
             referenced.add(att_name)
             att_manifest = _oci_json(fd, att_name, files, offsets, metadata)
-            if (not isinstance(att_manifest, dict) or set(att_manifest) !=
-                    {"schemaVersion", "mediaType", "artifactType", "config",
-                     "layers", "subject"} or
+            legacy_attestation = (isinstance(att_manifest, dict) and set(att_manifest) ==
+                                  {"schemaVersion", "mediaType", "config", "layers"})
+            if (not isinstance(att_manifest, dict) or
+                    not (legacy_attestation or set(att_manifest) ==
+                         {"schemaVersion", "mediaType", "artifactType", "config", "layers", "subject"}) or
                     att_manifest["schemaVersion"] != 2 or
                     att_manifest["mediaType"] != OCI_MANIFEST or
-                    att_manifest["artifactType"] !=
-                    "application/vnd.docker.attestation.manifest.v1+json" or
-                    att_manifest["subject"] != {key: primary[key] for key in
-                                               ("mediaType", "digest", "size")} or
-                    not isinstance(att_manifest["config"], dict) or
-                    set(att_manifest["config"]) !=
-                    {"mediaType", "digest", "size", "data"} or
-                    att_manifest["config"]["mediaType"] !=
-                    "application/vnd.oci.empty.v1+json" or
                     not isinstance(att_manifest["layers"], list) or
                     len(att_manifest["layers"]) != 1):
                 raise Refused("INVALID_IMAGE_ARCHIVE")
-            empty = att_manifest["config"]
-            if (empty["data"] != "e30=" or empty["size"] != 2 or
-                    empty["digest"] != "sha256:" + hashlib.sha256(b"{}").hexdigest()):
-                raise Refused("INVALID_IMAGE_ARCHIVE")
-            empty_name = "blobs/sha256/" + empty["digest"][7:]
-            if empty_name in files:
-                if files[empty_name][0] != 2:
+            legacy_config = None
+            if legacy_attestation:
+                config_name = _oci_blob(att_manifest["config"], files, media_type=OCI_CONFIG)
+                referenced.add(config_name)
+                legacy_config = _oci_json(fd, config_name, files, offsets, metadata)
+            else:
+                if (att_manifest["artifactType"] !=
+                        "application/vnd.docker.attestation.manifest.v1+json" or
+                        att_manifest["subject"] != {key: primary[key] for key in
+                                                   ("mediaType", "digest", "size")} or
+                        not isinstance(att_manifest["config"], dict) or
+                        set(att_manifest["config"]) != {"mediaType", "digest", "size", "data"} or
+                        att_manifest["config"]["mediaType"] != "application/vnd.oci.empty.v1+json"):
                     raise Refused("INVALID_IMAGE_ARCHIVE")
-                referenced.add(empty_name)
+                empty = att_manifest["config"]
+                if (empty["data"] != "e30=" or empty["size"] != 2 or
+                        empty["digest"] != "sha256:" + hashlib.sha256(b"{}").hexdigest()):
+                    raise Refused("INVALID_IMAGE_ARCHIVE")
+                empty_name = "blobs/sha256/" + empty["digest"][7:]
+                if empty_name in files:
+                    if files[empty_name][0] != 2:
+                        raise Refused("INVALID_IMAGE_ARCHIVE")
+                    referenced.add(empty_name)
             att_layer = att_manifest["layers"][0]
             if (not isinstance(att_layer, dict) or set(att_layer) !=
                     {"mediaType", "digest", "size", "annotations"} or
-                    att_layer["annotations"] != {
-                        "in-toto.io/predicate-type": "https://slsa.dev/provenance/v1"}):
+                    att_layer["annotations"] not in (
+                        {"in-toto.io/predicate-type": "https://slsa.dev/provenance/v0.2"},
+                        {"in-toto.io/predicate-type": "https://slsa.dev/provenance/v1"})):
                 raise Refused("INVALID_IMAGE_ARCHIVE")
             att_layer_name = _oci_blob({key: att_layer[key] for key in
                                         ("mediaType", "digest", "size")},
                                        files, media_type="application/vnd.in-toto+json")
             referenced.add(att_layer_name)
+            if legacy_attestation and legacy_config != {
+                    "architecture": "unknown", "os": "unknown", "config": {},
+                    "rootfs": {"type": "layers", "diff_ids": [att_layer["digest"]]}}:
+                raise Refused("INVALID_IMAGE_ARCHIVE")
             _oci_json(fd, att_layer_name, files, offsets, metadata,
                       limit=MAX_LEGACY_METADATA)
     if services != set(image_ids) or set(files) != referenced:
@@ -559,7 +622,8 @@ def _inspect_oci_tar(fd: int, image_ids: dict[str, str], files: dict,
 def _inspect_image_tar(fd: int, image_ids: dict[str, str], *, deadline: float,
                        platforms: dict | None = None,
                        source_rootfs: dict | None = None,
-                       exported_configs: dict | None = None) -> int:
+                       exported_configs: dict | None = None,
+                       runtime_ids: dict[str, list[str]] | None = None) -> int:
     """Validate exact Docker-save members before any later docker-load design."""
     os.lseek(fd, 0, os.SEEK_SET)
     seen: set[str] = set()
@@ -624,7 +688,8 @@ def _inspect_image_tar(fd: int, image_ids: dict[str, str], *, deadline: float,
         return _inspect_oci_tar(fd, image_ids, files, offsets, seen, captured,
                                 deadline=deadline, platforms=platforms,
                                 source_rootfs=source_rootfs,
-                                exported_configs=exported_configs)
+                                exported_configs=exported_configs,
+                                runtime_ids=runtime_ids)
     listing = _parse_json(captured.get("manifest.json", b""))
     if not isinstance(listing, list) or len(listing) != len(image_ids):
         raise Refused("INVALID_IMAGE_ARCHIVE")
@@ -673,6 +738,8 @@ def _inspect_image_tar(fd: int, image_ids: dict[str, str], *, deadline: float,
             raise Refused("ROOTFS_MISMATCH")
         if exported_configs is not None:
             exported_configs[service] = "sha256:" + config_name[:-5]
+        if runtime_ids is not None:
+            runtime_ids[service] = ["sha256:" + config_name[:-5]]
         if (len(differences) != len(item["Layers"]) or
                 any(not _sha(difference) or
                     files[layer][1] != difference[7:]
