@@ -223,8 +223,11 @@ def initial_names(root, records, source):
         package = "sovagrid_agent" if root.endswith("agent") else "sovagrid_vpn"
         component = "sovagrid-agent" if root.endswith("agent") else "sovagrid-vpn"
         allowed = {"", package, package + "/__pycache__"}
-        for file in (source / component / package).glob("*.py"):
-            name = package + "/" + file.name
+        installed = [(file, package + "/" + file.name)
+                     for file in (source / component / package).glob("*.py")]
+        installed.extend((source / component / name, name)
+                         for name in ("LICENSE", "ATTRIBUTION.md", "NOTICE"))
+        for file, name in installed:
             allowed.add(name)
             if name in records:
                 need(records[name]["sha256"] == hashlib.sha256(file.read_bytes()).hexdigest(), "installed code is foreign")

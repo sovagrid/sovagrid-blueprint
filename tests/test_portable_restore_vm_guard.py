@@ -173,6 +173,26 @@ class VmGuardTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "unknown initial"):
                     vm.initial_names(root, {"": {}, foreign: {}}, Path("/unused"))
 
+    def test_installer_notices_are_pinned_without_adopting_other_code_descendants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            for component in ("sovagrid-agent", "sovagrid-vpn"):
+                folder = source / component
+                folder.mkdir()
+                records = {"": {}}
+                for name in ("LICENSE", "ATTRIBUTION.md", "NOTICE"):
+                    raw = (component + "/" + name + "\n").encode()
+                    (folder / name).write_bytes(raw)
+                    records[name] = {"sha256": hashlib.sha256(raw).hexdigest()}
+                vm.initial_names("/opt/" + component, records, source)
+                records["NOTICE"] = {"sha256": "0" * 64}
+                with self.assertRaisesRegex(RuntimeError, "installed code is foreign"):
+                    vm.initial_names("/opt/" + component, records, source)
+                records.pop("NOTICE")
+                records["unknown-file"] = {}
+                with self.assertRaisesRegex(RuntimeError, "unknown installed code descendant"):
+                    vm.initial_names("/opt/" + component, records, source)
+
     def test_source_manifest_pin_is_known_and_all_bytes_are_checked_before_import(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
