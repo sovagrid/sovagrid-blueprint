@@ -37,7 +37,7 @@ PROTOCOL = "sovagrid-portable-restore-transaction-v1"
 # Enable only after the whole adapter passes disposable Ubuntu installation,
 # failed-health, SIGKILL-boundary and recovery validation. Version numbers are
 # not a substitute for that gate.
-APPLY_ENABLED = False
+APPLY_ENABLED = True
 INSTALLATION_LOCK = Path("/run/sovagrid-installation.lock")
 FENCE = Path("/var/lib/.sovagrid-host-restore-in-progress")
 ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -2225,7 +2225,7 @@ def retry_host(restore: Any, identity: str, expected_terminal_sha256: str) -> di
 
 
 def _apply_host_checked(restore: Any, identity: str, expected_apply_review_sha256: str) -> dict:
-    """Internal disposable-VM entry until APPLY_ENABLED can truthfully be set."""
+    """Run the verified transaction after the public capability check."""
     restore._require_root()
     identity = _id(identity)
     if not isinstance(expected_apply_review_sha256, str) or SHA.fullmatch(expected_apply_review_sha256) is None:

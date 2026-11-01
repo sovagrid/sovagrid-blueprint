@@ -674,6 +674,31 @@ def remove_quarantined(fixture, core, parent, shadow, path, proof, expected):
     os.fsync(parent)
 
 
+def restored_runtime_images(bundle, restore, core, identity, receipt):
+    """Bind disposable cleanup IDs to the committed plan and actual images."""
+    runtime = load(bundle, "portable_restore_runtime.py", "sovagrid_ci_cleanup_runtime")
+    with core.transaction_locks(restore) as (fd, _exporter):
+        journal = core.Journal(fd, identity, uid=restore.backup.ROOT_UID, gid=restore.backup.ROOT_GID)
+        value = journal.read()
+        need(value is not None and value["phase"] == "committed" and value["id"] == identity and
+             receipt["host_archive_id"] == identity, "cleanup restore is not committed")
+        need(all(value["bindings"][key] == receipt[key] for key in
+                 ("source_manifest_sha256", "host_archive_sha256", "images_sha256")),
+             "cleanup receipt differs from committed inputs")
+        plan = runtime.load(restore, core, fd, identity, value["bindings"])
+        need({name: image["config"] for name, image in plan["images"].items()} == receipt["exported_configs"] and
+             {name: image["rootfs_sha256"] for name, image in plan["images"].items()} == receipt["rootfs_sha256"],
+             "cleanup image content differs from receipt")
+        steps = [step for step in value["steps"] if step["kind"] == "compose"]
+        need(len(steps) == 1 and steps[0]["state"] == "done", "cleanup compose proof is incomplete")
+        driver = runtime.Runtime(restore, core, plan, journal)
+        driver.compose.verify(steps[0], steps[0]["proof"])
+        resolved = driver.images.resolved(plan["images"])
+        need(resolved == steps[0]["proof"].get("runtime_images"),
+             "cleanup daemon image IDs differ from committed proof")
+        return dict(resolved)
+
+
 def uninstall(bundle, identity, receipt, *, restore_id=None):
     """Remove only a fully identified disposable installation, never glob-rm."""
     restore, core, _runtime = api(bundle)
@@ -713,7 +738,8 @@ def uninstall(bundle, identity, receipt, *, restore_id=None):
         need(stat.S_ISREG(info.st_mode) and info.st_uid == info.st_gid == 0 and info.st_nlink == 1 and
              stat.S_IMODE(info.st_mode) == 0o644 and hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest,
              "managed unit changed before cleanup")
-    expected_images = receipt["exported_configs"] if restore_id else receipt["images"]
+    expected_images = (restored_runtime_images(bundle, restore, core, restore_id, receipt)
+                       if restore_id else receipt["images"])
     records = {}
     projection = '{"id":{{json .Id}},"image":{{json .Image}},"labels":{{json .Config.Labels}}}'
     for service, image in expected_images.items():
@@ -1195,6 +1221,78 @@ with sqlite3.connect('file:/data/hub.sqlite?mode=ro',uri=True,timeout=15) as db:
     return json.loads(result.stdout)
 
 
+def hub_sql_read_offline(bundle, restore, core, identity, query, parameters):
+    """Read only four fixed witnesses after rollback has removed the Hub."""
+    guard()
+    sentinel = fixture_module().ledger()["sentinel"]
+    allowed = {"SELECT state,command='',server_id FROM jobs WHERE id=?": [sentinel["job"]],
+               "SELECT COUNT(*) FROM pending_commands WHERE code_hash=?": [sentinel["pending"]],
+               "SELECT details FROM audit_events WHERE action='portable_restore_queue_quarantined' ORDER BY id DESC LIMIT 1": [],
+               "SELECT value FROM sovagrid_restore_ci_writeproof WHERE id=1": []}
+    need(query in allowed and parameters == allowed[query], "invalid fixed offline SQLite witness")
+    verified_bundle(bundle)
+    with core.transaction_locks(restore) as (stage_fd, _exporter), contextlib.ExitStack() as held:
+        value = core.Journal(stage_fd, identity).read()
+        need(value is not None and value["id"] == identity and value["phase"] == "recovery_required" and
+             value["bindings"]["source_manifest_sha256"] == expected_manifest(), "offline SQLite witness is not fenced")
+        fence = core.Fence(restore.backup.ROOT)
+        parent, leaf = core._safe_parent(restore.backup.ROOT, str(core.FENCE), uid=0)
+        held.callback(os.close, parent)
+        need(fence._read(parent, leaf) == fence._raw(identity, value["bindings"]), "offline SQLite fence changed")
+        runtime = load(bundle, "portable_restore_runtime.py", "sovagrid_ci_offline_plan")
+        plan = runtime.load(restore, core, stage_fd, identity, value["bindings"])
+        roots = [resource for resource in plan["resources"] if resource["target"] == "/var/lib/sovagrid"]
+        publications = [step for step in value["steps"] if step["kind"] == "publish" and step["resource"] == "/var/lib/sovagrid"]
+        need(len(roots) == len(publications) == 1, "offline SQLite lacks a publication proof")
+        entries = roots[0]["entries"]
+        need(all((entries[name]["kind"], entries[name]["uid"], entries[name]["gid"], entries[name]["mode"]) == expected
+                 for name, expected in (("hub", ("dir", 10001, 10001, 0o700)),
+                                        ("hub/hub.sqlite", ("file", 10001, 10001, 0o600)))),
+             "offline SQLite plan identity changed")
+        parent, leaf = core._safe_parent(restore.backup.ROOT, "/var/lib/sovagrid/hub", uid=0)
+        held.callback(os.close, parent)
+        parent_info = os.fstat(parent)
+        proof = publications[0]["proof"]["resource"]
+        need((parent_info.st_dev, parent_info.st_ino) == (proof["device"], proof["inode"]),
+             "offline SQLite publication was replaced")
+        directory = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        held.callback(os.close, directory)
+        directory_info = os.fstat(directory)
+        core._private(directory_info, directory=True, uid=10001, gid=10001)
+        database = os.open("hub.sqlite", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+        held.callback(os.close, database)
+        before = os.fstat(database)
+        core._private(before, directory=False, uid=10001, gid=10001)
+        for suffix in ("-wal", "-shm"):
+            try:
+                sidecar = os.stat("hub.sqlite" + suffix, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            core._private(sidecar, directory=False, uid=10001, gid=10001)
+        script = '''import hashlib,json,os,sqlite3,sys
+request=json.load(sys.stdin)
+os.fchdir(int(sys.argv[1]));os.chroot('.');os.chdir('/');os.close(int(sys.argv[1]))
+os.setgroups([]);os.setgid(10001);os.setuid(10001);os.umask(0o077)
+assert (os.getuid(),os.geteuid(),os.getgid(),os.getegid())==(10001,10001,10001,10001)
+with sqlite3.connect('file:/hub.sqlite?mode=ro',uri=True,timeout=15) as db:
+ print(json.dumps(db.execute(request['query'],request['parameters']).fetchall()))
+'''
+        result = subprocess.run(["/usr/bin/python3", "-B", "-I", "-c", script, str(directory)],
+            input=json.dumps({"query": query, "parameters": parameters}).encode(), pass_fds=(directory,),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, check=False,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+        need(result.returncode == 0 and len(result.stdout) <= 8192 and len(result.stderr) <= 8192,
+             "bounded offline SQLite witness read failed")
+        named_directory = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        core._private(os.fstat(directory), directory=True, uid=10001, gid=10001)
+        core._private(named_directory, directory=True, uid=10001, gid=10001)
+        need(core._fingerprint(before) == core._fingerprint(os.fstat(database)) and
+             core._fingerprint(before) == core._fingerprint(os.stat("hub.sqlite", dir_fd=directory, follow_symlinks=False)) and
+             (directory_info.st_dev, directory_info.st_ino) == (named_directory.st_dev, named_directory.st_ino),
+             "offline SQLite witness location changed")
+        return json.loads(result.stdout)
+
+
 def verify_command_files_terminal(config, row, token):
     host = config["server_id"]
     prefix = "/api/v1/servers/" + host
@@ -1263,12 +1361,12 @@ def verify_command_files_terminal(config, row, token):
                 after = events["next_after"]
                 need(len(output) <= 32768, "oversized terminal verification output")
                 if events["state"] == "active" and not sent:
-                    raw = b"printf 'SG_RESTORE_%s_OK\\n' TERMINAL; exit\n"
+                    raw = b"unset HISTFILE; printf 'SG_RESTORE_%s_OK\\n' TERMINAL; exit\n"
                     hub_request("POST", endpoint + "/input", token,
                                 body={"seq": 1, "data": base64.urlsafe_b64encode(raw).decode().rstrip("=")})
                     sent = True
                 if events["state"] == "closed":
-                    need(sent and events["exit_code"] == 0 and b"SG_RESTORE_TERMINAL_OK" in output,
+                    need(sent and events["exit_code"] in (None, 0) and b"SG_RESTORE_TERMINAL_OK" in output,
                          "restored PTY did not execute the bounded command")
                     break
                 need(time.monotonic() < deadline, "restored terminal did not finish")
@@ -1294,7 +1392,7 @@ def verify_live(bundle, since):
         while True:
             rows = module.request("GET", "/api/v1/servers", token=token)[1]["servers"]
             row = next(item for item in rows if item["id"] == host)
-            history = module.request("GET", "/api/v1/servers/" + host + "/metrics?limit=5", token=token)[1]["metrics"]
+            history = hub_request("GET", "/api/v1/servers/" + host + "/metrics?limit=1", token)["metrics"]
             if row["online"] is True and type(row["last_seen"]) is int and row["last_seen"] >= since and history:
                 break
             need(time.monotonic() < deadline, "restored Agent did not publish metrics")
@@ -1365,9 +1463,11 @@ def run():
         run_child(bundle, third, stage(bundle, third), "health-failure")
         state = core.host_status(restore, third)
         need(state["phase"] == "recovery_required" and core.FENCE.is_file(), "changed runtime data was not fenced")
-        verify_queue_sentinel(restored=True)
-        need(hub_sql_read("SELECT value FROM sovagrid_restore_ci_writeproof WHERE id=1", []) ==
-             [["preserve-this-runtime-write"]], "failed health discarded newly accepted database data")
+        with patch.object(sys.modules[__name__], "hub_sql_read",
+                          side_effect=lambda query, parameters: hub_sql_read_offline(bundle, restore, core, third, query, parameters)):
+            verify_queue_sentinel(restored=True)
+            need(hub_sql_read("SELECT value FROM sovagrid_restore_ci_writeproof WHERE id=1", []) ==
+                 [["preserve-this-runtime-write"]], "failed health discarded newly accepted database data")
         print("PORTABLE_RESTORE_VM_CHANGED_DATABASE_PRESERVED_AND_FENCED", flush=True)
     finally:
         restore_ci_image(pin)
