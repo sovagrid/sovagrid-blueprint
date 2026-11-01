@@ -96,12 +96,13 @@ class FeatureWebTests(unittest.TestCase):
         jobs = SimpleNamespace(_bundle_path=self.root / ('source-' + 'a' * 64 + '.tar.gz'),
             _bundle_sha256='a' * 64, _exclusive=nullcontext, _bundle=lambda: self.root / 'bundle.tar.gz')
         outer = self
+        self.transport_cleanup = lambda: None
 
         class Transport:
             def __init__(self, **kwargs):
                 self.options = ConnectionOptions(host=kwargs['host'], user=kwargs['username'], port=kwargs['port'])
             def __enter__(self): return self
-            def __exit__(self, *args): pass
+            def __exit__(self, *args): outer.transport_cleanup()
             def target_rpc(self, _options): return outer.rpc
 
         self.jobs = module.AgentFeatureJobs(jobs, transport_factory=Transport, api_factory=lambda _: self.api)
@@ -146,6 +147,110 @@ class FeatureWebTests(unittest.TestCase):
         self.assertEqual(result['current'], DESIRED)
         self.assertTrue(result['fresh_metric_verified'])
         self.assertTrue(result['hub_enabled'])
+        self.assertFalse((self.root / 'agent-features-stage.json').exists())
+
+    def test_gate_opens_only_after_metric_final_checks_cleanup_and_fresh_authorization(self):
+        plan = self.plan()
+        order = []
+        original_call, original_get = self.rpc.call, self.api.get
+        original_management, original_set = self.api.management, self.api.set_management
+        original_cleanup = self.rpc.cleanup_stage
+        def call(action, payload, *, stage):
+            order.append(action)
+            return original_call(action, payload, stage=stage)
+        def get(enrollment):
+            order.append('metric-or-registration')
+            self.assertFalse(self.api.policy['enabled'])
+            return original_get(enrollment)
+        def management(server):
+            order.append('management')
+            return original_management(server)
+        def set_management(expected, enabled):
+            order.append('open' if enabled else 'close')
+            return original_set(expected, enabled)
+        def cleanup(stage):
+            order.append('cleanup')
+            self.assertFalse(self.api.policy['enabled'])
+            return original_cleanup(stage)
+        self.rpc.call, self.api.get = call, get
+        self.api.management, self.api.set_management = management, set_management
+        self.rpc.cleanup_stage = cleanup
+        self.transport_cleanup = lambda: order.append('transport-close')
+        result = self.jobs.execute('apply', features=DESIRED, expected_review_sha256=plan['review_sha256'],
+            confirm=True, authorize=lambda: order.append('authorize'), **self.arguments)
+        self.assertTrue(result['hub_enabled'])
+        self.assertEqual(order, ['management', 'target-features-preview', 'metric-or-registration',
+            'authorize', 'close', 'authorize', 'target-features-apply', 'metric-or-registration',
+            'metric-or-registration', 'target-features-status', 'management', 'cleanup',
+            'transport-close', 'authorize', 'open'])
+
+    def test_metric_timeout_keeps_gate_closed_after_successful_target_apply(self):
+        plan = self.plan()
+        original = self.api.get
+        def stationary(enrollment):
+            row = original(enrollment)
+            row['last_seen'] = 5
+            return row
+        self.api.get = stationary
+        ticks = iter((0, 120))
+        self.jobs.clock, self.jobs.pause = lambda: next(ticks), lambda _: None
+        with self.assertRaises(module.AgentFeatureError) as error:
+            self.jobs.execute('apply', features=DESIRED, expected_review_sha256=plan['review_sha256'],
+                confirm=True, **self.arguments)
+        self.assertEqual(error.exception.code, 'METRIC_UNCONFIRMED')
+        self.assertEqual(self.rpc.applies, 1)
+        self.assertFalse(self.api.policy['enabled'])
+        self.assertEqual(self.events, [('gate', False)])
+
+    def test_final_rpc_failure_or_changed_target_keeps_gate_closed(self):
+        for changed in (False, True):
+            with self.subTest(changed=changed):
+                self.setUp()
+                plan = self.plan()
+                original = self.rpc.call
+                def final_failure(action, payload, *, stage):
+                    if action == 'target-features-status':
+                        if not changed:
+                            raise module.RPCError('SSH_FAILED')
+                        result = original(action, payload, stage=stage)
+                        result['current']['files'] = False
+                        return result
+                    return original(action, payload, stage=stage)
+                self.rpc.call = final_failure
+                with self.assertRaises(module.AgentFeatureError) as error:
+                    self.jobs.execute('apply', features=DESIRED, expected_review_sha256=plan['review_sha256'],
+                        confirm=True, **self.arguments)
+                self.assertEqual(error.exception.code, 'APPLY_UNCERTAIN')
+                self.assertEqual(self.rpc.applies, 1)
+                self.assertFalse(self.api.policy['enabled'])
+                self.assertEqual(self.events, [('gate', False)])
+
+    def test_stage_cleanup_failure_never_opens_gate(self):
+        plan = self.plan()
+        def refuse(_stage):
+            raise module.RPCError('STAGE_CLEANUP_REQUIRED')
+        self.rpc.cleanup_stage = refuse
+        with self.assertRaises(module.AgentFeatureError) as error:
+            self.jobs.execute('apply', features=DESIRED, expected_review_sha256=plan['review_sha256'],
+                confirm=True, **self.arguments)
+        self.assertEqual(error.exception.code, 'STAGE_CLEANUP_REQUIRED')
+        self.assertEqual(self.rpc.applies, 1)
+        self.assertFalse(self.api.policy['enabled'])
+        self.assertEqual(self.events, [('gate', False)])
+        self.assertTrue((self.root / 'agent-features-stage.json').is_file())
+
+    def test_ssh_transport_cleanup_failure_never_opens_gate(self):
+        plan = self.plan()
+        def refuse():
+            raise OSError('disposable SSH cleanup failed')
+        self.transport_cleanup = refuse
+        with self.assertRaises(module.AgentFeatureError) as error:
+            self.jobs.execute('apply', features=DESIRED, expected_review_sha256=plan['review_sha256'],
+                confirm=True, **self.arguments)
+        self.assertEqual(error.exception.code, 'APPLY_UNCERTAIN')
+        self.assertEqual(self.rpc.applies, 1)
+        self.assertFalse(self.api.policy['enabled'])
+        self.assertEqual(self.events, [('gate', False)])
         self.assertFalse((self.root / 'agent-features-stage.json').exists())
 
     def test_revocation_after_closing_gate_blocks_target_apply(self):

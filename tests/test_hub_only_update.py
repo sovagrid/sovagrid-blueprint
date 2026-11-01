@@ -390,7 +390,9 @@ class HubOnlyUpdatePolicy(unittest.TestCase):
                 for name in ("sovagrid-web/Dockerfile.ssh-gateway",
                              "sovagrid-web/gateway/package.json",
                              "sovagrid-web/gateway/package-lock.json",
-                             "sovagrid-web/gateway/server.js"):
+                             "sovagrid-web/gateway/server.js",
+                             "sovagrid-web/agent-features.js",
+                             "sovagrid-web/agent-features.css"):
                     file = candidate / name
                     file.parent.mkdir(parents=True, exist_ok=True)
                     file.write_text("fixture")
@@ -405,6 +407,12 @@ class HubOnlyUpdatePolicy(unittest.TestCase):
                 script.write_bytes(script.read_bytes() + b"# SOVAGRID_PUBLIC_SSH_REFRESH_V1\n")
                 self.assertEqual(update._candidate(ARCHIVE, {"sovagrid-blueprint": "old"})[0],
                                  candidate)
+                for name in ("agent-features.js", "agent-features.css"):
+                    asset = candidate / "sovagrid-web" / name
+                    asset.unlink()
+                    with self.assertRaisesRegex(update.Refused, "CANDIDATE_INCOMPATIBLE"):
+                        update._candidate(ARCHIVE, {"sovagrid-blueprint": "old"})
+                    asset.write_text("fixture")
 
     def test_unmanaged_stopped_gateway_is_not_taken_over_by_update(self) -> None:
         common = update.common

@@ -121,6 +121,7 @@ class AgentFeatureJobs:
                         private_key=credential.private_key, passphrase=credential.passphrase, **route_kwargs) as transport:
                     rpc = transport.target_rpc(transport.options)
                     self.stages._cleanup_orphan(rpc, identity)
+                    stage_cleaned = False
                     try:
                         stage = rpc.stage_target(bundle, self.jobs._bundle_sha256,
                             checkpoint=lambda descriptor: self.stages._save_stage(identity, descriptor))
@@ -162,12 +163,10 @@ class AgentFeatureJobs:
                         baseline = api.get(applied["identity"]["enrollment_id"])
                         self._bind(applied, closed, baseline, server_id)
                         old_seen = baseline["last_seen"] or 0
-                        authorize()
-                        opened = api.set_management(closed, desired["commands"])
                         deadline = self.clock() + 120
                         while True:
                             row = api.get(applied["identity"]["enrollment_id"])
-                            self._bind(applied, opened, row, server_id)
+                            self._bind(applied, closed, row, server_id)
                             if row["last_seen"] is not None and row["last_seen"] > old_seen:
                                 break
                             if self.clock() >= deadline:
@@ -176,17 +175,25 @@ class AgentFeatureJobs:
                         final = target("status")
                         final_policy = api.management(server_id)
                         self._bind(final, final_policy, row, server_id)
-                        if (final_policy != opened or final["current"] != desired or final["recovery_required"] or
+                        if (final_policy != closed or final["current"] != desired or final["recovery_required"] or
                                 any(final[key] != applied[key] for key in
                                     ("identity", "current", "expected", "source_manifest_sha256", "pending_features", "services"))):
                             raise AgentFeatureError("APPLY_UNCERTAIN")
-                        return {**public, "action": "applied", "current": final["current"], "desired": desired,
-                            "hub_enabled": final_policy["enabled"], "hub_revision": final_policy["revision"],
-                            "applied": True, "changed": bool(changed), "fresh_metric_verified": True,
-                            "cleanup_required": False}
+                        # Nothing may reopen command delivery before the fresh
+                        # metric, final target/policy checks and stage cleanup
+                        # have all succeeded. The SSH context also closes
+                        # before the last authorized Hub CAS below.
+                        self.stages._cleanup_orphan(rpc, identity)
+                        stage_cleaned = True
                     finally:
-                        if self.stages._read_stage() is not None:
+                        if not stage_cleaned and self.stages._read_stage() is not None:
                             self.stages._cleanup_orphan(rpc, identity)
+                authorize()
+                opened = api.set_management(closed, desired["commands"])
+                return {**public, "action": "applied", "current": final["current"], "desired": desired,
+                    "hub_enabled": opened["enabled"], "hub_revision": opened["revision"],
+                    "applied": True, "changed": bool(changed), "fresh_metric_verified": True,
+                    "cleanup_required": False}
         except AgentFeatureError:
             raise
         except EnrollmentAPIError as error:
