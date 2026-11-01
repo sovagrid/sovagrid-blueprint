@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Jigokuraku01
 # Additional author attribution terms: see ATTRIBUTION.md.
 """Execute the real inventory preparation and preflight against private paths."""
+import json
 import os
 from pathlib import Path
 import shlex
@@ -35,11 +36,18 @@ class ContainerInventoryPreparationTests(unittest.TestCase):
         # Model root/sovagrid identities while keeping every real operation
         # unprivileged. Modes, types, inodes and link counts remain real.
         self.tool('stat', r'''
-import os, pathlib, stat, sys
+import json, os, pathlib, stat, sys
 path=pathlib.Path(sys.argv[-1]); info=path.lstat()
 owner='root' if info.st_uid==os.getuid() else 'foreign'
-if str(path)==os.environ.get('TEST_BAD_OWNER'): owner='foreign'
 group='sovagrid' if path.name in ('sovagrid-containers','sovagrid','snapshot.json') or path.name.startswith('.sovagrid-container-prepare.') else 'root'
+if path.name=='.containers-managed-by-run-sh' or path.name.startswith('.containers-marker.'):
+ group=os.environ.get('TEST_MARKER_DEFAULT_GROUP','root')
+trace=pathlib.Path(os.environ['TEST_TRACE'])
+if trace.exists():
+ for line in trace.read_text().splitlines():
+  event=json.loads(line)
+  if event[:2]==['chown',str(info.st_ino)]: owner,group=event[2].split(':')
+if str(path)==os.environ.get('TEST_BAD_OWNER'): owner='foreign'
 if str(path)==os.environ.get('TEST_BAD_GROUP'): group='foreign'
 values={'%U':owner,'%G':group,'%a':format(stat.S_IMODE(info.st_mode),'o'),'%h':str(info.st_nlink)}
 print(':'.join(values[part] for part in sys.argv[2].split(':')))
@@ -54,20 +62,37 @@ else:
   if child.name not in ('snapshot.json','.prepared-by-run-sh'):
    print(child); break
 ''')
-        self.tool('chown', 'pass\n')
+        self.tool('chown', r'''
+import json, os, pathlib, sys
+with open(os.environ['TEST_TRACE'],'a') as stream:
+ stream.write(json.dumps(['chown',str(pathlib.Path(sys.argv[-1]).stat().st_ino),sys.argv[1]])+'\n')
+''')
         self.tool('python-sync', r'''
-import os, subprocess, sys
+import json, os, pathlib, subprocess, sys
 result=subprocess.run([sys.executable,*sys.argv[1:]],input=sys.stdin.buffer.read())
 if result.returncode: sys.exit(result.returncode)
+with open(os.environ['TEST_TRACE'],'a') as stream:
+ for name in sys.argv[sys.argv.index('-')+1:]:
+  stream.write(json.dumps(['sync',str(pathlib.Path(name).stat().st_ino)])+'\n')
 if os.environ.get('TEST_FAIL_MARKER_SYNC')=='1' and any(path.endswith('/.containers-managed-by-run-sh') for path in sys.argv): sys.exit(98)
 ''')
         self.tool('mv', r'''
-import os, pathlib, sys
+import json, os, pathlib, stat, sys
 source,destination=map(pathlib.Path,sys.argv[-2:])
 if os.environ.get('TEST_RACE_TARGET')=='1':
  destination.mkdir(mode=0o750); (destination/'foreign').write_text('preserve')
+if destination.name=='.containers-managed-by-run-sh':
+ events=[json.loads(line) for line in pathlib.Path(os.environ['TEST_TRACE']).read_text().splitlines()]
+ inode=str(source.stat().st_ino)
+ assert ['chown',inode,'root:root'] in events and ['sync',inode] in events
+ assert events.index(['chown',inode,'root:root']) < events.index(['sync',inode])
+ assert stat.S_IMODE(source.stat().st_mode)==0o600
+ if os.environ.get('TEST_RACE_MARKER')=='1': destination.write_text('foreign marker')
+ if os.environ.get('TEST_FAIL_MARKER_PUBLISH')=='1': sys.exit(99)
 if destination.exists() or destination.is_symlink(): sys.exit(0)
 os.rename(source,destination)
+with open(os.environ['TEST_TRACE'],'a') as stream:
+ stream.write(json.dumps(['publish',str(destination.stat().st_ino)])+'\n')
 if os.environ.get('TEST_FAIL_AFTER_PUBLISH')=='1': sys.exit(97)
 ''')
         self.functions = FUNCTIONS.replace('/etc/systemd/system', str(self.units)).replace('/etc/sovagrid', str(self.etc))
@@ -83,7 +108,7 @@ if os.environ.get('TEST_FAIL_AFTER_PUBLISH')=='1': sys.exit(97)
                   'die() { printf "%s\\n" "$*" >&2; exit 1; }\n' + self.functions + '\n' + operation)
         return subprocess.run(['bash', '-c', script], text=True, capture_output=True, timeout=15,
                               env=dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
-                                       PYTHONDONTWRITEBYTECODE='1', **environment))
+                                       TEST_TRACE=str(self.root / 'trace'), PYTHONDONTWRITEBYTECODE='1', **environment))
 
     def prepare(self):
         result = self.run_shell('container_inventory_prepare')
@@ -123,6 +148,31 @@ if os.environ.get('TEST_FAIL_AFTER_PUBLISH')=='1': sys.exit(97)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.receipt.exists())
         self.assertEqual(list(self.directory.iterdir()), [])
+
+    def test_marker_metadata_is_ready_and_synced_before_publish_with_nonroot_egid(self):
+        result = self.run_shell('container_inventory_prepare', TEST_MARKER_DEFAULT_GROUP='nonroot')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = [json.loads(line) for line in (self.root / 'trace').read_text().splitlines()]
+        inode = str(self.marker.stat().st_ino)
+        self.assertLess(events.index(['chown', inode, 'root:root']), events.index(['sync', inode]))
+        self.assertLess(events.index(['sync', inode]), events.index(['publish', inode]))
+        self.assertEqual(self.marker.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(list(self.etc.glob('.containers-marker.*')), [])
+
+    def test_marker_race_preserves_foreign_target_and_cleans_private_staging(self):
+        result = self.run_shell('container_inventory_prepare', TEST_RACE_MARKER='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.marker.read_text(), 'foreign marker')
+        self.assertTrue(self.receipt.is_file())
+        self.assertEqual(list(self.etc.glob('.containers-marker.*')), [])
+
+    def test_failed_marker_publish_cleans_staging_and_remains_retryable(self):
+        result = self.run_shell('container_inventory_prepare', TEST_FAIL_MARKER_PUBLISH='1')
+        self.assertEqual(result.returncode, 99, result.stderr)
+        self.assertFalse(self.marker.exists())
+        self.assertTrue(self.receipt.is_file())
+        self.assertEqual(list(self.etc.glob('.containers-marker.*')), [])
+        self.prepare()
 
     def test_preexisting_unmarked_directory_or_units_remain_refused(self):
         self.directory.mkdir(mode=0o750)

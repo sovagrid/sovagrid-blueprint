@@ -65,8 +65,8 @@ require_host_capabilities() {
   local tool state version major record
   local -a missing=()
   (( BASH_VERSINFO[0] >= 4 )) || die 'Bash 4 or newer is required'
-  for tool in basename cat chmod chown cmp cut dirname env find flock getent grep groupadd id \
-              install ln mkdir mktemp mv rm runuser sha256sum stat systemctl systemd-analyze touch tr uname useradd; do
+  for tool in basename bash cat chmod chown cmp cut dirname env find flock getent grep groupadd id \
+              install ln mkdir mktemp mv rm runuser sha256sum sleep stat systemctl systemd-analyze touch tr uname useradd; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
   (( ${#missing[@]} == 0 )) || die "missing required host tools: ${missing[*]}; prepare these tools before installing"
@@ -934,12 +934,14 @@ container_inventory_prepare() (
   # travels atomically with a fresh directory across interruption before marker publication.
   local marker=/etc/sovagrid/.containers-managed-by-run-sh directory=/var/lib/sovagrid-containers
   container_inventory_stage=
+  container_inventory_marker_stage=
   container_inventory_preflight
   [[ -d /var/lib && ! -L /var/lib && $(stat -c '%U' /var/lib) == root &&
      -z $(find /var/lib -maxdepth 0 -perm /022 -print -quit) &&
      -d /etc/sovagrid && ! -L /etc/sovagrid && $(stat -c '%U:%G:%a' /etc/sovagrid) == root:sovagrid:750 ]] ||
     die 'container inventory preparation parent is unsafe'
-  trap 'if [[ -n $container_inventory_stage && -d $container_inventory_stage && ! -L $container_inventory_stage ]]; then rm -f -- "$container_inventory_stage/.prepared-by-run-sh"; rmdir -- "$container_inventory_stage" 2>/dev/null || true; fi' EXIT
+  trap 'if [[ -n $container_inventory_marker_stage && -f $container_inventory_marker_stage && ! -L $container_inventory_marker_stage ]]; then rm -f -- "$container_inventory_marker_stage"; fi
+        if [[ -n $container_inventory_stage && -d $container_inventory_stage && ! -L $container_inventory_stage ]]; then rm -f -- "$container_inventory_stage/.prepared-by-run-sh"; rmdir -- "$container_inventory_stage" 2>/dev/null || true; fi' EXIT
   if [[ ! -e $directory && ! -L $directory ]]; then
     container_inventory_stage=$(mktemp -d /var/lib/.sovagrid-container-prepare.XXXXXXXX)
     printf 'SOVAGRID_CONTAINER_PREPARED_V1\n' > "$container_inventory_stage/.prepared-by-run-sh"
@@ -955,7 +957,14 @@ container_inventory_prepare() (
   fi
   container_inventory_preflight
   if [[ ! -e $marker && ! -L $marker ]]; then
-    ( umask 077; set -o noclobber; : > "$marker" ) || die 'container inventory marker appeared during preparation'
+    container_inventory_marker_stage=$(mktemp /etc/sovagrid/.containers-marker.XXXXXXXX)
+    chown root:root "$container_inventory_marker_stage"
+    chmod 0600 "$container_inventory_marker_stage"
+    container_inventory_sync "$container_inventory_marker_stage"
+    mv -Tn -- "$container_inventory_marker_stage" "$marker"
+    [[ ! -e $container_inventory_marker_stage && ! -L $container_inventory_marker_stage ]] ||
+      die 'container inventory marker appeared during preparation'
+    container_inventory_marker_stage=
   fi
   container_inventory_preflight
   container_inventory_sync "$marker" /etc/sovagrid
