@@ -48,12 +48,19 @@ HUB_CERT = HUB_ROOT / "cert.pem"
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 AGENT_UNIT = "sovagrid-agent.service"
 BASELINE_AGENT_COMMIT = "1085a14a7c0c654a5a6ec16edd028dea1c543c8e"
-EXPECTED_TRIAL_COMPONENTS = {
-    "sovagrid-agent": "abb00bb36489814593304d8e2055779d08e67eb9",
-    "sovagrid-hub": "cfaef4855e32245941e3a57a4393f93551e511d2",
-    "sovagrid-web": "ce740bb11ff47ffb226826e31c1b5e9d6b85a0b9",
-    "sovagrid-vpn": "5ccfd083c8a2fd26413beb0a0d46393890c62b20",
-}
+EXPECTED_TRIAL_COMPONENTS = ("sovagrid-agent", "sovagrid-hub", "sovagrid-web", "sovagrid-vpn")
+
+
+def reviewed_components(manifest: dict) -> dict[str, str]:
+    expected = {name: os.environ.get(name.removeprefix("sovagrid-").upper() + "_REF", "")
+                for name in EXPECTED_TRIAL_COMPONENTS}
+    require(all(re.fullmatch(r"[0-9a-f]{40}", commit) is not None for commit in expected.values()),
+            "four exact reviewed component refs are required")
+    components = manifest.get("components") if isinstance(manifest, dict) else None
+    require(isinstance(components, dict) and all(isinstance(components.get(name), dict) and
+            components[name].get("commit") == commit for name, commit in expected.items()),
+            "candidate does not use the reviewed server component set")
+    return expected
 
 
 def require(ok: bool, reason: str) -> None:
@@ -343,12 +350,7 @@ def seed(candidate: Path, old_agent_source: Path) -> None:
     raw = (candidate / "sovagrid-bundle.json").read_bytes()
     candidate_manifest = json.loads(raw)
     manifest_sha256 = sha(raw)
-    components = candidate_manifest.get("components") if isinstance(candidate_manifest, dict) else None
-    require(isinstance(components, dict) and all(
-            isinstance(components.get(name), dict) and
-            components[name].get("commit") == commit
-            for name, commit in EXPECTED_TRIAL_COMPONENTS.items()),
-            "candidate does not use the reviewed server component set")
+    expected = reviewed_components(candidate_manifest)
     require(SHA.fullmatch(manifest_sha256) is not None and
             (candidate / "sovagrid-agent/sovagrid_agent/trial_gate.py").is_file(),
             "candidate lacks trial-capable Agent")
@@ -425,7 +427,7 @@ def seed(candidate: Path, old_agent_source: Path) -> None:
     HUB_KEY.chmod(0o600)
     HUB_CERT.chmod(0o600)
     replace_root_file(Path("/etc/sovagrid/hub-ca.pem"), HUB_CERT.read_bytes())
-    write_root_file(HUB_ROOT / "manifest.json", encode({"sha256": manifest_sha256}),
+    write_root_file(HUB_ROOT / "manifest.json", encode({"sha256": manifest_sha256, "components": expected}),
                     mode=0o600)
     config_path = Path("/etc/sovagrid/agent.json")
     server_id = str(uuid.uuid4())
@@ -533,6 +535,7 @@ def _wait_lease_expiry() -> None:
 
 def killed_at_trial(archive_sha256: str) -> None:
     planner = installed_planner()
+    verified_trial_candidate(planner, archive_sha256)
     current, old, review = _review(planner, archive_sha256)
     original = planner.recovery.Recovery.begin_trial
 
@@ -545,6 +548,16 @@ def killed_at_trial(archive_sha256: str) -> None:
     raise SystemExit("trial SIGKILL did not happen")
 
 
+def verified_trial_candidate(planner, archive_sha256):
+    candidate_root, _commits = planner.common.candidate_source(archive_sha256)
+    manifest_sha, manifest = planner._manifest(candidate_root)
+    expected = reviewed_components(manifest)
+    provenance = json.loads((HUB_ROOT / "manifest.json").read_text())
+    require(provenance == {"sha256": manifest_sha, "components": expected},
+            "reviewed components or candidate differ from seeded provenance")
+    return manifest
+
+
 def run(archive_sha256: str) -> None:
     require(SHA.fullmatch(archive_sha256) is not None, "archive SHA required")
     fixed_unit = Path("/etc/systemd/system/sovagrid-external-agent-apply@.service")
@@ -554,8 +567,7 @@ def run(archive_sha256: str) -> None:
             fixed_marker.read_bytes() == b"SOVAGRID_EXTERNAL_AGENT_APPLY_UNIT_V1\n",
             "repeat Hub-only install did not install the fixed Agent writer")
     planner = installed_planner()
-    candidate_root, _commits = planner.common.candidate_source(archive_sha256)
-    _candidate_sha, candidate_manifest = planner._manifest(candidate_root)
+    candidate_manifest = verified_trial_candidate(planner, archive_sha256)
     require(planner._normal_activation_ready(candidate_manifest),
             "candidate lacks the production trial protocol")
     old_sha, _old_manifest, _old_state = planner._external_snapshot()

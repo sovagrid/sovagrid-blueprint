@@ -21,21 +21,21 @@ on:
         required: false
         default: false
       hub_ref:
-        description: Exact Hub SHA for the signed transition component set
+        description: Exact reviewed Hub commit for the candidate
         type: string
-        required: false
+        required: true
       web_ref:
-        description: Exact Web SHA for the signed transition component set
+        description: Exact reviewed Web commit for the candidate
         type: string
-        required: false
+        required: true
       agent_ref:
-        description: Exact Agent SHA for the signed transition component set
+        description: Exact reviewed Agent commit for the candidate
         type: string
-        required: false
+        required: true
       vpn_ref:
-        description: Exact VPN SHA for the signed transition component set
+        description: Exact reviewed VPN commit for the candidate
         type: string
-        required: false
+        required: true
 
 permissions:
   contents: read
@@ -62,36 +62,66 @@ jobs:
           test "$RUNNER_OS" = Linux
           test "$(cat /proc/1/comm)" = systemd
           sudo -n install -d -o root -g root -m 0755 /opt
+          test "$GITHUB_ACTIONS" = true
+          test ! -e /var/lib/sovagrid
+          test ! -L /var/lib/sovagrid
+          sudo -n python3 - <<'PYTHON'
+          import os
+          import stat
+          for path in ("/usr/local", "/usr/local/bin", "/usr/local/libexec"):
+              try:
+                  os.mkdir(path, 0o755)
+              except FileExistsError:
+                  pass
+              fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+              try:
+                  info = os.fstat(fd)
+                  if not stat.S_ISDIR(info.st_mode):
+                      raise SystemExit("fixed fixture parent is not a directory")
+                  os.fchown(fd, 0, 0)
+                  os.fchmod(fd, 0o755)
+                  current = os.stat(path, follow_symlinks=False)
+                  if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                      raise SystemExit("fixed fixture parent changed during setup")
+              finally:
+                  os.close(fd)
+          PYTHON
           test "$(stat -c '%u:%a' /opt)" = 0:755
           sudo -n systemctl start docker
           sudo -n docker info >/dev/null
           sudo -n docker compose version
           test ! -e /opt/sovagrid-src
           test ! -e /etc/sovagrid
-      - name: Verify published server-v0.11.0 baseline bundle and build candidate
+      - name: Verify published server-v0.14.1 baseline bundle and build candidate
         env:
-          RELEASE_URL: https://github.com/sovagrid/sovagrid-blueprint/releases/download/server-v0.11.0/SovaGrid-server-source.tar.gz
+          RELEASE_URL: https://github.com/sovagrid/sovagrid-blueprint/releases/download/server-v0.14.1/SovaGrid-server-source.tar.gz
+          HUB_REF: ${{ inputs.hub_ref }}
+          WEB_REF: ${{ inputs.web_ref }}
+          AGENT_REF: ${{ inputs.agent_ref }}
+          VPN_REF: ${{ inputs.vpn_ref }}
         run: |
           curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --silent --show-error \
-            "$RELEASE_URL" -o "$RUNNER_TEMP/sovagrid-0.11.0-published.tar.gz"
+            "$RELEASE_URL" -o "$RUNNER_TEMP/sovagrid-0.14.1-published.tar.gz"
           printf '%s  %s\n' \
-            '10abb18ca39d789d3a9cc8bd04d36126f6dd624a81e48219bd814fb6a15ab766' \
-            "$RUNNER_TEMP/sovagrid-0.11.0-published.tar.gz" | sha256sum --check -
+            'c5786bb64467063196046144e665a98e347f40713facb37809b65a03eb70f347' \
+            "$RUNNER_TEMP/sovagrid-0.14.1-published.tar.gz" | sha256sum --check -
           python3 tests/hub_only_candidate.py \
-            "$RUNNER_TEMP/sovagrid-0.11.0-published.tar.gz" \
+            "$RUNNER_TEMP/sovagrid-0.14.1-published.tar.gz" \
             "$GITHUB_WORKSPACE" "$RUNNER_TEMP/sovagrid-candidate-workspace" \
             "$RUNNER_TEMP/sovagrid-candidate.tar.gz"
           mkdir "$RUNNER_TEMP/sovagrid-published-source"
-          tar -xzf "$RUNNER_TEMP/sovagrid-0.11.0-published.tar.gz" \
+          tar -xzf "$RUNNER_TEMP/sovagrid-0.14.1-published.tar.gz" \
             -C "$RUNNER_TEMP/sovagrid-published-source" --no-same-owner
+          printf '%s  %s\n' ec6f567b0292916dd3f104f1441451708a955b79d02ef91f82237a8cf8603f1f \
+            "$RUNNER_TEMP/sovagrid-published-source/sovagrid-bundle.json" | sha256sum --check -
       - name: Build an opt-in candidate from one reviewed server component set
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.external_agent_apply }}
         env:
           OLD_AGENT_COMMIT: 1085a14a7c0c654a5a6ec16edd028dea1c543c8e
-          AGENT_COMMIT: abb00bb36489814593304d8e2055779d08e67eb9
-          HUB_COMMIT: cfaef4855e32245941e3a57a4393f93551e511d2
-          WEB_COMMIT: ce740bb11ff47ffb226826e31c1b5e9d6b85a0b9
-          VPN_COMMIT: 5ccfd083c8a2fd26413beb0a0d46393890c62b20
+          AGENT_COMMIT: ${{ inputs.agent_ref }}
+          HUB_COMMIT: ${{ inputs.hub_ref }}
+          WEB_COMMIT: ${{ inputs.web_ref }}
+          VPN_COMMIT: ${{ inputs.vpn_ref }}
         run: |
           set -o pipefail
           [[ "$OLD_AGENT_COMMIT" =~ ^[0-9a-f]{40}$ ]]
@@ -121,38 +151,19 @@ jobs:
           mkdir "$RUNNER_TEMP/sovagrid-candidate-source"
           tar -xzf "$RUNNER_TEMP/sovagrid-candidate.tar.gz" \
             -C "$RUNNER_TEMP/sovagrid-candidate-source" --no-same-owner
-      - name: Select the reviewed signed-transition component set
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.signed_feed_transition }}
+      - name: Seed and pin an independent external Agent and two transport units
         env:
+          EXTERNAL_AGENT_APPLY: ${{ inputs.external_agent_apply || false }}
           HUB_REF: ${{ inputs.hub_ref }}
           WEB_REF: ${{ inputs.web_ref }}
           AGENT_REF: ${{ inputs.agent_ref }}
           VPN_REF: ${{ inputs.vpn_ref }}
-          EXTERNAL_TRIAL: ${{ inputs.external_agent_apply }}
-        run: |
-          test "$EXTERNAL_TRIAL" != true
-          while read -r repo commit; do
-            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-            git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/$repo" fetch --no-tags origin "$commit"
-            git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/$repo" checkout --quiet --detach "$commit"
-            test "$(git -C "$RUNNER_TEMP/sovagrid-candidate-workspace/$repo" rev-parse HEAD)" = "$commit"
-          done <<REFS
-          sovagrid-hub $HUB_REF
-          sovagrid-web $WEB_REF
-          sovagrid-agent $AGENT_REF
-          sovagrid-vpn $VPN_REF
-          REFS
-          python3 "$RUNNER_TEMP/sovagrid-candidate-workspace/sovagrid-blueprint/package_server.py" \
-            "$RUNNER_TEMP/sovagrid-reviewed-hub-candidate.tar.gz"
-          mv "$RUNNER_TEMP/sovagrid-reviewed-hub-candidate.tar.gz" "$RUNNER_TEMP/sovagrid-candidate.tar.gz"
-      - name: Seed and pin an independent external Agent and two transport units
-        env:
-          EXTERNAL_AGENT_APPLY: ${{ inputs.external_agent_apply || false }}
         run: |
           sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_PROMOTION_VM_FIXTURE=1 \
             python3 tests/promotion_vm.py seed "$RUNNER_TEMP/sovagrid-published-source"
           if [ "$EXTERNAL_AGENT_APPLY" = true ]; then
-            sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_EXTERNAL_APPLY_VM_FIXTURE=1 \
+            sudo env GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_EXTERNAL_APPLY_VM_FIXTURE=1 \
+              HUB_REF="$HUB_REF" WEB_REF="$WEB_REF" AGENT_REF="$AGENT_REF" VPN_REF="$VPN_REF" \
               python3 tests/integrated_external_agent_apply_vm.py seed \
               "$RUNNER_TEMP/sovagrid-candidate-source" \
               "$RUNNER_TEMP/sovagrid-old-agent-source"
@@ -161,7 +172,7 @@ jobs:
           sudo python3 "$RUNNER_TEMP/sovagrid-published-source/sovagrid-blueprint/deploy/promote_agent_only.py" \
             prepare --manifest-sha256 "$old_manifest"
           sudo install -d -o root -g root -m 0755 /opt/sovagrid-src
-          sudo tar -xzf "$RUNNER_TEMP/sovagrid-0.11.0-published.tar.gz" \
+          sudo tar -xzf "$RUNNER_TEMP/sovagrid-0.14.1-published.tar.gz" \
             -C /opt/sovagrid-src --no-same-owner
           sudo /opt/sovagrid-src/sovagrid-blueprint/run.sh --hub-only
           sudo python3 /opt/sovagrid-src/sovagrid-blueprint/deploy/promote_agent_only.py \
@@ -232,7 +243,7 @@ jobs:
           from pathlib import Path
           state = Path('/var/lib/sovagrid/release-feed-state.json')
           state.write_text(json.dumps({'format': 1, 'highest_sequence': 3,
-                                       'highest_version': '0.11.1', 'highest_issued_at': 1,
+                                       'highest_version': '0.14.1', 'highest_issued_at': 1,
                                        'last_seen_at': 1}, sort_keys=True) + '\n')
           state.chmod(0o600)
           PY
@@ -326,9 +337,15 @@ jobs:
             /root/sovagrid-signed-hub-next/source.tar.gz hub_only
       - name: Exercise external Agent apply and boot recovery on the disposable VM
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.external_agent_apply }}
+        env:
+          HUB_REF: ${{ inputs.hub_ref }}
+          WEB_REF: ${{ inputs.web_ref }}
+          AGENT_REF: ${{ inputs.agent_ref }}
+          VPN_REF: ${{ inputs.vpn_ref }}
         run: |
           candidate_sha=$(sha256sum "$RUNNER_TEMP/sovagrid-candidate.tar.gz" | cut -d ' ' -f1)
-          sudo GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_EXTERNAL_APPLY_VM_FIXTURE=1 \
+          sudo env GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted SOVAGRID_EXTERNAL_APPLY_VM_FIXTURE=1 \
+            HUB_REF="$HUB_REF" WEB_REF="$WEB_REF" AGENT_REF="$AGENT_REF" VPN_REF="$VPN_REF" \
             python3 tests/integrated_external_agent_apply_vm.py run "$candidate_sha"
       - name: Report bounded installer diagnostics from the disposable VM
         if: ${{ failure() }}

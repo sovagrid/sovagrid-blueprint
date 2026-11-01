@@ -193,6 +193,19 @@ class VmGuardTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "unknown installed code descendant"):
                     vm.initial_names("/opt/" + component, records, source)
 
+    def test_machine_properties_use_machinectl_individual_property_filters(self):
+        name = "sovagrid-ci-target-012345abcdef"
+        values = {"Name": name, "Leader": "123", "RootDirectory": "/var/lib/machines/" + name,
+                  "Service": "systemd-nspawn", "Class": "container",
+                  "Unit": "sovagrid-ci-nspawn-target-012345abcdef.service"}
+        def machinectl(*args):
+            self.assertEqual(args[:3], ("machinectl", "show", name))
+            # machinectl treats each filter as one literal property name.
+            filters = [arg.removeprefix("--property=") for arg in args[3:]]
+            return "\n".join(key + "=" + value for key, value in values.items() if key in filters)
+        with patch.object(vm, "text", side_effect=machinectl):
+            self.assertEqual(vm.guest_properties(name), values)
+
     def test_source_manifest_pin_is_known_and_all_bytes_are_checked_before_import(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

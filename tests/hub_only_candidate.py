@@ -4,7 +4,7 @@
 # Additional author attribution terms: see ATTRIBUTION.md.
 """Build a review candidate from this Blueprint and pinned current components.
 
-The published server-v0.11.0 archive is the baseline under test. The candidate
+The published server-v0.14.1 archive is the baseline under test. The candidate
 uses exact reviewed component commits with a newer Blueprint checkout.
 """
 
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -19,27 +20,27 @@ import sys
 import tarfile
 
 
-PUBLISHED_SHA256 = "10abb18ca39d789d3a9cc8bd04d36126f6dd624a81e48219bd814fb6a15ab766"
+PUBLISHED_SHA256 = "c5786bb64467063196046144e665a98e347f40713facb37809b65a03eb70f347"
 PUBLISHED_COMMITS = {
-    "sovagrid-blueprint": "aa778a8cbec811c0e7296d7a956683ee72e8bcc9",
-    "sovagrid-agent": "7b4dab289ca239266b77584a927f6976f375042c",
-    "sovagrid-hub": "f63511381c9c0fd8d8976891ed462aec9a88398e",
-    "sovagrid-vpn": "e500d5a9a97ad329c33af6a06eb1d2f17a541897",
-    "sovagrid-web": "cf126ca047f17df951ff40a5b75eb236b2939bd2",
+    "sovagrid-blueprint": "922c8e8bcc9752c090bacf3f5986765f8fa4865e",
+    "sovagrid-agent": "abb00bb36489814593304d8e2055779d08e67eb9",
+    "sovagrid-hub": "4fac7ee24201b451ecade607a2bf08e5ba7153dd",
+    "sovagrid-vpn": "5ccfd083c8a2fd26413beb0a0d46393890c62b20",
+    "sovagrid-web": "ca5db3ac6baf57318d5b02e944a1cac7f2e545bb",
 }
 
-CANDIDATE_COMMITS = {
-    "sovagrid-agent": "7b4dab289ca239266b77584a927f6976f375042c",
-    "sovagrid-hub": "ae8b2fc6075aa76b418ad202887515b78e9e63d1",
-    "sovagrid-vpn": "e500d5a9a97ad329c33af6a06eb1d2f17a541897",
-    "sovagrid-web": "eb53324c7f2ef6186ad445fb729b6687acf65595",
-}
+def candidate_commits() -> dict[str, str]:
+    commits = {"sovagrid-" + name.lower(): os.environ.get(name + "_REF", "")
+               for name in ("HUB", "WEB", "AGENT", "VPN")}
+    if any(re.fullmatch(r"[0-9a-f]{40}", value) is None for value in commits.values()):
+        raise SystemExit("Set HUB_REF, WEB_REF, AGENT_REF and VPN_REF to exact reviewed commit SHAs")
+    return commits
 
 
 def check_published(archive: Path) -> None:
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     if digest != PUBLISHED_SHA256:
-        raise SystemExit("Published server-v0.11.0 archive SHA-256 does not match the pin")
+        raise SystemExit("Published server-v0.14.1 archive SHA-256 does not match the pin")
     with tarfile.open(archive, "r:gz") as package:
         entry = package.getmember("sovagrid-bundle.json")
         if entry.size > 1024 * 1024:
@@ -47,10 +48,13 @@ def check_published(archive: Path) -> None:
         stream = package.extractfile(entry)
         if stream is None:
             raise SystemExit("Published bundle manifest is unavailable")
-        manifest = json.loads(stream.read(1024 * 1024))
+        raw = stream.read(1024 * 1024)
+        if hashlib.sha256(raw).hexdigest() != "ec6f567b0292916dd3f104f1441451708a955b79d02ef91f82237a8cf8603f1f":
+            raise SystemExit("Published server-v0.14.1 inner manifest differs from its pin")
+        manifest = json.loads(raw)
     commits = {name: item.get("commit") for name, item in manifest.get("components", {}).items()}
     if manifest.get("format") != 1 or commits != PUBLISHED_COMMITS:
-        raise SystemExit("Published server-v0.11.0 component commits differ from the approved pin")
+        raise SystemExit("Published server-v0.14.1 component commits differ from the approved pin")
 
 
 def git(*arguments: str, timeout: int = 180) -> str:
@@ -59,6 +63,7 @@ def git(*arguments: str, timeout: int = 180) -> str:
 
 def build(archive: Path, blueprint: Path, workspace: Path, output: Path) -> None:
     check_published(archive)
+    selected = candidate_commits()
     if not (blueprint / ".git").exists() or not (blueprint / "package_server.py").is_file():
         raise SystemExit("Current Blueprint must be a Git checkout")
     if git("-C", str(blueprint), "status", "--porcelain", "--untracked-files=no"):
@@ -74,7 +79,7 @@ def build(archive: Path, blueprint: Path, workspace: Path, output: Path) -> None
     git("-C", str(root), "checkout", "--quiet", "--detach", head)
     if git("-C", str(root), "rev-parse", "HEAD") != head:
         raise SystemExit("Candidate Blueprint checkout changed")
-    for name, commit in CANDIDATE_COMMITS.items():
+    for name, commit in selected.items():
         repo = workspace / name
         git("clone", "--quiet", "--", f"https://github.com/sovagrid/{name}.git", str(repo))
         git("-C", str(repo), "checkout", "--quiet", "--detach", commit)
@@ -87,10 +92,10 @@ def build(archive: Path, blueprint: Path, workspace: Path, output: Path) -> None
             raise SystemExit("Candidate bundle manifest is unavailable")
         built = json.loads(stream.read(1024 * 1024))
     commits = {name: item.get("commit") for name, item in built["components"].items()}
-    expected = CANDIDATE_COMMITS | {"sovagrid-blueprint": head}
+    expected = selected | {"sovagrid-blueprint": head}
     if commits != expected:
         raise SystemExit("Candidate bundle component commits are incorrect")
-    print(f"Candidate Blueprint {head}; published server-v0.11.0 baseline and current component pins verified; "
+    print(f"Candidate Blueprint {head}; published server-v0.14.1 baseline and current component pins verified; "
           f"candidate bundle SHA-256 {hashlib.sha256(output.read_bytes()).hexdigest()}")
 
 

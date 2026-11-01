@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import os
 import re
+import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
@@ -19,6 +22,33 @@ else:
 
 
 class FixtureContractTests(unittest.TestCase):
+    def test_trial_components_require_explicit_exact_refs_and_sealed_provenance(self):
+        expected = {name: chr(ord('a') + index) * 40
+                    for index, name in enumerate(fixture.EXPECTED_TRIAL_COMPONENTS)}
+        env = {name.removeprefix('sovagrid-').upper() + '_REF': commit for name, commit in expected.items()}
+        manifest = {'components': {name: {'commit': commit} for name, commit in expected.items()}}
+        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(SystemExit, 'four exact'):
+            fixture.reviewed_components(manifest)
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(fixture.reviewed_components(manifest), expected)
+            with mock.patch.dict(os.environ, {'WEB_REF': 'main'}), self.assertRaises(SystemExit):
+                fixture.reviewed_components(manifest)
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                record = root / 'manifest.json'
+                digest = 'f' * 64
+                record.write_text(json.dumps({'sha256': digest, 'components': expected}))
+                planner = SimpleNamespace(common=SimpleNamespace(candidate_source=lambda _sha: (root, {})),
+                    _manifest=lambda _root: (digest, manifest))
+                with mock.patch.object(fixture, 'HUB_ROOT', root):
+                    self.assertEqual(fixture.verified_trial_candidate(planner, 'e' * 64), manifest)
+                    record.write_text(json.dumps({'sha256': '0' * 64, 'components': expected}))
+                    with self.assertRaisesRegex(SystemExit, 'provenance'):
+                        fixture.verified_trial_candidate(planner, 'e' * 64)
+            changed = {'components': {**manifest['components'], 'sovagrid-web': {'commit': '0' * 40}}}
+            with self.assertRaisesRegex(SystemExit, 'reviewed server component'):
+                fixture.reviewed_components(changed)
+
     def test_lease_answers_match_production_parser(self):
         import importlib.util
 
@@ -78,10 +108,11 @@ class FixtureContractTests(unittest.TestCase):
                       workflow)
         self.assertIn(f"OLD_AGENT_COMMIT: {fixture.BASELINE_AGENT_COMMIT}", workflow)
         self.assertIn('"$RUNNER_TEMP/sovagrid-old-agent-source"', workflow)
-        for component, commit in fixture.EXPECTED_TRIAL_COMPONENTS.items():
+        for component in fixture.EXPECTED_TRIAL_COMPONENTS:
             label = component.removeprefix("sovagrid-").upper() + "_COMMIT"
             with self.subTest(component=component):
-                self.assertIn(f"{label}: {commit}", workflow)
+                ref = component.removeprefix("sovagrid-") + "_ref"
+                self.assertIn(f"{label}: ${{{{ inputs.{ref} }}}}", workflow)
         self.assertLess(workflow.index("Stage and preflight the exact candidate"),
                         workflow.index("Exercise external Agent apply and boot recovery"))
 

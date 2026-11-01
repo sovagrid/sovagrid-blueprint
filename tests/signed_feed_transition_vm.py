@@ -37,6 +37,7 @@ sys.dont_write_bytecode = True
 SOURCE = Path("/opt/sovagrid-src/sovagrid-blueprint/deploy")
 CONFIG = Path("/etc/sovagrid/release-feed.json")
 KEY = "disposable-vm-key"
+LEGACY_FULL_MANIFEST = "ec6f567b0292916dd3f104f1441451708a955b79d02ef91f82237a8cf8603f1f"
 
 
 def need(condition: bool, reason: str) -> None:
@@ -170,7 +171,18 @@ def sandbox_arm(feed, automatic, release, current, layout):
     need(result.returncode == 0 and expected in result.stdout.splitlines(), "arm failed inside broker sandbox")
 
 
-def run(filename: str, layout: str = "full") -> None:
+def transition_current(feed, layout, *, legacy_full=False):
+    if legacy_full:
+        need(layout == "full", "legacy API is allowed only for the pinned full baseline")
+        current = feed.current_manifest()
+        need(current == LEGACY_FULL_MANIFEST, "legacy full baseline is not published 0.14.1")
+        need(not os.path.lexists("/var/lib/.sovagrid-portable-restore-ci-fixture.json"),
+             "legacy transition cannot adopt a portable-restore provenance ledger")
+        return current
+    return feed.current_manifest(layout)
+
+
+def run(filename: str, layout: str = "full", *, legacy_full=False) -> None:
     need(os.geteuid() == 0 and os.environ.get("GITHUB_ACTIONS") == "true" and
          os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted" and
          os.environ.get("RUNNER_OS") == "Linux" and
@@ -183,7 +195,7 @@ def run(filename: str, layout: str = "full") -> None:
     worker = load("sovagrid_vm_transition_worker", "hub_only_update.py" if layout == "hub_only" else "remote_update_worker.py")
     need(not CONFIG.exists() and not CONFIG.is_symlink() and not feed.existing_policy(),
          "the disposable install must have no existing subscription or approval")
-    current = feed.current_manifest(layout)
+    current = transition_current(feed, layout, legacy_full=legacy_full)
     external = worker.promotion.capture_external() if layout == "hub_only" else None
     external_runtime = worker._external_runtime() if layout == "hub_only" else None
     if layout == "hub_only": probe_broker_api()
@@ -198,7 +210,7 @@ def run(filename: str, layout: str = "full") -> None:
     candidate_hash = hashlib.sha256(archive).hexdigest()
     candidate = feed.CANDIDATES / candidate_hash
     need(not candidate.exists() and not candidate.is_symlink(), "candidate was already staged")
-    if layout == "full":
+    if layout == "full" and not legacy_full:
         portable_fixture("begin", current, target, candidate_hash)
 
     with tempfile.TemporaryDirectory(prefix=".sovagrid-signed-transition-", dir="/root") as directory:
@@ -302,11 +314,12 @@ def run(filename: str, layout: str = "full") -> None:
         need(worker.promotion.capture_external() == external, "external Agent or SSH transport files changed")
         need(worker._external_runtime() == external_runtime, "external Agent or SSH transport processes changed")
         need(not Path("/etc/sovagrid/auto-update.json").exists(), "full-server approval appeared on Hub-only host")
-    else:
+    elif not legacy_full:
         portable_fixture("complete", current, target, candidate_hash)
     print("Signed discovery, corrupt-signature refusal, busy deferral and real idle apply passed for " + layout)
 
 
 if __name__ == "__main__":
-    need(len(sys.argv) in (2, 3), "provide a reviewed next server archive and optional full|hub_only layout")
-    run(sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else "full")
+    need(len(sys.argv) in (2, 3, 4), "provide archive, optional full|hub_only layout and optional legacy-full mode")
+    need(len(sys.argv) != 4 or sys.argv[3] == "legacy-full", "unknown transition mode")
+    run(sys.argv[1], sys.argv[2] if len(sys.argv) >= 3 else "full", legacy_full=len(sys.argv) == 4)

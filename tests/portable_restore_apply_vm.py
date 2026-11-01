@@ -272,6 +272,13 @@ def process_identity(pid):
             "cmdline": (root / "cmdline").read_bytes().split(b"\0")[:-1]}
 
 
+def guest_properties(name):
+    # machinectl accepts one property per option, unlike systemctl's comma list.
+    selected = ("Name", "Leader", "RootDirectory", "Service", "Class", "Unit")
+    return dict(line.split("=", 1) for line in text("machinectl", "show", name,
+        *("--property=" + key for key in selected)).splitlines() if "=" in line)
+
+
 def guest_identity(name, state):
     suffix = re.fullmatch(r"sovagrid-ci-target-([0-9a-f]{12})", state.get("container", ""))
     need(suffix and name in (state["container"], "sovagrid-ci-web-target-" + suffix[1]) and
@@ -283,8 +290,7 @@ def guest_identity(name, state):
     need((root / "root/.ssh/authorized_keys").read_text() == state["auth_line"] + "\n", "guest fixture key changed")
     machine_id = (root / "etc/machine-id").read_text().strip()
     need(re.fullmatch(r"[0-9a-f]{32}", machine_id), "guest machine identity changed")
-    properties = dict(line.split("=", 1) for line in text("machinectl", "show", name,
-        "--property=Name,Leader,RootDirectory,Service,Class,Unit").splitlines() if "=" in line)
+    properties = guest_properties(name)
     unit = "sovagrid-ci-nspawn-" + name.removeprefix("sovagrid-ci-") + ".service"
     need(properties.get("Name") == name and properties.get("RootDirectory") == str(root) and
          properties.get("Service") == "systemd-nspawn" and properties.get("Class") == "container" and
