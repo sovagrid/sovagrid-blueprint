@@ -4,6 +4,7 @@
 """A destructive VM helper must reject a developer/private host before reads."""
 
 import importlib.util
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import hashlib
@@ -14,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from deploy import portable_restore_apply as core
+from deploy import portable_restore_receiver as receiver
 
 
 spec = importlib.util.spec_from_file_location("portable_restore_vm_guard_fixture",
@@ -24,6 +26,82 @@ fixture = vm.fixture_module()
 
 
 class VmGuardTest(unittest.TestCase):
+    @contextmanager
+    def public_inputs_fixture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = "d" * 32
+            host = root / "var/lib/sovagrid-host-backups"
+            images = root / "var/lib/sovagrid-host-image-exports" / identity
+            host.mkdir(parents=True, mode=0o700)
+            images.mkdir(parents=True, mode=0o700)
+            images.parent.chmod(0o700)
+            originals = {"host_manifest": host / (identity + ".manifest.json"),
+                         "host": host / (identity + ".tar.gz"),
+                         "images_manifest": images / "manifest.json", "images": images / "images.tar",
+                         "receipt": images / "receipt.json"}
+            for part, path in originals.items():
+                path.write_bytes(part.encode() + b"\x00\xff\n")
+                path.chmod(0o600)
+            exporter = SimpleNamespace(verify=lambda *args, **kwargs: {
+                "receipt": {"protocol": "sovagrid-portable-host-receipt-v2"}})
+            restore = SimpleNamespace(_sibling=lambda *args: exporter)
+            mappings = {"/var/lib/sovagrid-host-backups": host,
+                        "/var/lib/sovagrid-host-image-exports": images.parent}
+            def mapped(value):
+                return mappings.get(str(value), Path(value))
+            with (patch.object(vm, "Path", side_effect=mapped),
+                  patch.object(receiver, "_safe_open", side_effect=lambda path, **kwargs:
+                      os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)),
+                  patch.object(receiver, "UID", os.getuid()), patch.object(receiver, "GID", os.getgid())):
+                yield root, identity, host, images, originals, restore, exporter
+
+    def test_public_inputs_preserve_all_five_originals_and_hold_verified_descriptors(self):
+        with self.public_inputs_fixture() as (root, identity, host, images, paths, restore, _exporter):
+            expected = {part: path.read_bytes() for part, path in paths.items()}
+            before = {part: (path.stat().st_dev, path.stat().st_ino) for part, path in paths.items()}
+            with vm.public_restore_inputs(restore, receiver, identity) as (files, artifacts, fingerprints):
+                self.assertEqual(set(files), set(expected))
+                self.assertTrue(all(not path.exists() for path in paths.values()))
+                for part, fd in files.items():
+                    info = os.fstat(fd)
+                    self.assertEqual((info.st_dev, info.st_ino), before[part])
+                    self.assertEqual(os.pread(fd, info.st_size, 0), expected[part])
+                    self.assertEqual(artifacts[part], {"bytes": len(expected[part]),
+                        "sha256": hashlib.sha256(expected[part]).hexdigest()})
+                    self.assertEqual(receiver._fingerprint(info), fingerprints[part])
+            private, = (root / "var/lib").glob(".sovagrid-public-restore-ci-*")
+            self.assertEqual({str(path.relative_to(private)): path.read_bytes()
+                for path in private.rglob("*") if path.is_file()}, {
+                    "host_manifest": expected["host_manifest"], "host": expected["host"],
+                    "images/manifest.json": expected["images_manifest"],
+                    "images/images.tar": expected["images"], "images/receipt.json": expected["receipt"]})
+            self.assertEqual(list(host.iterdir()), [])
+            self.assertFalse(images.exists())
+
+    def test_public_input_quarantine_refuses_foreign_image_descendants_without_moving_anything(self):
+        with self.public_inputs_fixture() as (root, identity, _host, images, paths, restore, _exporter):
+            foreign = images / "foreign-data"
+            foreign.write_bytes(b"preserve")
+            with self.assertRaisesRegex(RuntimeError, "foreign descendants"):
+                with vm.public_restore_inputs(restore, receiver, identity):
+                    self.fail("foreign input was adopted")
+            self.assertTrue(all(path.exists() for path in paths.values()))
+            self.assertEqual(foreign.read_bytes(), b"preserve")
+            self.assertEqual(list((root / "var/lib").glob(".sovagrid-public-restore-ci-*")), [])
+
+    def test_public_input_changed_after_full_verification_is_preserved_and_never_renamed(self):
+        with self.public_inputs_fixture() as (_root, identity, _host, _images, paths, restore, exporter):
+            def changed(*args, **kwargs):
+                paths["host_manifest"].write_bytes(b"changed-after-verify")
+                return {"receipt": {"protocol": "sovagrid-portable-host-receipt-v2"}}
+            exporter.verify = changed
+            with self.assertRaisesRegex(RuntimeError, "changed before rename"):
+                with vm.public_restore_inputs(restore, receiver, identity):
+                    self.fail("changed input was adopted")
+            self.assertTrue(all(path.exists() for path in paths.values()))
+            self.assertEqual(paths["host_manifest"].read_bytes(), b"changed-after-verify")
+
     def test_vm_preview_and_child_use_same_enabled_core_without_changing_production_gate(self):
         base = {"apply_review_sha256": "a" * 64}
         resources = {"bindings": {"resource_manifest_sha256": "b" * 64}}
@@ -53,16 +131,19 @@ class VmGuardTest(unittest.TestCase):
             self.assertEqual(verify.call_count, 2)
             self.assertEqual(api.call_count, 2)
 
-    def test_vm_enable_refuses_unverified_bytes_or_an_already_open_production_gate(self):
+    def test_vm_enable_refuses_unverified_bytes_and_retains_an_open_production_gate(self):
         with (patch.object(vm, "guard"), patch.object(vm, "verified_bundle", side_effect=RuntimeError("pin mismatch")),
               patch.object(vm, "api") as api):
             with self.assertRaisesRegex(RuntimeError, "pin mismatch"):
                 with vm.enabled_vm_api(Path("/unused")): self.fail("unverified API enabled")
             api.assert_not_called()
         with (patch.object(vm, "guard"), patch.object(vm, "verified_bundle"),
-              patch.object(vm, "api", return_value=(None, core, None)), patch.object(core, "APPLY_ENABLED", True)):
-            with self.assertRaisesRegex(RuntimeError, "production apply gate must remain disabled"):
-                with vm.enabled_vm_api(Path("/unused")): self.fail("production gate accepted")
+              patch.object(vm, "api", return_value=(SimpleNamespace(_sibling=lambda *args: None), core, None)),
+              patch.object(core, "APPLY_ENABLED", True)):
+            with vm.enabled_vm_api(Path("/unused")) as (_restore, bound, _runtime):
+                self.assertIs(bound, core)
+                self.assertIs(core.APPLY_ENABLED, True)
+            self.assertIs(core.APPLY_ENABLED, True)
 
     def test_same_byte_unit_and_external_template_replacements_refuse_before_cleanup(self):
         for name in ("sovagrid-agent.service", "sovagrid-external-agent-apply@.service"):
@@ -197,7 +278,7 @@ class VmGuardTest(unittest.TestCase):
         name = "sovagrid-ci-target-012345abcdef"
         values = {"Name": name, "Leader": "123", "RootDirectory": "/var/lib/machines/" + name,
                   "Service": "systemd-nspawn", "Class": "container",
-                  "Unit": "sovagrid-ci-nspawn-target-012345abcdef.service"}
+                  "Unit": "sg-ci-nspawn-target-012345abcdef.service"}
         def machinectl(*args):
             self.assertEqual(args[:3], ("machinectl", "show", name))
             # machinectl treats each filter as one literal property name.

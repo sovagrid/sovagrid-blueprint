@@ -11,8 +11,9 @@ case intentionally retains recovery_required and its fence after a real Hub
 database write; no later backend checks may run on that VM.
 
 No production code bytes, release signatures, public addresses or accounts are
-changed. The disabled public apply flag is enabled only in the child process's
-memory so the actual CLI/adapter can be tested before its production gate opens.
+changed. Before public enablement the apply flag is enabled only in the child
+process's memory. Once the pinned release enables it, the positive case uses
+the public receiver and a detached systemd worker without changing the flag.
 """
 
 from __future__ import annotations
@@ -128,11 +129,11 @@ def api(bundle):
 
 @contextlib.contextmanager
 def enabled_vm_api(bundle):
-    """One verified, memory-only core binding for VM preview and apply."""
+    """One verified core binding, retaining the release's real public gate."""
     guard()
     verified_bundle(bundle)  # Hash original production bytes before importing.
     restore, core, runtime = api(bundle)
-    need(core.APPLY_ENABLED is False, "the production apply gate must remain disabled")
+    need(type(core.APPLY_ENABLED) is bool, "invalid production apply capability")
     real_sibling = restore._sibling
 
     def sibling(filename, name):
@@ -291,7 +292,7 @@ def guest_identity(name, state):
     machine_id = (root / "etc/machine-id").read_text().strip()
     need(re.fullmatch(r"[0-9a-f]{32}", machine_id), "guest machine identity changed")
     properties = guest_properties(name)
-    unit = "sovagrid-ci-nspawn-" + name.removeprefix("sovagrid-ci-") + ".service"
+    unit = "sg-ci-nspawn-" + name.removeprefix("sovagrid-ci-") + ".service"
     need(properties.get("Name") == name and properties.get("RootDirectory") == str(root) and
          properties.get("Service") == "systemd-nspawn" and properties.get("Class") == "container" and
          properties.get("Unit") == unit and properties.get("Leader", "").isdecimal(), "foreign registered guest")
@@ -500,7 +501,7 @@ def stop_ci_guests_and_retag(bundle):
         if name is None:
             continue
         need(re.fullmatch(r"sovagrid-ci-(?:web-)?target-[0-9a-f]{12}", name) is not None, "unknown guest machine")
-        unit = "sovagrid-ci-nspawn-" + name.removeprefix("sovagrid-ci-") + ".service"
+        unit = "sg-ci-nspawn-" + name.removeprefix("sovagrid-ci-") + ".service"
         need(guest_identity(name, state) == provenance["guests"][name], "guest identity changed before poweroff")
         command("machinectl", "poweroff", name, accepted=(0, 1))
         command("systemctl", "stop", unit, accepted=(0, 5))
@@ -753,6 +754,178 @@ def uninstall(bundle, identity, receipt, *, restore_id=None):
             command("/usr/sbin/groupdel", name)
         command("systemctl", "daemon-reload")
     print("PORTABLE_RESTORE_VM_TARGET_CLEANED", flush=True)
+
+
+@contextlib.contextmanager
+def public_restore_inputs(restore, receiver, identity):
+    """Retain only the five exact producer files while receiver republishes them.
+
+    The real source and destination share this disposable VM. Production
+    refuses to adopt an existing destination, so quarantine the immutable
+    inputs on the same filesystem without deleting or repairing any entry.
+    Every source FD remains held through transfer and every original byte
+    remains in the private quarantine, including after a failed RPC.
+    """
+    need(re.fullmatch(r"[0-9a-f]{32}", identity), "invalid public restore archive")
+    host = Path("/var/lib/sovagrid-host-backups")
+    images = Path("/var/lib/sovagrid-host-image-exports") / identity
+    paths = {"host_manifest": host / (identity + ".manifest.json"),
+             "host": host / (identity + ".tar.gz"),
+             "images_manifest": images / "manifest.json", "images": images / "images.tar",
+             "receipt": images / "receipt.json"}
+    with contextlib.ExitStack() as held:
+        folders = {}
+        for folder in (host, images.parent, images):
+            fd = receiver._safe_open(folder, directory=True)
+            held.callback(os.close, fd)
+            receiver._private(os.fstat(fd), directory=True)
+            folders[folder] = fd
+        need(set(os.listdir(folders[images])) == {"manifest.json", "images.tar", "receipt.json"},
+             "public snapshot image directory has foreign descendants")
+        descriptors, metadata, before = {}, {}, {}
+        for part, path in paths.items():
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=folders[path.parent])
+            held.callback(os.close, fd)
+            info = os.fstat(fd)
+            receiver._private(info)
+            need(0 < info.st_size <= receiver.MAX_PARTS[part], "invalid public snapshot part size")
+            digest = receiver._hash_fd(fd, info.st_size)
+            need(receiver._fingerprint(os.fstat(fd)) == receiver._fingerprint(info) and
+                 receiver._fingerprint(os.stat(path.name, dir_fd=folders[path.parent], follow_symlinks=False)) ==
+                 receiver._fingerprint(info), "public snapshot changed before quarantine")
+            descriptors[part], before[part] = fd, info
+            metadata[part] = {"bytes": info.st_size, "sha256": digest}
+        exporter = restore._sibling("host_image_export.py", "sovagrid_ci_public_image_verifier")
+        need(exporter.verify(identity, require_receipt=True)["receipt"]["protocol"] ==
+             "sovagrid-portable-host-receipt-v2", "public snapshot receipt is not verified v2")
+        sealed = fixture_module().inventory(images)
+        private = Path(tempfile.mkdtemp(prefix=".sovagrid-public-restore-ci-", dir=host.parent))
+        private.chmod(0o700)
+        parent = os.open(private, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        held.callback(os.close, parent)
+        private_info = os.fstat(parent)
+        receiver._private(private_info, directory=True)
+        need(all(os.fstat(fd).st_dev == private_info.st_dev for fd in folders.values()),
+             "public snapshot quarantine must share its source filesystem")
+        for part in ("host_manifest", "host"):
+            path, info = paths[part], before[part]
+            need(receiver._fingerprint(os.stat(path.name, dir_fd=folders[host], follow_symlinks=False)) ==
+                 receiver._fingerprint(info), "public snapshot changed before rename")
+            os.rename(path.name, part, src_dir_fd=folders[host], dst_dir_fd=parent)
+            moved = os.stat(part, dir_fd=parent, follow_symlinks=False)
+            need((moved.st_dev, moved.st_ino) == (info.st_dev, info.st_ino),
+                 "public snapshot quarantine inode changed")
+        image_info = os.fstat(folders[images])
+        need(fixture_module().inventory(images) == sealed and
+             (images.stat().st_dev, images.stat().st_ino) == (image_info.st_dev, image_info.st_ino),
+             "public image snapshot changed before rename")
+        os.rename(identity, "images", src_dir_fd=folders[images.parent], dst_dir_fd=parent)
+        moved = os.stat("images", dir_fd=parent, follow_symlinks=False)
+        need((moved.st_dev, moved.st_ino) == (image_info.st_dev, image_info.st_ino) and
+             fixture_module().inventory(private / "images") == sealed,
+             "public image snapshot quarantine changed")
+        for fd in (folders[host], folders[images.parent], parent):
+            os.fsync(fd)
+        # rename may update ctime; content, owner, mode and the exact inode must
+        # remain those just verified from the producer. Hold this new stable
+        # fingerprint for every bounded transfer read.
+        fingerprints = {}
+        for part, fd in descriptors.items():
+            info = os.fstat(fd)
+            receiver._private(info)
+            need((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) ==
+                 (before[part].st_dev, before[part].st_ino, before[part].st_size, before[part].st_mtime_ns) and
+                 receiver._hash_fd(fd, info.st_size) == metadata[part]["sha256"] and
+                 receiver._fingerprint(os.fstat(fd)) == receiver._fingerprint(info),
+                 "public snapshot quarantine bytes changed")
+            fingerprints[part] = receiver._fingerprint(os.fstat(fd))
+        yield descriptors, metadata, fingerprints
+
+
+def run_public_restore(bundle, identity):
+    """Real public bootstrap, framing, registration and detached apply once."""
+    guard()
+    expected = verified_bundle(bundle)
+    restore, core, _runtime = api(bundle)
+    need(core.APPLY_ENABLED is True, "public restore requires the pinned enabled release")
+    archive = Path("/root/sovagrid-signed-next/source.tar.gz")
+    with os.fdopen(os.open(archive, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == info.st_gid == 0 and
+             stat.S_IMODE(info.st_mode) == 0o600 and 0 < info.st_size <= 64 * 1024**2,
+             "public runner archive is not private and bounded")
+        fixture_module().archive_pin(archive, expected)
+        need(core._fingerprint(archive.lstat()) == core._fingerprint(info), "public runner archive was replaced")
+        raw = stream.read(64 * 1024**2 + 1)
+        need(len(raw) == info.st_size and core._fingerprint(os.fstat(stream.fileno())) == core._fingerprint(info),
+             "public runner archive changed")
+    spec = importlib.util.spec_from_file_location("sovagrid_ci_public_rpc",
+        bundle / "sovagrid-blueprint/tests/portable_restore_bootstrap_vm.py")
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    operation, archive_sha = uuid.uuid4().hex, hashlib.sha256(raw).hexdigest()
+    script = (bundle / "sovagrid-blueprint/deploy/portable_restore_bootstrap.sh").read_text()
+    reply = smoke.command(["/bin/bash", "-c", script, "--", operation, str(len(raw)), archive_sha, expected],
+                          raw, timeout=900)
+    need(reply == [{"ok": True, "protocol": smoke.PROTOCOL, "operation_id": operation,
+                   "runner_archive_sha256": archive_sha, "runner_manifest_sha256": expected,
+                   "dependencies_ready": True}], "public bootstrap pins are not exact")
+    work = Path("/root/.sovagrid-restore") / operation
+    receiver = load(bundle, "portable_restore_receiver.py", "sovagrid_ci_public_receiver")
+    args = ["/usr/bin/python3", "-B", "-I",
+            str(work / "runner/sovagrid-blueprint/deploy/portable_restore_receiver.py"), "serve", operation]
+
+    def rpc(frame, payload=b"", timeout=180):
+        values = smoke.command(args, smoke.canonical(frame) + payload, timeout=timeout)
+        need(len(values) == 1 and values[0].get("operation_id") == operation, "public RPC operation changed")
+        return values[0]
+
+    with public_restore_inputs(restore, receiver, identity) as (files, artifacts, fingerprints):
+        request = {"protocol": smoke.PROTOCOL, "operation_id": operation, "archive_id": identity,
+                   "runner_archive_sha256": archive_sha, "runner_manifest_sha256": expected, "artifacts": artifacts}
+        rpc({"action": "init", "request": request})
+        for part, fd in files.items():
+            offset = 0
+            while offset < artifacts[part]["bytes"]:
+                need(receiver._fingerprint(os.fstat(fd)) == fingerprints[part], "public input changed during upload")
+                data = os.pread(fd, min(receiver.MAX_CHUNK, artifacts[part]["bytes"] - offset), offset)
+                need(bool(data), "public input ended before its declared size")
+                rpc({"action": "receive", "part": part, "offset": offset, "length": len(data),
+                     "sha256": hashlib.sha256(data).hexdigest()}, data)
+                offset += len(data)
+            need(receiver._fingerprint(os.fstat(fd)) == fingerprints[part], "public input changed after upload")
+        need(rpc({"action": "register"})["registered"] is True, "public receiver did not register the complete pair")
+    preview = rpc({"action": "preview"})
+    need(preview["backend_supported"] is True and preview["apply_available"] is True and
+         preview["blockers"] == [] and SHA.fullmatch(preview.get("apply_review_sha256", "")),
+         "public restore preview is not available")
+    start = {"action": "start", "apply_review_sha256": preview["apply_review_sha256"]}
+    need(rpc(start)["phase"] == "accepted", "public restore start was not accepted")
+    original = private_json(work / "target-operation.json", maximum=16384)
+    # Every rpc() starts and closes a different receiver process. Poll after
+    # the first disconnect, then replay a potentially lost start ACK using the
+    # exact original CAS. Neither reconnect may replace the durable worker.
+    rpc({"action": "operation-status"})
+    rpc(start)
+    deadline = time.monotonic() + 1800
+    while True:
+        current = rpc({"action": "operation-status"})
+        control = private_json(work / "target-operation.json", maximum=16384)
+        need(all(control[key] == original[key] for key in ("worker_nonce", "unit", "apply_review_sha256")),
+             "public reconnect launched another worker")
+        need(current["error"] is None and current["phase"] not in ("failed", "rolled_back", "recovery_required"),
+             "public restore worker failed")
+        if current["phase"] == "committed" and current["worker_active"] is False:
+            break
+        need(time.monotonic() < deadline, "public detached restore did not finish")
+        time.sleep(1)
+    need(rpc(start)["phase"] == "committed" and
+         private_json(work / "target-operation.json", maximum=16384)["worker_nonce"] == original["worker_nonce"],
+         "public delayed acknowledgement replayed a completed apply")
+    need(core.host_status(restore, identity)["phase"] == "committed" and not core.FENCE.exists(),
+         "public restore did not commit without its fence")
+    print("PORTABLE_RESTORE_VM_PUBLIC_DETACHED_APPLY_AND_RECONNECT_PASSED", flush=True)
 
 
 def stage(bundle, identity):
@@ -1067,9 +1240,12 @@ def run():
         need(restore.portable_clean_plan(snapshots[1][0])["target_empty"], "recovery left target resources")
         print("PORTABLE_RESTORE_VM_REAL_PROCESS_EXIT_RECOVERED", flush=True)
         second, receipt = snapshots[1]
-        review = stage(bundle, second)
         started = int(time.time())
-        run_child(bundle, second, review, "success")
+        if core.APPLY_ENABLED:
+            run_public_restore(bundle, second)
+        else:
+            review = stage(bundle, second)
+            run_child(bundle, second, review, "success")
         record_restored(bundle, second)
         verify_queue_sentinel(restored=True)
         verify_live(bundle, started)

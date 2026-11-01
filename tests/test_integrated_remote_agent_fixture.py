@@ -26,8 +26,8 @@ class BrowserRequestTests(unittest.TestCase):
         web = "sovagrid-ci-web-target-012345abcdef"
         self.assertEqual(fixture.machine_root(target), Path("/var/lib/machines") / target)
         self.assertEqual(fixture.machine_root(web), Path("/var/lib/machines") / web)
-        self.assertEqual(fixture.machine_unit(target), "sovagrid-ci-nspawn-target-012345abcdef.service")
-        self.assertEqual(fixture.machine_unit(web), "sovagrid-ci-nspawn-web-target-012345abcdef.service")
+        self.assertEqual(fixture.machine_unit(target), "sg-ci-nspawn-target-012345abcdef.service")
+        self.assertEqual(fixture.machine_unit(web), "sg-ci-nspawn-web-target-012345abcdef.service")
         self.assertNotEqual(fixture.CONNECT_PORT, fixture.WEB_PORT)
         for name in ("sovagrid-ci-target-../../etc", "sovagrid-ci-target-012345abcdef/else",
                      "sovagrid-ci-target-untrusted", "sovagrid-ci-other-012345abcdef"):

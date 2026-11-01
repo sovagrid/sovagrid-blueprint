@@ -74,7 +74,7 @@ def machine_root(name: str) -> Path:
 
 def machine_unit(name: str) -> str:
     machine_root(name)
-    return "sovagrid-ci-nspawn-" + name.removeprefix("sovagrid-ci-") + ".service"
+    return "sg-ci-nspawn-" + name.removeprefix("sovagrid-ci-") + ".service"
 
 
 def portable_fixture(action, *args):
