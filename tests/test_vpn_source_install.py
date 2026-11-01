@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -29,6 +31,28 @@ class SourceInstallTests(unittest.TestCase):
     def _install(self):
         preview = self.installer.preview("a" * 64, self.source, self.package)
         return self.installer.apply("a" * 64, self.source, self.package, preview["expected"])
+
+    def test_isolated_rpc_imports_leave_the_staged_verifier_byte_clean(self):
+        deploy = Path(__file__).resolve().parents[1] / "deploy"
+        staged_verifier = self.root / "remote_agent.py"
+        shutil.copyfile(deploy / "remote_agent.py", staged_verifier)
+        script = '''import importlib.util,pathlib,runpy,sys
+assert sys.flags.isolated and sys.dont_write_bytecode is False
+runpy.run_path(sys.argv[1],run_name='vpn_source_import_probe')
+spec=importlib.util.spec_from_file_location('staged_remote_agent_probe',sys.argv[2])
+module=importlib.util.module_from_spec(spec)
+sys.modules[spec.name]=module
+spec.loader.exec_module(module)
+assert not list(pathlib.Path(sys.argv[2]).parent.rglob('__pycache__'))
+print('staged-verifier-byte-clean')
+'''
+        result = subprocess.run([sys.executable, "-I", "-c", script,
+            str(deploy / "vpn_source_install.py"), str(staged_verifier)],
+            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+            capture_output=True, timeout=15, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertEqual(result.stdout, b"staged-verifier-byte-clean\n")
+        self.assertEqual(list(self.root.rglob("*.pyc")), [])
 
     def test_first_install_is_idempotent_and_keeps_two_trees_equal(self):
         preview = self.installer.preview("a" * 64, self.source, self.package)

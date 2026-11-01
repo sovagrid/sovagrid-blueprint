@@ -29,6 +29,11 @@ import subprocess
 import uuid
 
 
+# RPC invokes this helper with Python -I, which ignores the environment's
+# PYTHONDONTWRITEBYTECODE. Its dynamic verifier imports must not add files to
+# the staged, hash-checked source tree or make subsequent cleanup refuse it.
+sys.dont_write_bytecode = True
+
 PROTOCOL = 1
 MAX_RPC = 32768
 MAX_FILE = 32 * 1024 * 1024

@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Jigokuraku01
 # Additional author attribution terms: see ATTRIBUTION.md.
-"""Validation and private staging for SovaGrid host archives.
+"""Inspect, stage and control restoration of SovaGrid host archives.
 
 Staging writes only to a private directory and never installs files or starts
-services. Writer fencing, durable recovery, and rollback remain prerequisites
-to a future apply transaction.
+services. Portable apply uses a separately confirmed transaction with writer
+fencing, a durable journal, recovery and rollback, when the runner enables it.
 """
 
 from __future__ import annotations

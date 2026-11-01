@@ -382,5 +382,175 @@ class VmGuardTest(unittest.TestCase):
                 vm.guard()
 
 
+class SnapshotRetryTest(unittest.TestCase):
+    @contextmanager
+    def snapshot_fixture(self, outcomes, *, foreign=False, worker_states=None, lock_busy=False):
+        class Refused(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".lock").write_bytes(b"")
+            (root / ".lock").chmod(0o600)
+            provenance = {"trees": {str(root): fixture.inventory(root)}}
+            manifest, identity = "a" * 64, "c" * 32
+            receipt = {"protocol": "sovagrid-portable-host-receipt-v2",
+                       "source_manifest_sha256": manifest,
+                       "unit_states": {"sovagrid-agent.service": {"enablement": "enabled"}}}
+            calls, events, pending = [], [], {}
+            clock = [0]
+            busy = [lock_busy]
+            states = iter(worker_states or ())
+
+            @contextmanager
+            def lock(name):
+                events.append(name)
+                if name == "global" and busy[0]:
+                    busy[0] = False
+                    raise Refused("BUSY")
+                yield
+
+            def record(request, phase_name, error_name=None, **overrides):
+                value = {"protocol": "sovagrid-host-backup-operation-v1", "request_id": request,
+                         "phase": phase_name, "created_at": "2026-11-01T00:00:00Z",
+                         "updated_at": "2026-11-01T00:00:01Z", "expected_manifest_sha256": manifest,
+                         "layout": "full", "active_units": [], "running_containers": ["hub", "web"],
+                         "container_ids": {}, "unit_hashes": {}, "archive_id": identity,
+                         "archive": {"id": identity} if phase_name == "complete" else None,
+                         "error": error_name, "portable_images": {}, "unit_states": {},
+                         "image_receipt": receipt if phase_name == "complete" else None}
+                value.update(overrides)
+                path = root / (request + ".json")
+                path.write_text(json.dumps(value))
+                path.chmod(0o600)
+                return value
+
+            def start(request, expected, *, portable):
+                self.assertEqual(expected, manifest)
+                self.assertIs(portable, True)
+                self.assertFalse((root / (request + ".json")).exists())
+                calls.append(request)
+                outcome = outcomes[len(calls) - 1]
+                clock[0] += outcome.get("seconds", 0)
+                if "refusal" in outcome:
+                    if outcome.get("created"):
+                        record(request, "accepted")
+                    raise Refused(outcome["refusal"])
+                pending[request] = iter(outcome.get("phases", [("complete", None)]))
+                record(request, "accepted")
+                return {"protocol": orchestrator.PROTOCOL, "request_id": request, "phase": "accepted"}
+
+            def status(request):
+                outcome = outcomes[len(calls) - 1]
+                phase, error = next(pending[request])
+                value = record(request, phase, error, **outcome.get("raw", {}))
+                if foreign:
+                    (root / "foreign.json").write_bytes(b"preserve")
+                return {**value, **outcome.get("public", {})}
+
+            def worker(*args, **kwargs):
+                events.append("systemd")
+                self.assertEqual(args[2], "sg-host-backup-" + calls[-1] + ".service")
+                return next(states, "inactive")
+
+            orchestrator = SimpleNamespace(
+                PROTOCOL="sovagrid-host-backup-operation-v1", STATE_DIR=root,
+                Refused=Refused, start=start, portable_status=status,
+                _record=lambda request: json.loads((root / (request + ".json")).read_text()),
+                _active=lambda: None, _global_lock=lambda: lock("global"),
+                backup=SimpleNamespace(Refused=Refused, _locks=lambda: lock("backup")),
+                update=SimpleNamespace(UpdateFailure=Refused,
+                                       web_agent_snapshot_lock=lambda: lock("web")))
+            exporter = SimpleNamespace(verify=lambda *args, **kwargs: {"receipt": receipt})
+            producer = SimpleNamespace(ledger=lambda: provenance, extend=fixture.extend)
+            uuids = iter(SimpleNamespace(hex=format(number, "032x")) for number in range(1, 10))
+            with (patch.object(vm, "load", side_effect=lambda _bundle, filename, _name:
+                      orchestrator if filename == "host_backup_orchestrator.py" else exporter),
+                  patch.object(vm, "fixture_module", return_value=producer),
+                  patch.object(fixture, "save") as save, patch.object(vm, "text", side_effect=worker),
+                  patch.object(vm.uuid, "uuid4", side_effect=lambda: next(uuids)),
+                  patch.object(vm.time, "monotonic", side_effect=lambda: clock[0]),
+                  patch.object(vm.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)),
+                  patch("builtins.print")):
+                yield SimpleNamespace(root=root, manifest=manifest, identity=identity, receipt=receipt,
+                                      calls=calls, events=events, clock=clock, provenance=provenance,
+                                      save=save, orchestrator=orchestrator)
+
+    def test_precheck_refusals_use_fresh_requests_without_adopting_records(self):
+        outcomes = [{"refusal": code} for code in ("UNIT_STATE_UNAVAILABLE", "STATE_CHANGED", "BUSY")] + [{}]
+        with self.snapshot_fixture(outcomes, worker_states=["activating", "inactive"], lock_busy=True) as run:
+            self.assertEqual(vm.snapshot(Path("/unused"), run.manifest), (run.identity, run.receipt))
+            self.assertEqual(len(run.calls), 4)
+            self.assertEqual(len(set(run.calls)), 4)
+            self.assertEqual(set(run.provenance["trees"][str(run.root)]), {"", ".lock", run.calls[-1] + ".json"})
+            self.assertEqual(run.save.call_count, 1)
+            self.assertGreater(run.events.count("systemd"), len(run.calls))
+
+    def test_failed_pre_stop_comparison_is_sealed_before_the_next_attempt(self):
+        with self.snapshot_fixture([{"phases": [("failed", "STATE_CHANGED")]}, {}]) as run:
+            vm.snapshot(Path("/unused"), run.manifest)
+            self.assertEqual(len(run.calls), 2)
+            self.assertEqual(run.save.call_count, 2)
+            self.assertEqual(set(run.provenance["trees"][str(run.root)]),
+                             {"", ".lock", *(request + ".json" for request in run.calls)})
+            self.assertEqual(json.loads((run.root / (run.calls[0] + ".json")).read_text())["archive"], None)
+            self.assertEqual(run.events[:4], ["systemd", "global", "web", "backup"])
+
+    def test_no_retry_after_archive_stop_recovery_or_unknown_failure(self):
+        for outcome in (
+            {"phases": [("failed", "STATE_CHANGED")], "raw": {"archive": {"id": "c" * 32}}},
+            {"phases": [("failed", "STATE_CHANGED")], "raw": {"image_receipt": {"unsafe": True}}},
+            {"phases": [("stopping", None), ("failed", "STATE_CHANGED")]},
+            {"phases": [("recovery_required", "STATE_CHANGED")]},
+            {"phases": [("failed", "IMAGES_FAILED")]},
+            {"refusal": "SOURCE_CHANGED"},
+            {"refusal": "STATE_CHANGED", "created": True},
+        ):
+            with self.subTest(outcome=outcome), self.snapshot_fixture([outcome, {}]) as run:
+                with self.assertRaises(RuntimeError):
+                    vm.snapshot(Path("/unused"), run.manifest)
+                self.assertEqual(len(run.calls), 1)
+                run.save.assert_not_called()
+
+    def test_failed_record_requires_exact_request_manifest_and_closed_schema(self):
+        for raw in ({"request_id": "d" * 32}, {"expected_manifest_sha256": "b" * 64},
+                    {"foreign": "unowned"}, {"phase": "archiving"}, {"error": "BUSY"}):
+            with self.subTest(raw=raw), self.snapshot_fixture([
+                {"phases": [("failed", "STATE_CHANGED")], "raw": raw,
+                 "public": {"phase": "failed", "error": "STATE_CHANGED"}}, {}]) as run:
+                with self.assertRaises(RuntimeError):
+                    vm.snapshot(Path("/unused"), run.manifest)
+                self.assertEqual(len(run.calls), 1)
+                run.save.assert_not_called()
+
+    def test_retry_count_and_shared_deadline_are_bounded(self):
+        for seconds, attempts in ((0, 6), (400, 4)):
+            with self.subTest(seconds=seconds), self.snapshot_fixture([
+                {"refusal": "STATE_CHANGED", "seconds": seconds} for _ in range(6)]) as run:
+                with self.assertRaisesRegex(RuntimeError, "retry limit|deadline expired"):
+                    vm.snapshot(Path("/unused"), run.manifest)
+                self.assertEqual(len(run.calls), attempts)
+                self.assertEqual(len(set(run.calls)), attempts)
+                run.save.assert_not_called()
+
+    def test_failed_retry_preserves_producer_guard_for_foreign_descendants(self):
+        with self.snapshot_fixture([{"phases": [("failed", "STATE_CHANGED")]}, {}], foreign=True) as run:
+            with self.assertRaisesRegex(RuntimeError, "unknown descendant"):
+                vm.snapshot(Path("/unused"), run.manifest)
+            self.assertEqual(len(run.calls), 1)
+            self.assertEqual((run.root / "foreign.json").read_bytes(), b"preserve")
+            run.save.assert_not_called()
+
+    def test_existing_uuid_is_never_adopted_or_started(self):
+        with self.snapshot_fixture([{}]) as run:
+            existing = run.root / (format(1, "032x") + ".json")
+            existing.write_bytes(b"unowned existing operation")
+            with self.assertRaisesRegex(RuntimeError, "snapshot request already exists"):
+                vm.snapshot(Path("/unused"), run.manifest)
+            self.assertEqual(run.calls, [])
+            self.assertEqual(existing.read_bytes(), b"unowned existing operation")
+            run.save.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

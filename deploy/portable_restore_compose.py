@@ -199,7 +199,7 @@ class Compose:
         if len(ids) > len(self.services) or len(ids) != len(set(ids)) or any(CONTAINER.fullmatch(value) is None for value in ids):
             raise self.core.Refused("RESTORE_CONTAINER_CHANGED")
         projection = ('{"id":{{json .Id}},"image":{{json .Image}},"labels":{{json .Config.Labels}},'
-                      '"running":{{json .State.Running}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}}}')
+                      '"running":{{json .State.Running}},"health":{{if index .State "Health"}}{{json .State.Health.Status}}{{else}}null{{end}}}')
         records = {}
         for identity in ids:
             try:

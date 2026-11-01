@@ -1,8 +1,13 @@
 # Target restore transport
 
-This is the client integration contract for the portable restore wizard. It is
-not an end-user installation command. The production apply gate remains closed
-until the complete disposable Ubuntu checks pass.
+This is the implemented client integration contract for the portable restore
+wizard, not an end-user installation command. Apply availability comes from
+the independently pinned runner: its capability, physical target readiness and
+a fresh confirmed review must all agree. The current production flag and
+release-validation status are recorded in [HOST_BACKUP.md](../HOST_BACKUP.md)
+and [RELEASE_1_0.md](../RELEASE_1_0.md). The published stable source archive and
+client server pins remain `server-v0.14.1`; these newer helpers are not implied
+by an application version number.
 
 The client separately obtains and verifies a pinned SovaGrid source release.
 Executable helpers come from that release, never from the selected backup. The
@@ -17,15 +22,17 @@ and send exactly that complete runner archive on stdin. Root or existing
 passwordless sudo is required. The target must be Ubuntu 22.04, 24.04 or 26.04
 with systemd. No sudo password is collected.
 
-The script holds the shared installation lock, verifies the independent archive
+The script holds the common installation lock, verifies the independent archive
 and manifest pins, restricts extraction to the five source components, and
 publishes a private operation directory containing both runner and metadata in
 one rename. A crash before publication leaves an unadvertised private draft.
 An existing published operation is reverified before any helper is imported.
 The source archive and the private pin record are immutable for that operation.
 
-Dependencies are installed through `run.sh --restore-dependencies-only`; no
-SovaGrid account, Hub, Agent or live configuration is installed. Dependency
+Dependencies are installed through `run.sh --restore-dependencies-only`: missing
+Python, Docker/Compose, iproute2, WireGuard tools, Python cryptography and
+nftables are prepared from the configured Ubuntu repositories. No SovaGrid
+account, unit, Hub, Agent, container, secret or live configuration is installed. Dependency
 output goes to a root-private log. Successful stdout is one JSON object:
 
 ```json
@@ -41,8 +48,10 @@ after dependencies and before the full installation. It verifies the original
 source bundle, streams it through the real bootstrap twice with the same
 operation, checks exact ready pins and the retained runner inode, then tests a
 tiny binary upload and receiver reconnection. It creates no SovaGrid accounts,
-services or live configuration. This prepared check still requires a successful
-hosted VM run; local tests do not open the production apply gate.
+services or live configuration. Dependency preparation and this repeated
+bootstrap/binary-reconnection stage have passed on disposable hosted Ubuntu.
+That stage does not prove the complete apply/recovery transaction; its final
+validation status is tracked separately in the release document.
 
 ## One SSH stream
 
@@ -116,9 +125,19 @@ attempt revision; a changed or delayed review cannot start another attempt.
 
 The review explicitly reports that archived queued commands and Telegram
 confirmations are canceled before any activation, and VPN configuration is
-restored with interfaces down. Unsupported layouts, v1 receipts, kernel
-routing state, custom file roots and a changed public address block the review
-before confirmation. There is no implicit public-address remapping.
+restored with interfaces down. The internal full/v2 policy has exactly six
+fields: `queued_jobs:cancel`, `telegram_confirmations:cancel`,
+`vpn:restore_configuration_down`, `public_address_override:false`,
+`layout:full`, `receipt:v2`. The Web boundary validates all six then exposes
+only its four public policy fields, retaining the original review digest.
+
+The supported apply target is a clean full-layout Ubuntu with a v2 receipt and
+root or existing passwordless sudo. Hub-only, v1 receipts, active or enabled
+kernel VPN routing, unsupported unit enablement/file roots, staging ACME and a
+changed public address block review before confirmation. There is no implicit
+public-address remapping. Mutable AmneziaWG container configuration/client
+state and its image are not exported; that state is refused with
+`VPN_PORT_UNVERIFIED`, not restored with missing clients.
 
 `start` records a durable intent then starts fixed-argv transient systemd work.
 Its control lock is released before starting systemd so an immediately launched
@@ -139,3 +158,38 @@ nonce. Interruption of that archival must finish before another apply can
 begin. A partially archived retry remains readable as `phase:retry_required` with its retained terminal digest, even after the live kernel journal moved. The next start requires a new preview. `recovery_required` with changed
 runtime data preserves those data and the persistent fence; another apply is
 not a safe substitute for recovery.
+
+## Transaction and recovery boundaries
+
+The kernel holds the five verified input descriptors and locks in the order
+installation → staging → image-export. It journals and fsyncs each external
+intent before reserving identities, loading images, publishing owned shadow
+trees, quarantining queued work, activating units/Compose and checking health.
+The runner stays outside the restored source tree. The durable fence
+`/var/lib/.sovagrid-host-restore-in-progress` survives process death/reboot and
+is released only for its matching committed or fully rolled-back operation.
+
+The SQLite quarantine uses trusted host Python on a private clone under Hub
+UID/GID `10001:10001`, with no supplementary groups. Archived WAL is included;
+the original persistent journal mode is preserved. Queued jobs are canceled
+and their command text cleared; pending Telegram confirmations are removed
+before the first activation. Only aggregate counts enter the audit. Original
+DB/WAL/SHM remain available until commit. Changed runtime data on a later
+health failure prevent destructive automatic rollback and keep the fence.
+
+Image checks cover supported legacy, OCI and classic/OCI hybrid Docker 28/29
+exports. Config, manifest/index, descriptors, layer diff IDs, platform, exact
+tags and compatibility metadata form a verified graph. Compose receives an
+immutable runnable ID bound by that graph, using `--no-build --pull never`.
+Cross-store conversion uses the bounded anonymous re-export described above.
+Existing images are inventoried before import and retained; undo rechecks and
+removes only a new image ID owned by this operation. No prune, force removal
+or broad `compose down` is performed.
+
+Shadow publication uses held parent descriptors and no-replace rename on the
+target filesystem. Unknown paths, changed inodes/NSS records, foreign Docker
+resources, systemd drop-ins or foreign activation edges are preserved and
+refuse automatic adoption. Unit files and states, local health, TLS to the
+new target and Agent readiness are checked before commit; timers start last.
+A clean preview is a point-in-time observation, not permission to skip those
+checks during execution.

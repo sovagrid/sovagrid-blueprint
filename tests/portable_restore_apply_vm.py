@@ -30,7 +30,6 @@ from pathlib import Path
 import pwd
 import re
 import shutil
-import sqlite3
 import stat
 import subprocess
 import sys
@@ -451,37 +450,120 @@ def record_restored(bundle, identity):
     fixture.save(value)
 
 
+def _snapshot_pause(deadline, seconds):
+    remaining = deadline - time.monotonic()
+    need(remaining > 0, "portable snapshot deadline expired")
+    time.sleep(min(seconds, remaining))
+
+
+def _snapshot_idle(orchestrator, request, deadline, ready):
+    """Do not reuse a terminal record until its exact worker releases locks."""
+    while True:
+        remaining = deadline - time.monotonic()
+        need(remaining > 0, "portable snapshot deadline expired")
+        state = text("systemctl", "is-active", "sg-host-backup-" + request + ".service",
+                     accepted=(0, 3, 4), timeout=min(10, remaining))
+        need(state in ("active", "activating", "deactivating", "reloading", "refreshing",
+                       "inactive", "failed", "unknown"), "unknown snapshot worker state")
+        if state in ("inactive", "failed", "unknown"):
+            try:
+                # Match the worker's lock order. All three contexts are bounded;
+                # a failed precheck must never adopt another active operation.
+                with (orchestrator._global_lock(), orchestrator.update.web_agent_snapshot_lock(),
+                      orchestrator.backup._locks()):
+                    need(time.monotonic() < deadline, "portable snapshot deadline expired")
+                    need(orchestrator._active() is None, "snapshot retry found an active operation")
+                    ready()
+                    return
+            except (orchestrator.Refused, orchestrator.backup.Refused,
+                    orchestrator.update.UpdateFailure) as exc:
+                if str(exc) != "BUSY":
+                    raise
+        _snapshot_pause(deadline, 0.2)
+
+
+def _snapshot_register(orchestrator, request, manifest, *, failed=False):
+    """Seal only this fresh request's closed, pinned portable-v2 record."""
+    value = orchestrator._record(request)
+    keys = {"protocol", "request_id", "phase", "created_at", "updated_at",
+            "expected_manifest_sha256", "layout", "active_units", "running_containers",
+            "container_ids", "unit_hashes", "archive_id", "archive", "error",
+            "portable_images", "image_receipt", "unit_states"}
+    need(isinstance(value, dict) and set(value) == keys and
+         value["protocol"] == orchestrator.PROTOCOL and value["request_id"] == request and
+         value["expected_manifest_sha256"] == manifest, "snapshot record provenance differs")
+    if failed:
+        # In the pinned worker this exact terminal combination occurs only in
+        # its compare before _stop. Later archive/restart failures are fatal.
+        need(value["phase"] == "failed" and value["error"] == "STATE_CHANGED" and
+             value["archive"] is None and value["image_receipt"] is None,
+             "snapshot failure is not a pre-stop comparison")
+    else:
+        need(value["phase"] == "complete" and value["error"] is None and
+             value["archive"] is not None and value["image_receipt"] is not None,
+             "snapshot record is not complete")
+    fixture = fixture_module()
+    fixture.extend(fixture.ledger(), {str(orchestrator.STATE_DIR): {".lock", request + ".json"}})
+
+
 def snapshot(bundle, manifest):
     orchestrator = load(bundle, "host_backup_orchestrator.py", "sovagrid_ci_portable_backup")
-    request = uuid.uuid4().hex
-    started = orchestrator.start(request, manifest, portable=True)
-    need(started["phase"] in ("accepted", "stopping", "archiving", "restarting", "complete"), "portable snapshot refused")
     deadline = time.monotonic() + 1500
-    while True:
-        value = orchestrator.portable_status(request)
+    for attempt in range(6):
+        need(time.monotonic() < deadline, "portable snapshot deadline expired")
+        request = uuid.uuid4().hex
+        record_path = orchestrator.STATE_DIR / (request + ".json")
+        need(not os.path.lexists(record_path), "snapshot request already exists")
+        try:
+            started = orchestrator.start(request, manifest, portable=True)
+        except orchestrator.Refused as exc:
+            if str(exc) not in ("UNIT_STATE_UNAVAILABLE", "STATE_CHANGED", "BUSY"):
+                raise
+            # start must have refused before its first durable record/spawn.
+            def absent(record_path=record_path):
+                need(not os.path.lexists(record_path), "snapshot refusal created a record")
+            absent()
+            _snapshot_idle(orchestrator, request, deadline, absent)
+            need(attempt < 5, "portable snapshot precheck retry limit: " + str(exc))
+            _snapshot_pause(deadline, 1)
+            continue
+        need(started.get("protocol") == orchestrator.PROTOCOL and
+             started.get("request_id") == request and started.get("phase") in
+             ("accepted", "stopping", "archiving", "restarting", "complete"), "portable snapshot refused")
+        changed = started["phase"] != "accepted"
+        while True:
+            need(time.monotonic() < deadline, "portable snapshot deadline expired")
+            value = orchestrator.portable_status(request)
+            need(value.get("protocol") == orchestrator.PROTOCOL and value.get("request_id") == request,
+                 "snapshot status provenance differs")
+            changed |= value["phase"] in ("stopping", "archiving", "restarting", "complete")
+            if value["phase"] == "complete":
+                break
+            error = value.get("error")
+            safe_error = error if isinstance(error, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", error) else "UNKNOWN"
+            if value["phase"] == "failed" and safe_error == "STATE_CHANGED" and not changed:
+                _snapshot_idle(orchestrator, request, deadline,
+                               lambda request=request: _snapshot_register(orchestrator, request, manifest, failed=True))
+                need(attempt < 5, "portable snapshot precheck retry limit: STATE_CHANGED")
+                _snapshot_pause(deadline, 1)
+                break
+            need(value["phase"] not in ("failed", "recovery_required"),
+                 "portable snapshot did not complete: " + value["phase"] + "/" + safe_error)
+            _snapshot_pause(deadline, 0.5)
         if value["phase"] == "complete":
             break
-        error = value.get("error")
-        safe_error = error if isinstance(error, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", error) else "UNKNOWN"
-        need(value["phase"] not in ("failed", "recovery_required") and time.monotonic() < deadline,
-             "portable snapshot did not complete: " + value["phase"] + "/" + safe_error)
-        time.sleep(0.5)
-    # The record may be durable just before the worker releases its locks.
-    while text("systemctl", "is-active", "sg-host-backup-" + request + ".service", accepted=(0, 3, 4)) == "active":
-        need(time.monotonic() < deadline, "snapshot worker remained active")
-        time.sleep(0.2)
+    _snapshot_idle(orchestrator, request, deadline, lambda: None)
     identity = value["archive"]["id"]
     exporter = load(bundle, "host_image_export.py", "sovagrid_ci_portable_images")
     result = exporter.verify(identity, require_receipt=True)
+    need(time.monotonic() < deadline, "portable snapshot deadline expired")
     receipt = result["receipt"]
     need(receipt["protocol"] == "sovagrid-portable-host-receipt-v2" and
          receipt["source_manifest_sha256"] == manifest and
          all(state["enablement"] in ("enabled", "disabled", "static")
              for state in receipt["unit_states"].values()), "snapshot lacks supported v2 unit states")
     print("PORTABLE_RESTORE_VM_SNAPSHOT_READY", flush=True)
-    fixture = fixture_module()
-    provenance = fixture.ledger()
-    fixture.extend(provenance, {"/var/lib/sovagrid-host-backup-operations": {".lock", request + ".json"}})
+    _snapshot_register(orchestrator, request, manifest)
     return identity, receipt
 
 
@@ -745,12 +827,25 @@ def uninstall(bundle, identity, receipt, *, restore_id=None):
                 remove_quarantined(fixture, core, parent, shadow, path, proofs[path], expected)
             finally:
                 os.close(parent)
+        # Ubuntu userdel may remove an empty, matching private primary group.
+        # Seal every planned group immediately before our identity deletions.
+        for name, record in groups.items():
+            need(list(grp.getgrnam(name)) == record and not grp.getgrnam(name).gr_mem,
+                 "group changed before user deletion")
         for name, record in users.items():
             need(list(pwd.getpwnam(name)) + [sorted(os.getgrouplist(name, record[3]))] == record and no_user_processes(record[2]),
                  "identity changed before user deletion")
             command("/usr/sbin/userdel", name)
         for name, record in groups.items():
-            need(list(grp.getgrnam(name)) == record and not grp.getgrnam(name).gr_mem and
+            try:
+                current = grp.getgrnam(name)
+            except KeyError:
+                need(name in users and users[name][3] == record[2] and
+                     not any(group.gr_gid == record[2] for group in grp.getgrall()) and
+                     not any(user.pw_gid == record[2] for user in pwd.getpwall()),
+                     "unrelated planned group disappeared or its ID was reused")
+                continue
+            need(list(current) == record and not current.gr_mem and
                  not any(user.pw_gid == record[2] for user in pwd.getpwall()),
                  "group changed or gained another user")
             command("/usr/sbin/groupdel", name)
@@ -959,13 +1054,11 @@ def _enabled_child(restore, core, runtime, identity, review, mode):
         health(self, value)  # Real containers, HTTP, TLS, Gateway, Agent and sockets.
         if mode == "health-failure":
             script = '''import sqlite3
-with sqlite3.connect('/var/lib/sovagrid/hub/hub.sqlite',timeout=15) as db:
+with sqlite3.connect('/data/hub.sqlite',timeout=15) as db:
  db.execute('CREATE TABLE sovagrid_restore_ci_writeproof (id INTEGER PRIMARY KEY, value TEXT NOT NULL)')
  db.execute("INSERT INTO sovagrid_restore_ci_writeproof VALUES (1, 'preserve-this-runtime-write')")
 '''
-            result = subprocess.run(["/usr/bin/python3", "-I", "-c", script], stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, check=False,
-                user=10001, group=10001, extra_groups=(), env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+            result = hub_sql_fixture(script, timeout=25)
             need(result.returncode == 0 and not result.stdout, "bounded Hub runtime witness write failed")
             raise core.Refused("CI_HEALTH_FAILURE")
 
@@ -1036,7 +1129,7 @@ def seed_queue_sentinel():
             "command": "printf stale-command-must-not-run > " + str(target)}
     script = '''import hashlib,json,sqlite3,sys
 data=json.load(sys.stdin)
-with sqlite3.connect('/var/lib/sovagrid/hub/hub.sqlite',timeout=30) as db:
+with sqlite3.connect('/data/hub.sqlite',timeout=30) as db:
  db.execute('BEGIN IMMEDIATE')
  assert db.execute('SELECT remote_commands_enabled FROM servers WHERE id=?',(data['server'],)).fetchone()==(0,)
  assert db.execute('SELECT 1 FROM sessions WHERE token_hash=? AND expires_at>?',(data['session_hash'],data['now'])).fetchone()==(1,)
@@ -1045,9 +1138,7 @@ with sqlite3.connect('/var/lib/sovagrid/hub/hub.sqlite',timeout=30) as db:
  db.execute('INSERT INTO pending_commands(code_hash,server_id,actor_user_id,chat_id,command,created_at,expires_at) VALUES(?,?,1,1,?,?,?)',
   (data['pending'],data['server'],data['command'],data['now'],data['now']+86400))
 '''
-    result = subprocess.run(["/usr/bin/python3", "-I", "-c", script], input=json.dumps(data).encode(),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45, check=False,
-        user=10001, group=10001, extra_groups=(), env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    result = hub_sql_fixture(script, input=json.dumps(data).encode(), timeout=45)
     need(result.returncode == 0 and not result.stdout, "could not seed the bounded stale-command fixture")
     value["sentinel"] = {"job": identity, "pending": pending, "server": server, "effect": effect}
     fixture.save(value)
@@ -1072,18 +1163,34 @@ def verify_queue_sentinel(*, restored):
     need(not os.path.lexists(Path("/var/lib/sovagrid-agent/files") / value["effect"]), "pre-backup command was executed")
 
 
+def hub_sql_fixture(script, *, input=None, timeout=25):
+    # SQLite canonicalizes paths, so a host process running as Hub cannot cross
+    # the root-only /var/lib/sovagrid parent even with a preselected cwd. Use
+    # the verified live Hub's /data bind and UID for all WAL connections.
+    projection = ('{"id":{{json .Id}},"name":{{json .Name}},"running":{{json .State.Running}},'
+                  '"user":{{json .Config.User}},"labels":{{json .Config.Labels}},'
+                  '"mounts":{{json .Mounts}}}')
+    hub = json.loads(text(*DOCKER, "inspect", "--type", "container", "--format", projection, "sovagrid-hub-1"))
+    need(SHA.fullmatch(hub["id"]) is not None and hub["name"] == "/sovagrid-hub-1" and
+         hub["running"] is True and hub["user"] == "10001:10001" and
+         hub["labels"].get("com.docker.compose.project") == "sovagrid" and
+         hub["labels"].get("com.docker.compose.service") == "hub" and
+         any(mount.get("Type") == "bind" and mount.get("Source") == "/var/lib/sovagrid/hub" and
+             mount.get("Destination") == "/data" and mount.get("RW") is True for mount in hub["mounts"]),
+         "Hub SQL fixture container identity changed")
+    return subprocess.run([*DOCKER, "exec", "-i", "--user", "10001:10001", hub["id"],
+        "python3", "-I", "-c", script], input=input, stdin=subprocess.DEVNULL if input is None else None,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+
+
 def hub_sql_read(query, parameters):
-    # Even a read-only WAL connection may need a shared-memory sidecar. Keep
-    # every fixture connection under Hub's own identity, never root.
     script = '''import json,sqlite3,sys
 request=json.load(sys.stdin)
-with sqlite3.connect('file:/var/lib/sovagrid/hub/hub.sqlite?mode=ro',uri=True,timeout=15) as db:
+with sqlite3.connect('file:/data/hub.sqlite?mode=ro',uri=True,timeout=15) as db:
  print(json.dumps(db.execute(request['query'],request['parameters']).fetchall()))
 '''
-    result = subprocess.run(["/usr/bin/python3", "-I", "-c", script],
-        input=json.dumps({"query": query, "parameters": parameters}).encode(),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, check=False,
-        user=10001, group=10001, extra_groups=(), env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    result = hub_sql_fixture(script, input=json.dumps({"query": query, "parameters": parameters}).encode())
     need(result.returncode == 0 and len(result.stdout) <= 8192, "bounded Hub fixture read failed")
     return json.loads(result.stdout)
 
