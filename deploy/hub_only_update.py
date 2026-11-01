@@ -471,6 +471,11 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
                      "sovagrid_vpn/amnezia_provision.py"):
             need((source / "sovagrid-vpn" / name).is_file(),
                  "CANDIDATE_INCOMPATIBLE")
+    if common.web_restore_managed():
+        need(b"# SOVAGRID_WEB_RESTORE_V1" in script.splitlines(), "CANDIDATE_INCOMPATIBLE")
+        for name in common.WEB_RESTORE_REQUIRED:
+            item = source / name
+            need(item.is_file() and not item.is_symlink(), "CANDIDATE_INCOMPATIBLE")
     if common.ssh_gateway_managed():
         need(b"# SOVAGRID_SSH_GATEWAY_INSTALL_V1" in script,
              "CANDIDATE_INCOMPATIBLE")

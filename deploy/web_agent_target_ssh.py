@@ -701,6 +701,15 @@ class PinnedTargetSSH:
         rpc._installer = _HeadlessInstaller(options, self, popen=rpc._spawn)
         return rpc
 
+    def restore_controller(self, **kwargs):
+        """Use the shared restore protocol with this exact pinned SSH route."""
+        from sovagrid_connect.portable_restore import PortableRestoreController
+        if self.config_path is None or self.launcher_path is None:
+            raise TargetSSHError("SSH-транспорт закрыт.")
+        controller = PortableRestoreController(self.options, **kwargs)
+        controller.manager = _HeadlessInstaller(self.options, self, popen=subprocess.Popen)
+        return controller
+
 
 class _HeadlessInstaller:
     """Only the two methods AgentRPC uses from ServerInstaller."""
@@ -718,8 +727,8 @@ class _HeadlessInstaller:
             raise TargetSSHError("SSH-транспорт закрыт.")
         yield str(self.transport.config_path), str(self.transport.launcher_path)
 
-    def _ssh(self, config: str, helper: str, command: str, *, input_file=None):
-        from sovagrid_connect.installer import InstallError
+    def _ssh(self, config: str, helper: str, command: str, *, input_file=None, privileged=True):
+        from sovagrid_connect.installer import InstallError, _privileged_command
         if config != str(self.transport.config_path) or helper != str(self.transport.launcher_path):
             raise InstallError("Неверная конфигурация SSH.")
         nonce = self.transport.broker.arm()
@@ -738,6 +747,8 @@ class _HeadlessInstaller:
             environment["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_SOCKET"] = str(
                 self.transport.jump_broker.path)
             environment["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_NONCE"] = jump_nonce
+        if privileged and self.options.user != "root":
+            command = _privileged_command(command)
         argv = ["/usr/bin/ssh", "-F", config, "-T", "-o", "BatchMode=no",
                 "-o", "ClearAllForwardings=yes", "sovagrid-target", command]
         try:
@@ -754,6 +765,16 @@ class _HeadlessInstaller:
         with self._lock:
             self._process = process
         return process
+
+    def _read_bounded(self, process, **kwargs):
+        from sovagrid_connect.installer import ServerInstaller
+        return ServerInstaller._read_bounded(self, process, **kwargs)
+
+    def cancel(self):
+        with self._lock:
+            process = self._process
+        if process is not None and process.poll() is None:
+            process.terminate()
 
 
 if __name__ == "__main__":

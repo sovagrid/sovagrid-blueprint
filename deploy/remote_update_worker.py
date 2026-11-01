@@ -61,6 +61,60 @@ SSH_GATEWAY_MARKER_CONTENT = b'SOVAGRID_SSH_GATEWAY_V1\n'
 WEB_AGENT_MARKER = '/var/lib/sovagrid/.web-agent-installer-managed-by-run-sh'
 WEB_AGENT_DIR = '/var/lib/sovagrid/web-agent'
 WEB_AGENT_JOURNAL = WEB_AGENT_DIR + '/jobs'
+WEB_RESTORE_DIR = WEB_AGENT_DIR + '/restores'
+WEB_RESTORE_REQUIRED = (
+    'sovagrid-blueprint/deploy/web_restore.py',
+    'sovagrid-blueprint/deploy/host_restore.py',
+    'sovagrid-blueprint/deploy/host_backup.py',
+    'sovagrid-blueprint/deploy/host_image_export.py',
+    'sovagrid-blueprint/deploy/host_backup_orchestrator.py',
+    'sovagrid-blueprint/deploy/public_web.py',
+    'sovagrid-blueprint/deploy/runtime_locks.py',
+    'sovagrid-blueprint/deploy/web_agent_target_ssh.py',
+    'sovagrid-blueprint/deploy/web_agent_local_rpc.py',
+    'sovagrid-blueprint/deploy/web_agent_bundle.py',
+    'sovagrid-blueprint/deploy/web_agent_service.py',
+    'sovagrid-blueprint/deploy/remote_update_worker.py',
+    'sovagrid-blueprint/deploy/portable_restore_bootstrap.sh',
+    'sovagrid-blueprint/deploy/portable_restore_receiver.py',
+    'sovagrid-blueprint/deploy/portable_restore_target.py',
+    'sovagrid-blueprint/deploy/portable_restore_retry.py',
+    'sovagrid-blueprint/deploy/portable_restore_apply.py',
+    'sovagrid-blueprint/deploy/portable_restore_runtime.py',
+    'sovagrid-blueprint/deploy/portable_restore_shadow.py',
+    'sovagrid-blueprint/deploy/portable_restore_compose.py',
+    'sovagrid-blueprint/deploy/portable_restore_queue.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/__init__.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/agent_enrollment.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/agent_rpc.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/askpass.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/core.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_api.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_journal.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_protocol.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/installer.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/remote_update.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/server_status.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/server_timer.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/approved_manifest.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/auto_update.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/host_backup.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/host_backup_remote.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/host_backup_request.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/host_backup_transfer.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/hub_backup.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/hub_backup_remote.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/local_operations.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/portable_restore.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/promotion.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/promotion_protocol.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/promotion_remote.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/release_feed_remote.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/theme.py',
+    'sovagrid-blueprint/vendor/connect/SOURCE.json',
+    'sovagrid-web/host-restore.js',
+    'sovagrid-web/host-restore.css',
+)
 WEB_AGENT_MARKER_CONTENT = b'SOVAGRID_WEB_AGENT_INSTALL_V1\n'
 BASE_COMPOSE_SERVICES = ('hub', 'web')
 SSH_GATEWAY_SERVICE = 'ssh-gateway'
@@ -511,6 +565,13 @@ def candidate_features_compatible(source, flags):
                      'sovagrid_vpn/amnezia_provision.py'):
             if not (source / 'sovagrid-vpn' / name).is_file():
                 fail('COMPAT')
+    if web_restore_managed():
+        if b'# SOVAGRID_WEB_RESTORE_V1' not in script.splitlines():
+            fail('COMPAT')
+        for name in WEB_RESTORE_REQUIRED:
+            item = source / name
+            if not item.is_file() or item.is_symlink():
+                fail('COMPAT')
     if ssh_gateway_managed():
         gateway_required = (
             'sovagrid-web/Dockerfile.ssh-gateway',
@@ -644,6 +705,15 @@ def web_agent_managed():
         if info.st_gid != 0 or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o644:
             fail('STATE')
         public_path('/etc/systemd/system/' + unit, limit=8192)
+    return True
+
+def web_restore_managed():
+    namespace = path(WEB_RESTORE_DIR)
+    if not namespace.exists() and not namespace.is_symlink():
+        return False
+    public_path(WEB_RESTORE_DIR, directory=True, private=True)
+    if namespace.lstat().st_gid != 0:
+        fail('STATE')
     return True
 
 def web_agent_socket_ready():

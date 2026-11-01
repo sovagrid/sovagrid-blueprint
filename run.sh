@@ -12,6 +12,7 @@
 # SOVAGRID_EXTERNAL_AGENT_APPLY_UNIT_V1
 # SOVAGRID_SSH_GATEWAY_INSTALL_V1
 # SOVAGRID_WEB_AGENT_INSTALL_V1
+# SOVAGRID_WEB_RESTORE_V1
 set -euo pipefail
 umask 077
 # Keep the verified source tree free of generated Python bytecode on fresh installs.
@@ -466,6 +467,26 @@ if [[ -e $web_agent_marker || -L $web_agent_marker ]]; then
     die 'Web Agent installer marker is unsafe'
 fi
 
+# Reject existing foreign state/cache before systemd can adopt or change them.
+web_restore_preflight() {
+  local parent namespace
+  for parent in /var /var/lib /var/lib/sovagrid /var/lib/sovagrid/web-agent /var/cache; do
+    if [[ -e $parent || -L $parent ]]; then
+      [[ -d $parent && ! -L $parent && $(stat -c '%u' "$parent") == 0 &&
+         -z $(find "$parent" -maxdepth 0 -perm /022 -print -quit) ]] ||
+        die 'Web restore namespace ancestor is unsafe'
+    fi
+  done
+  for namespace in /var/lib/sovagrid/web-agent/restores /var/cache/sovagrid-web-restores; do
+    if [[ -e $namespace || -L $namespace ]]; then
+      [[ -d $namespace && ! -L $namespace &&
+         $(stat -c '%u:%g:%a' "$namespace") == 0:0:700 ]] ||
+        die 'Web restore private state/cache directory is unsafe'
+    fi
+  done
+}
+web_restore_preflight
+
 hub_only=0
 with_wireguard=0
 with_terminal=0
@@ -735,6 +756,61 @@ for web_agent_file in web_agent_bundle.py web_agent_jobs.py web_agent_local_rpc.
      ! -L $source_root/sovagrid-blueprint/deploy/$web_agent_file ]] ||
     die "Web Agent source $web_agent_file is missing or a symlink"
 done
+for web_restore_file in \
+    sovagrid-blueprint/deploy/web_restore.py \
+    sovagrid-blueprint/deploy/host_restore.py \
+    sovagrid-blueprint/deploy/host_backup.py \
+    sovagrid-blueprint/deploy/host_image_export.py \
+    sovagrid-blueprint/deploy/host_backup_orchestrator.py \
+    sovagrid-blueprint/deploy/public_web.py \
+    sovagrid-blueprint/deploy/runtime_locks.py \
+    sovagrid-blueprint/deploy/web_agent_target_ssh.py \
+    sovagrid-blueprint/deploy/web_agent_local_rpc.py \
+    sovagrid-blueprint/deploy/web_agent_bundle.py \
+    sovagrid-blueprint/deploy/web_agent_service.py \
+    sovagrid-blueprint/deploy/remote_update_worker.py \
+    sovagrid-blueprint/deploy/portable_restore_bootstrap.sh \
+    sovagrid-blueprint/deploy/portable_restore_receiver.py \
+    sovagrid-blueprint/deploy/portable_restore_target.py \
+    sovagrid-blueprint/deploy/portable_restore_retry.py \
+    sovagrid-blueprint/deploy/portable_restore_apply.py \
+    sovagrid-blueprint/deploy/portable_restore_runtime.py \
+    sovagrid-blueprint/deploy/portable_restore_shadow.py \
+    sovagrid-blueprint/deploy/portable_restore_compose.py \
+    sovagrid-blueprint/deploy/portable_restore_queue.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/__init__.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/agent_enrollment.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/agent_rpc.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/askpass.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/core.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_api.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_journal.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_protocol.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/installer.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/remote_update.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/server_status.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/server_timer.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/approved_manifest.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/auto_update.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/host_backup.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/host_backup_remote.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/host_backup_request.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/host_backup_transfer.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/hub_backup.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/hub_backup_remote.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/local_operations.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/portable_restore.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/promotion.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/promotion_protocol.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/promotion_remote.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/release_feed_remote.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/theme.py \
+    sovagrid-blueprint/vendor/connect/SOURCE.json \
+    sovagrid-web/host-restore.js \
+    sovagrid-web/host-restore.css; do
+  [[ -f $source_root/$web_restore_file && ! -L $source_root/$web_restore_file ]] ||
+    die "Web restore source $web_restore_file is missing or a symlink"
+done
 for amnezia_provision_file in deploy/sovagrid-amnezia-provision sovagrid_vpn/amnezia_provision.py; do
   [[ -f $source_root/sovagrid-vpn/$amnezia_provision_file &&
      ! -L $source_root/sovagrid-vpn/$amnezia_provision_file ]] ||
@@ -910,6 +986,7 @@ install_web_agent_service() {
     chmod 0600 "$temporary"
     mv -Tf -- "$temporary" "$web_agent_marker"
   fi
+  web_restore_preflight
   systemd-analyze verify "$blueprint_dir/deploy/sovagrid-web-agent-control.socket" \
                          "$blueprint_dir/deploy/sovagrid-web-agent-control.service" ||
     die 'Web Agent systemd units are invalid'

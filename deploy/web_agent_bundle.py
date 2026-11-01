@@ -40,6 +40,10 @@ REQUIRED = frozenset(("sovagrid-blueprint/run.sh", "sovagrid-blueprint/deploy/co
     "sovagrid-vpn/sovagrid_vpn/wireguard_install.py",
     "sovagrid-vpn/deploy/sovagrid-amnezia-provision",
     "sovagrid-vpn/sovagrid_vpn/amnezia_provision.py"))
+REQUIRED |= frozenset("sovagrid-blueprint/deploy/" + name for name in (
+    "portable_restore_bootstrap.sh", "portable_restore_receiver.py", "portable_restore_target.py",
+    "portable_restore_retry.py", "portable_restore_apply.py", "portable_restore_runtime.py",
+    "portable_restore_shadow.py", "portable_restore_compose.py", "portable_restore_queue.py", "host_restore.py"))
 _NAME = re.compile(r"[A-Za-z0-9_.@-]+\Z")
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
@@ -226,6 +230,44 @@ def _verify_connect_bundle(path: Path, manifest: bytes) -> None:
         raise BundleError("BUNDLE_INVALID") from None
 
 
+def _restore_bundle_pins(directory: Path, uid: int) -> set[Path] | None:
+    """Keep every independently pinned runner needed by restore history.
+
+    An unreadable or partial durable inventory conservatively disables pruning.
+    No path from a browser request is used here; a saved digest selects only a
+    fixed source-<sha>.tar.gz name in the existing private bundle directory.
+    """
+    root = directory / "restores" / "operations"
+    if not os.path.lexists(root):
+        return set()
+    try:
+        for parent in (root.parent, root):
+            info = parent.lstat()
+            _need(stat.S_ISDIR(info.st_mode) and info.st_uid == uid and stat.S_IMODE(info.st_mode) == 0o700)
+        entries = list(root.iterdir())
+        _need(len(entries) <= 128)
+        result = set()
+        for entry in entries:
+            _need(re.fullmatch(r"[0-9a-f]{32}", entry.name) is not None)
+            info = entry.lstat()
+            _need(stat.S_ISDIR(info.st_mode) and info.st_uid == uid and stat.S_IMODE(info.st_mode) == 0o700)
+            if not (entry / "state.json").exists():
+                continue  # No advertised operation or remote work exists yet.
+            raw, mode = _read_regular(entry / "state.json", uid, 2 * 1024**2)
+            value = json.loads(raw, object_pairs_hook=_unique_object)
+            record = value["record"]; request = record["request"]
+            sha = request["runner_archive_sha256"]
+            _need(mode == 0o600 and value["protocol"] == "sovagrid-web-restore-v1" and
+                  value["operation_id"] == entry.name == record["operation_id"] == request["operation_id"] and
+                  isinstance(sha, str) and _SHA.fullmatch(sha) is not None)
+            expected = directory / f"source-{sha}.tar.gz"
+            _need(record["runner_path"] == str(expected))
+            result.add(expected)
+        return result
+    except (OSError, BundleError, ValueError, TypeError, KeyError):
+        return None
+
+
 def _prune_unused(directory: Path, current: Path, uid: int, jobs_root: Path) -> None:
     """Retire unreferenced archives under the same OS lock as job mutation.
 
@@ -258,6 +300,10 @@ def _prune_unused(directory: Path, current: Path, uid: int, jobs_root: Path) -> 
         except EnrollmentJournalError:
             return
         protected = {current}
+        restore_pins = _restore_bundle_pins(directory, uid)
+        if restore_pins is None:
+            return
+        protected.update(restore_pins)
         for record in records:
             if record["phase"] != "active" or record["cleanup_required"]:
                 saved = record["bundle"]

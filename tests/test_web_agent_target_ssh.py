@@ -180,6 +180,12 @@ class TransportTests(unittest.TestCase):
                 rpc = transport.target_rpc(transport.options)
                 self.assertEqual(rpc.role, "target")
                 self.assertEqual(rpc._installer.transport, transport)
+                controller = transport.restore_controller(approved_archive_sha256="a" * 64,
+                    record_target_id="b" * 64)
+                self.assertEqual(controller.manager.transport, transport)
+                self.assertEqual(controller.options, transport.options)
+                self.assertEqual(controller.record_target_id, "b" * 64)
+                controller.cancel()
                 with self.assertRaises(TargetSSHError):
                     transport.target_rpc(rpc.options.__class__(host="elsewhere.invalid", user="root"))
             self.assertFalse(folder.exists())
