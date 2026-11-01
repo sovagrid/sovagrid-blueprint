@@ -27,6 +27,7 @@ import threading
 _DEPLOY = Path(__file__).resolve().parent
 _BEARER = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _ACTIONS = frozenset({"prepare", "apply", "resume", "cleanup", "interrupt", "status", "list",
+                      "agent-features-preview", "agent-features-apply",
                       "vpn-source-preview", "vpn-source-apply", "vpn-source-recover",
                       "wg-control-preview", "wg-control-apply", "wg-control-recover",
                       "amnezia-provision-preview", "amnezia-provision-apply",
@@ -63,6 +64,7 @@ from web_vpn_source import VpnSourceError, VpnSourceJobs  # noqa: E402
 from web_wireguard_control import WireguardControlError, WireguardControlJobs  # noqa: E402
 from web_amnezia_provision import AmneziaProvisionError, AmneziaProvisionJobs  # noqa: E402
 from web_restore import WebRestoreJobs, RestoreError  # noqa: E402
+from web_agent_features import AgentFeatureJobs, AgentFeatureError  # noqa: E402
 from sovagrid_connect.agent_enrollment import AgentEnrollment  # noqa: E402
 from sovagrid_connect.core import ConnectionOptions  # noqa: E402
 from sovagrid_connect.enrollment_api import EnrollmentAPI, EnrollmentAPIError  # noqa: E402
@@ -246,6 +248,7 @@ def _stable_public_web(*, expected_uid: int = 0, expected_gid: int = 0):
 
 
 def dispatch(jobs: WebAgentJobs, request: object, *, authorize=_authorize,
+             agent_features: AgentFeatureJobs | None = None,
              vpn_source: VpnSourceJobs | None = None,
              wg_control: WireguardControlJobs | None = None,
              amnezia_provision: AmneziaProvisionJobs | None = None,
@@ -258,6 +261,7 @@ def dispatch(jobs: WebAgentJobs, request: object, *, authorize=_authorize,
     authorize(token)
     with _stable_public_web():
         return _dispatch_authorized(jobs, action, token, payload,
+                                    agent_features=agent_features,
                                     vpn_source=vpn_source, wg_control=wg_control,
                                     amnezia_provision=amnezia_provision,
                                     restore=restore, binary=binary,
@@ -265,11 +269,30 @@ def dispatch(jobs: WebAgentJobs, request: object, *, authorize=_authorize,
 
 
 def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: object,
-                         *, vpn_source: VpnSourceJobs | None = None,
+                         *, agent_features: AgentFeatureJobs | None = None,
+                         vpn_source: VpnSourceJobs | None = None,
                          wg_control: WireguardControlJobs | None = None,
                          amnezia_provision: AmneziaProvisionJobs | None = None,
                          restore: WebRestoreJobs | None = None, binary: bytes | None = None,
                          recheck_admin=lambda: None) -> dict:
+    if action.startswith("agent-features-"):
+        try:
+            if agent_features is None:
+                raise RequestError("RUNTIME_UNAVAILABLE")
+            operation = action.removeprefix("agent-features-")
+            extra = {"server_id", "features"} | ({"expected_review_sha256", "confirm"}
+                if operation == "apply" else set())
+            credential = _vpn_route_credential(payload, _LOGIN | extra)
+            try:
+                return agent_features.execute(operation, server_id=payload["server_id"],
+                    features=payload["features"], options=_options(payload),
+                    fingerprint=payload["fingerprint"], credential=credential,
+                    session_token=token, expected_review_sha256=payload.get("expected_review_sha256"),
+                    confirm=payload.get("confirm"), authorize=recheck_admin)
+            finally:
+                credential.wipe()
+        finally:
+            _wipe_route_payload(payload)
     if action.startswith("restore-"):
         if restore is None:
             raise RequestError("RUNTIME_UNAVAILABLE")
@@ -434,6 +457,7 @@ def _reply(value: dict) -> bytes:
 
 def _handle(connection: socket.socket, jobs: WebAgentJobs,
             *, peer_uid=None, authorize=_authorize,
+            agent_features: AgentFeatureJobs | None = None,
             vpn_source: VpnSourceJobs | None = None,
             wg_control: WireguardControlJobs | None = None,
             amnezia_provision: AmneziaProvisionJobs | None = None,
@@ -476,10 +500,11 @@ def _handle(connection: socket.socket, jobs: WebAgentJobs,
                 if len(binary) != length:
                     raise RequestError("INVALID_INPUT")
             result = dispatch(jobs, request, authorize=authorize,
+                              agent_features=agent_features,
                               vpn_source=vpn_source, wg_control=wg_control,
                               amnezia_provision=amnezia_provision, restore=restore, binary=binary)
             response = {"ok": True, "result": result}
-        except (JobError, RequestError, VpnSourceError, WireguardControlError,
+        except (JobError, RequestError, VpnSourceError, WireguardControlError, AgentFeatureError,
                 AmneziaProvisionError, RestoreError) as error:
             response = {"ok": False, "error": error.code}
             if getattr(error, "request_id", None) is not None:
@@ -515,7 +540,8 @@ def serve(listener: socket.socket, jobs: WebAgentJobs,
           vpn_source: VpnSourceJobs | None = None,
           wg_control: WireguardControlJobs | None = None,
           amnezia_provision: AmneziaProvisionJobs | None = None,
-          restore: WebRestoreJobs | None = None) -> None:
+          restore: WebRestoreJobs | None = None,
+          agent_features: AgentFeatureJobs | None = None) -> None:
     slots = threading.BoundedSemaphore(8)
     try:
         while True:
@@ -531,6 +557,7 @@ def serve(listener: socket.socket, jobs: WebAgentJobs,
             def work(sock):
                 try:
                     _handle(sock, jobs, vpn_source=vpn_source, wg_control=wg_control,
+                            agent_features=agent_features,
                             amnezia_provision=amnezia_provision, restore=restore)
                 finally:
                     slots.release()
@@ -550,7 +577,8 @@ def main() -> int:
                         bundle_path=bundle, bundle_sha256=digest,
                         controller_factory=_target_factory)
     serve(_systemd_socket(), jobs, VpnSourceJobs(jobs), WireguardControlJobs(jobs),
-          AmneziaProvisionJobs(jobs), WebRestoreJobs(bundle, digest, source_guard=_stable_public_web))
+          AmneziaProvisionJobs(jobs), WebRestoreJobs(bundle, digest, source_guard=_stable_public_web),
+          AgentFeatureJobs(jobs))
     return 0
 
 

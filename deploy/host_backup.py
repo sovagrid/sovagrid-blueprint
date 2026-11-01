@@ -379,7 +379,7 @@ def _web_agent_source(path: str) -> Source | None:
                       gid=ROOT_GID)
     if path.startswith(WEB_AGENT_DIR + "/"):
         relative = path[len(WEB_AGENT_DIR) + 1:]
-        if (relative in (".bundle.lock", "completed-enrollments.jsonl", "vpn-source-stage.json") or
+        if (relative in (".bundle.lock", "completed-enrollments.jsonl", "vpn-source-stage.json", "agent-features-stage.json") or
                 WEB_AGENT_BUNDLE.fullmatch(relative) or
                 relative in ("jobs/.lock", "jobs/.enrollment-web-mutation") or
                 relative.startswith("jobs/") and
@@ -404,7 +404,7 @@ def _web_agent_limit(path: str) -> int | None:
                 else WEB_AGENT_MAX_LOCK)
     if path == WEB_AGENT_DIR + "/.bundle.lock":
         return WEB_AGENT_MAX_LOCK
-    if path == WEB_AGENT_DIR + "/vpn-source-stage.json":
+    if path in (WEB_AGENT_DIR + "/vpn-source-stage.json", WEB_AGENT_DIR + "/agent-features-stage.json"):
         return 4096
     return None
 

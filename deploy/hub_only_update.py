@@ -463,7 +463,7 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
              "CANDIDATE_INCOMPATIBLE")
         for name in ("compose.web-agent.yaml", "web_agent_bundle.py",
                      "web_agent_jobs.py", "web_agent_service.py",
-                     "web_wireguard_control.py", "web_amnezia_provision.py",
+                     "web_agent_features.py", "web_wireguard_control.py", "web_amnezia_provision.py",
                      *WEB_AGENT_UNITS):
             need((source / "sovagrid-blueprint/deploy" / name).is_file(),
                  "CANDIDATE_INCOMPATIBLE")

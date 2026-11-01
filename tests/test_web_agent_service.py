@@ -205,6 +205,26 @@ class ServiceTests(unittest.TestCase):
                              authorize=lambda token: None, vpn_source=vpn)
         self.assertEqual(len(vpn.calls), 1)
 
+    def test_agent_feature_request_rechecks_admin_and_wipes_credentials(self):
+        calls = []
+        class Features:
+            def execute(self, action, **kwargs):
+                kwargs['authorize']()
+                calls.append((action, kwargs))
+                return {'current': {'commands': False, 'terminal': False, 'files': False}}
+        authorized = []
+        payload = {**login_payload(), 'server_id': '11111111-1111-4111-8111-111111111111', 'features': None}
+        result = service.dispatch(self.jobs, request('agent-features-preview', payload),
+            authorize=lambda token: authorized.append(token), agent_features=Features())
+        self.assertFalse(result['current']['commands'])
+        self.assertEqual(authorized, [TOKEN, TOKEN])
+        self.assertEqual(calls[0][0], 'preview')
+        self.assertEqual(calls[0][1]['credential'].password, '')
+        self.assertEqual(payload['password'], '')
+        with self.assertRaises(service.RequestError):
+            service.dispatch(self.jobs, request('agent-features-apply', {**login_payload(),
+                'server_id': payload['server_id'], 'features': None}),
+                authorize=lambda token: None, agent_features=Features())
     def test_vpn_source_maintenance_requires_exact_boolean_and_admin_before_dispatch(self):
         expected = {key: "a" * 64 for key in ("source_manifest_sha256", "candidate_sha256",
                                              "installed_sha256", "state_sha256")}

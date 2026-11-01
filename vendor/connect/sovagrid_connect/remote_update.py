@@ -105,6 +105,7 @@ WEB_RESTORE_REQUIRED = (
     'sovagrid-blueprint/deploy/web_agent_local_rpc.py',
     'sovagrid-blueprint/deploy/web_agent_bundle.py',
     'sovagrid-blueprint/deploy/web_agent_service.py',
+    'sovagrid-blueprint/deploy/web_agent_features.py',
     'sovagrid-blueprint/deploy/remote_update_worker.py',
     'sovagrid-blueprint/deploy/portable_restore_bootstrap.sh',
     'sovagrid-blueprint/deploy/portable_restore_receiver.py',
@@ -121,6 +122,7 @@ WEB_RESTORE_REQUIRED = (
     'sovagrid-blueprint/vendor/connect/sovagrid_connect/askpass.py',
     'sovagrid-blueprint/vendor/connect/sovagrid_connect/core.py',
     'sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_api.py',
+    'sovagrid-blueprint/vendor/connect/sovagrid_connect/remote_feature_api.py',
     'sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_journal.py',
     'sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_protocol.py',
     'sovagrid-blueprint/vendor/connect/sovagrid_connect/installer.py',
@@ -568,7 +570,7 @@ def candidate_features_compatible(source, flags):
             fail('COMPAT')
         for name in ('compose.web-agent.yaml', 'web_agent_bundle.py',
                      'web_agent_jobs.py', 'web_agent_service.py',
-                     'web_wireguard_control.py', 'web_amnezia_provision.py',
+                     'web_agent_features.py', 'web_wireguard_control.py', 'web_amnezia_provision.py',
                      *WEB_AGENT_UNITS):
             if not (source / 'sovagrid-blueprint/deploy' / name).is_file():
                 fail('COMPAT')
