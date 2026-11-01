@@ -14,6 +14,7 @@ remain separate. Client identities and host keys exist only for this run.
 
 from __future__ import annotations
 
+import importlib.util
 import hashlib
 import json
 import os
