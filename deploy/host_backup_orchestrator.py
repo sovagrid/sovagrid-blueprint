@@ -97,8 +97,16 @@ def _diagnostic(stage: str, error: Exception) -> None:
     code = str(error) if isinstance(error, (Refused, backup.Refused, images.Refused, update.UpdateFailure)) else ""
     if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) is None:
         code = "UNEXPECTED"
+    location = ""
+    trace = error.__traceback__
+    while trace is not None:
+        filename = Path(trace.tb_frame.f_code.co_filename).name
+        if filename in {"host_backup.py", "host_image_export.py", "host_restore.py",
+                        "host_backup_orchestrator.py", "remote_update_worker.py"}:
+            location = " " + filename + ":" + str(trace.tb_lineno)
+        trace = trace.tb_next
     try:
-        print("SOVAGRID_BACKUP_FAILURE " + stage + " " + kind + " " + code,
+        print("SOVAGRID_BACKUP_FAILURE " + stage + " " + kind + " " + code + location,
               file=sys.stderr, flush=True)
     except OSError:
         pass  # Diagnostics must never suppress the best-effort restart.

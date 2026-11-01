@@ -47,6 +47,13 @@ class OrchestratorTests(unittest.TestCase):
         with patch.object(operation.sys, "stderr", new_callable=io.StringIO) as output:
             operation._diagnostic("archive", operation.backup.Refused("SOURCE_CHANGED"))
         self.assertIn("SOURCE_CHANGED", output.getvalue())
+        with patch.object(operation.sys, "stderr", new_callable=io.StringIO) as output:
+            try:
+                operation._hash("not-a-hash")
+            except operation.Refused as error:
+                operation._diagnostic("archive", error)
+        self.assertRegex(output.getvalue(), r"host_backup_orchestrator\.py:[0-9]+")
+        self.assertNotIn(str(Path(operation.__file__).parent), output.getvalue())
         with patch.object(operation, "print", side_effect=OSError("journal unavailable"), create=True):
             operation._diagnostic("restart", operation.Refused("STATE_CHANGED"))
 

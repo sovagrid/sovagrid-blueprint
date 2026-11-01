@@ -192,6 +192,104 @@ def oci_daemon_ids(raw):
             for item in top["manifests"]}
 
 
+def classic_image_archive(*, legacy_change=None, metadata_change=None):
+    """Small counterpart of actual Docker29 classic-store product exports.
+
+    Unlike containerd, Moby writes raw OCI layers, LayerSources, repositories,
+    and a separate v1 compatibility chain. Mutations are made before computing
+    IDs, so negative cases retain valid blob and compatibility hashes.
+    """
+    zero = {"Hostname": "", "Domainname": "", "User": "", "AttachStdin": False,
+            "AttachStdout": False, "AttachStderr": False, "Tty": False,
+            "OpenStdin": False, "StdinOnce": False, "Env": None, "Cmd": None,
+            "Image": "", "Volumes": None, "WorkingDir": "", "Entrypoint": None,
+            "Labels": None}
+
+    def encode(value):
+        raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return raw.replace("<", "\\u003c").replace(
+            ">", "\\u003e").replace("&", "\\u0026").replace(
+            "\u2028", "\\u2028").replace("\u2029", "\\u2029").encode()
+
+    blobs = {}
+
+    def blob(raw, media_type):
+        digest = hashlib.sha256(raw).hexdigest()
+        blobs[digest] = raw
+        return {"mediaType": media_type, "digest": "sha256:" + digest, "size": len(raw)}
+
+    services = ("hub", "web", "ssh-gateway")
+    top, manifest, repositories, ids, rootfs, legacy_ids = [], [], {}, {}, {}, set()
+    for service in services:
+        layers = [blob(b"shared classic raw layer\n", images.OCI_RAW_LAYER),
+                  blob((service + " final raw layer\n").encode(), images.OCI_RAW_LAYER)]
+        differences = [layer["digest"] for layer in layers]
+        source_config = {"os": "linux", "architecture": "amd64",
+                         "created": "2026-11-01T12:44:39.123456789Z",
+                         "config": {"User": "10001", "Cmd": ["serve", service],
+                                    "Env": ["ESCAPES=<&>\u2028\u2029"]},
+                         "rootfs": {"type": "layers", "diff_ids": differences}}
+        config = blob(encode(source_config), images.OCI_CONFIG)
+        ids[service] = config["digest"]
+        rootfs[service] = images._rootfs_digest(differences)
+        primary = blob(encode({"schemaVersion": 2, "mediaType": images.OCI_MANIFEST,
+                               "config": config, "layers": layers}), images.OCI_MANIFEST)
+        primary["annotations"] = {
+            "io.containerd.image.name": "docker.io/library/sovagrid-" + service + ":local",
+            "org.opencontainers.image.ref.name": "local"}
+        top.append(primary)
+        manifest.append({"Config": "blobs/sha256/" + config["digest"][7:],
+                         "RepoTags": ["sovagrid-" + service + ":local"],
+                         "Layers": ["blobs/sha256/" + value[7:] for value in differences],
+                         "LayerSources": {layer["digest"]: dict(layer) for layer in layers}})
+        repositories["sovagrid-" + service] = {"local": differences[-1][7:]}
+        parent, chain = None, None
+        for number, difference in enumerate(differences):
+            final = number == len(differences) - 1
+            chain = difference if chain is None else "sha256:" + hashlib.sha256(
+                (chain + " " + difference).encode()).hexdigest()
+            record = {"created": ("2026-11-01T15:44:39.123456789+03:00" if final else
+                                   "1970-01-01T03:00:00+03:00"),
+                      "container_config": dict(zero)}
+            if final:
+                record["config"] = {**zero, **source_config["config"]}
+                record["architecture"] = "amd64"
+            record["os"] = "linux"
+            if legacy_change is not None:
+                legacy_change(record, service, final)
+            hash_fields = {key: value for key, value in record.items()
+                           if key != "os" or final}
+            hash_fields["layer_id"] = chain
+            if parent is not None:
+                hash_fields["parent"] = "sha256:" + parent
+            record["id"] = hashlib.sha256(encode(dict(sorted(hash_fields.items())))).hexdigest()
+            if parent is not None:
+                record["parent"] = parent
+            legacy_ids.add("sha256:" + record["id"])
+            parent = record["id"]
+            blob(encode(record), "compatibility-only")
+    state = {"index": {"schemaVersion": 2, "mediaType": images.OCI_INDEX, "manifests": top},
+             "manifest": manifest, "repositories": repositories, "blobs": blobs}
+    if metadata_change is not None:
+        metadata_change(state)
+    entries = [("index.json", encode(state["index"])),
+               ("manifest.json", encode(state["manifest"])),
+               ("oci-layout", b'{"imageLayoutVersion":"1.0.0"}'),
+               ("repositories", encode(state["repositories"]))]
+    entries.extend(("blobs/sha256/" + digest, raw) for digest, raw in blobs.items())
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for name in ("blobs", "blobs/sha256"):
+            member = tarfile.TarInfo(name)
+            member.type = tarfile.DIRTYPE
+            archive.addfile(member)
+        for name, raw in entries:
+            member = tarfile.TarInfo(name)
+            member.size = len(raw)
+            archive.addfile(member, io.BytesIO(raw))
+    return output.getvalue(), ids, rootfs, legacy_ids
+
+
 class ImageExportTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -274,6 +372,95 @@ class ImageExportTest(unittest.TestCase):
             with self.subTest(payload=hashlib.sha256(payload[0]).hexdigest()[:8]):
                 with self.assertRaisesRegex(images.Refused, "INVALID_IMAGE_ARCHIVE"):
                     self.inspect(*payload)
+
+    def test_real_classic_store_hybrid_proves_both_graphs_and_local_time_instants(self):
+        raw, ids, rootfs, compatibility_ids = classic_image_archive()
+        configs, runtime, platforms = {}, {}, {}
+        self.assertGreater(self.inspect(raw, ids, source_rootfs=rootfs,
+            exported_configs=configs, runtime_ids=runtime, platforms=platforms), 0)
+        self.assertEqual(configs, ids)
+        self.assertEqual(platforms, {service: {"os": "linux", "architecture": "amd64"}
+                                     for service in ids})
+        for service, identities in runtime.items():
+            self.assertEqual(len(identities), 2)
+            self.assertIn(ids[service], identities)
+            self.assertFalse(compatibility_ids.intersection(identities))
+        with self.assertRaisesRegex(images.Refused, "IMAGE_ID_MISMATCH"):
+            self.inspect(raw, {**ids, "hub": next(iter(compatibility_ids))})
+        with self.assertRaisesRegex(images.Refused, "ROOTFS_MISMATCH"):
+            self.inspect(raw, ids, source_rootfs={**rootfs, "hub": "0" * 64})
+
+    def test_classic_compatibility_blobs_cannot_change_verified_config_or_rootfs(self):
+        def command(record, _service, final):
+            if final:
+                record["config"]["Cmd"] = ["foreign command"]
+
+        def intermediate_command(record, _service, final):
+            if not final:
+                record["container_config"]["Cmd"] = ["foreign command"]
+
+        def final_time(record, _service, final):
+            if final:
+                record["created"] = "2026-11-01T15:44:39.123456788+03:00"
+
+        def intermediate_time(record, _service, final):
+            if not final:
+                record["created"] = "1970-01-01T03:00:01+03:00"
+
+        def architecture(record, _service, final):
+            if final:
+                record["architecture"] = "arm64"
+
+        def integer_boolean(record, _service, _final):
+            record["container_config"]["Tty"] = 0
+
+        for mutation in (command, intermediate_command, final_time, intermediate_time,
+                         architecture, integer_boolean,
+                         lambda record, *_: record.update(os="windows"),
+                         lambda record, *_: record.update(foreign="unreferenced")):
+            with self.subTest(mutation=mutation.__name__):
+                raw, ids, rootfs, _ = classic_image_archive(legacy_change=mutation)
+                with self.assertRaisesRegex(images.Refused, "INVALID_IMAGE_ARCHIVE"):
+                    self.inspect(raw, ids, source_rootfs=rootfs)
+
+    def test_classic_hybrid_rejects_extra_tags_sources_blobs_and_changed_legacy_ids(self):
+        def add_blob(state):
+            raw = b'{"id":"' + b"a" * 64 + b'","created":null}'
+            state["blobs"][hashlib.sha256(raw).hexdigest()] = raw
+
+        def change_legacy_id(state):
+            for digest, raw in list(state["blobs"].items()):
+                try:
+                    value = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(value, dict) and "id" in value:
+                    del state["blobs"][digest]
+                    value["id"] = "a" * 64
+                    raw = json.dumps(value).encode()
+                    state["blobs"][hashlib.sha256(raw).hexdigest()] = raw
+                    return
+            self.fail("fixture missing compatibility metadata")
+
+        def foreign_source(state):
+            sources = state["manifest"][0]["LayerSources"]
+            sources[next(iter(sources))]["urls"] = ["https://foreign.invalid/layer"]
+
+        for mutation in (
+            add_blob, change_legacy_id, foreign_source,
+            lambda state: state["repositories"]["sovagrid-hub"].update(
+                {"rollback-0123456789ab": "b" * 64}),
+            lambda state: state["repositories"]["sovagrid-hub"].update(local="c" * 64),
+            lambda state: state["manifest"][0]["RepoTags"].append(
+                "sovagrid-hub:rollback-0123456789ab"),
+            lambda state: state["manifest"][0].update(Parent="sha256:" + "a" * 64),
+            lambda state: state["manifest"][0]["LayerSources"].pop(
+                next(iter(state["manifest"][0]["LayerSources"]))),
+        ):
+            with self.subTest(mutation=mutation.__name__):
+                raw, ids, rootfs, _ = classic_image_archive(metadata_change=mutation)
+                with self.assertRaisesRegex(images.Refused, "INVALID_IMAGE_ARCHIVE"):
+                    self.inspect(raw, ids, source_rootfs=rootfs)
 
     def test_oci_docker_save_validates_nested_indexes_and_compressed_diff_ids(self):
         raw, ids = oci_image_archive(("hub", "web", "ssh-gateway"))

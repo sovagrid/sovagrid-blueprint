@@ -399,6 +399,151 @@ def _oci_diff_id(fd: int, name: str, files: dict, offsets: dict,
     return digest.hexdigest()
 
 
+_CLASSIC_CONFIG_DEFAULTS = {
+    "Hostname": "", "Domainname": "", "User": "", "AttachStdin": False,
+    "AttachStdout": False, "AttachStderr": False, "Tty": False,
+    "OpenStdin": False, "StdinOnce": False, "Env": None, "Cmd": None,
+    "Image": "", "Volumes": None, "WorkingDir": "", "Entrypoint": None,
+    "Labels": None,
+}
+_CLASSIC_CONFIG_OPTIONAL = frozenset((
+    "ExposedPorts", "Healthcheck", "ArgsEscaped", "NetworkDisabled", "OnBuild",
+    "StopSignal", "StopTimeout", "Shell",
+))
+
+
+def _classic_json(value: object) -> bytes:
+    # Go preserves struct field order inside RawMessage values when CreateID
+    # sorts the outer map. Retain the archived nested order, including Go's
+    # string escapes, rather than sorting a whole config recursively.
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        for character, escaped in (("&", "\\u0026"), ("<", "\\u003c"),
+                                    (">", "\\u003e"), ("\u2028", "\\u2028"),
+                                    ("\u2029", "\\u2029")):
+            text = text.replace(character, escaped)
+        return text.encode("utf-8")
+    except (UnicodeError, ValueError) as exc:
+        raise Refused("INVALID_IMAGE_ARCHIVE") from exc
+
+
+def _classic_same(left: object, right: object) -> bool:
+    try:
+        return json.dumps(left, sort_keys=True, allow_nan=False) == json.dumps(
+            right, sort_keys=True, allow_nan=False)
+    except (UnicodeError, ValueError, TypeError) as exc:
+        raise Refused("INVALID_IMAGE_ARCHIVE") from exc
+
+
+def _classic_config(value: object) -> dict:
+    if value is None:
+        value = {}
+    if (not isinstance(value, dict) or
+            set(value) - (set(_CLASSIC_CONFIG_DEFAULTS) | _CLASSIC_CONFIG_OPTIONAL)):
+        raise Refused("INVALID_IMAGE_ARCHIVE")
+    result = dict(_CLASSIC_CONFIG_DEFAULTS)
+    result.update(value)
+    # StopTimeout is a pointer: a present zero remains present. Other optional
+    # fields in Docker's container.Config omit empty values when marshalled.
+    for key in _CLASSIC_CONFIG_OPTIONAL:
+        if key in result and (result[key] is None or
+                              key != "StopTimeout" and not result[key]):
+            del result[key]
+    return result
+
+
+def _classic_instant(value: object) -> tuple[datetime, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise Refused("INVALID_IMAGE_ARCHIVE")
+    match = re.fullmatch(
+        r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})"
+        r"(?:\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})", value)
+    if match is None:
+        raise Refused("INVALID_IMAGE_ARCHIVE")
+    try:
+        instant = datetime.fromisoformat(match[1] + match[3].replace("Z", "+00:00")).astimezone(
+            timezone.utc)
+    except ValueError as exc:
+        raise Refused("INVALID_IMAGE_ARCHIVE") from exc
+    return instant, (match[2] or "").ljust(9, "0")
+
+
+def _classic_metadata(fd: int, files: dict, offsets: dict, metadata: list[int],
+                      unreferenced: set[str], configs: dict[str, dict], *,
+                      deadline: float) -> set[str]:
+    """Close Docker classic's compatibility blobs against the verified image DAG.
+
+    Moby tarexport emits inert pre-v1.9 config blobs beside its OCI layout.
+    CreateID binds each one to a RootFS ChainID and its preceding compatibility
+    ID; the final record copies the verified runnable config. They are not
+    additional runnable images and never enter runtime_ids.
+    """
+    if len(unreferenced) > sum(len(config["rootfs"]["diff_ids"])
+                               for config in configs.values()):
+        raise Refused("INVALID_IMAGE_ARCHIVE")
+    by_parent: dict[str | None, list[tuple[str, dict]]] = {}
+    for name in sorted(unreferenced):
+        if time.monotonic() > deadline:
+            raise Refused("TIME_LIMIT")
+        value = _oci_json(fd, name, files, offsets, metadata, limit=MAX_LEGACY_METADATA)
+        if (not isinstance(value, dict) or "created" not in value or
+                not isinstance(value.get("id"), str) or not _sha("sha256:" + value["id"]) or
+                "parent" in value and (not isinstance(value["parent"], str) or
+                                        not _sha("sha256:" + value["parent"]))):
+            raise Refused("INVALID_IMAGE_ARCHIVE")
+        by_parent.setdefault(value.get("parent"), []).append((name, value))
+    used: set[str] = set()
+    epoch = _classic_instant("1970-01-01T00:00:00Z")
+    for config in configs.values():
+        parent = None
+        chain = ""
+        differences = config["rootfs"]["diff_ids"]
+        for number, difference in enumerate(differences):
+            if time.monotonic() > deadline:
+                raise Refused("TIME_LIMIT")
+            chain = (difference if not chain else "sha256:" +
+                     hashlib.sha256((chain + " " + difference).encode()).hexdigest())
+            final = number == len(differences) - 1
+            expected = {"container_config": _classic_config(None), "os": config["os"]}
+            created = epoch
+            if final:
+                expected["container_config"] = _classic_config(config.get("container_config"))
+                if config.get("config") is not None:
+                    expected["config"] = _classic_config(config["config"])
+                for key in ("comment", "container", "docker_version", "author",
+                            "architecture", "variant", "Size"):
+                    if config.get(key):
+                        expected[key] = config[key]
+                created = _classic_instant(config.get("created"))
+            matches = []
+            for name, value in by_parent.get(parent, []):
+                fields = {key: item for key, item in value.items()
+                          if key not in ("id", "parent", "created")}
+                # Sorted comparison preserves JSON types (False is not 0).
+                if (not _classic_same(fields, expected) or
+                        _classic_instant(value["created"]) != created):
+                    continue
+                hashed = {key: item for key, item in value.items()
+                          if key not in ("id", "parent")}
+                if not final:
+                    del hashed["os"]  # Moby adds OS after computing an intermediate ID.
+                hashed["layer_id"] = chain
+                if parent is not None:
+                    hashed["parent"] = "sha256:" + parent
+                digest = hashlib.sha256(_classic_json(dict(sorted(hashed.items())))).hexdigest()
+                if digest == value["id"]:
+                    matches.append((name, value["id"]))
+            if len(matches) != 1:
+                raise Refused("INVALID_IMAGE_ARCHIVE")
+            name, parent = matches[0]
+            used.add(name)
+    if used != unreferenced:
+        raise Refused("INVALID_IMAGE_ARCHIVE")
+    return used
+
+
 def _inspect_oci_tar(fd: int, image_ids: dict[str, str], files: dict,
                      offsets: dict, seen: set[str], captured: dict,
                      *, deadline: float, platforms: dict | None = None,
@@ -408,9 +553,10 @@ def _inspect_oci_tar(fd: int, image_ids: dict[str, str], files: dict,
     if (set(seen) - set(files) != {"blobs", "blobs/sha256"} or
             not {"index.json", "manifest.json", "oci-layout"} <= set(files)):
         raise Refused("INVALID_IMAGE_ARCHIVE")
+    classic = "repositories" in files
     for name, (_size, digest) in files.items():
         match = OCI_BLOB.fullmatch(name)
-        if name not in ("index.json", "manifest.json", "oci-layout") and not match:
+        if name not in ("index.json", "manifest.json", "oci-layout", "repositories") and not match:
             raise Refused("INVALID_IMAGE_ARCHIVE")
         if match and match.group(1) != digest:
             raise Refused("INVALID_IMAGE_ARCHIVE")
@@ -429,6 +575,8 @@ def _inspect_oci_tar(fd: int, image_ids: dict[str, str], files: dict,
     metadata = [sum(len(raw) for raw in captured.values())]
     expanded = [0]
     referenced = {"index.json", "manifest.json", "oci-layout"}
+    classic_configs = {}
+    repositories = {}
     services = set()
     for top in index["manifests"]:
         if (not isinstance(top, dict) or set(top) !=
@@ -546,10 +694,20 @@ def _inspect_oci_tar(fd: int, image_ids: dict[str, str], files: dict,
         matching = [item for item in docker_manifest if isinstance(item, dict) and
                     item.get("RepoTags") == ["sovagrid-" + service + ":local"]]
         if (len(matching) != 1 or set(matching[0]) !=
-                {"Config", "RepoTags", "Layers"} or
+                ({"Config", "RepoTags", "Layers", "LayerSources"} if classic else
+                 {"Config", "RepoTags", "Layers"}) or
                 matching[0]["Config"] != config_name or
                 matching[0]["Layers"] != layer_names):
             raise Refused("INVALID_IMAGE_ARCHIVE")
+        if classic:
+            if (nested is not None or manifest["mediaType"] != OCI_MANIFEST or
+                    any(layer["mediaType"] != OCI_RAW_LAYER for layer in manifest["layers"]) or
+                    matching[0]["LayerSources"] != {
+                        layer["digest"]: layer for layer in manifest["layers"]}):
+                raise Refused("INVALID_IMAGE_ARCHIVE")
+            classic_configs[service] = config
+            repositories["sovagrid-" + service] = {
+                "local": config["rootfs"]["diff_ids"][-1][7:]}
         if nested is not None and len(nested["manifests"]) == 2:
             att = nested["manifests"][1]
             if (not isinstance(att, dict) or set(att) !=
@@ -614,6 +772,12 @@ def _inspect_oci_tar(fd: int, image_ids: dict[str, str], files: dict,
                 raise Refused("INVALID_IMAGE_ARCHIVE")
             _oci_json(fd, att_layer_name, files, offsets, metadata,
                       limit=MAX_LEGACY_METADATA)
+    if classic:
+        if _parse_json(captured["repositories"]) != repositories:
+            raise Refused("INVALID_IMAGE_ARCHIVE")
+        referenced.add("repositories")
+        referenced.update(_classic_metadata(fd, files, offsets, metadata,
+            set(files) - referenced, classic_configs, deadline=deadline))
     if services != set(image_ids) or set(files) != referenced:
         raise Refused("INVALID_IMAGE_ARCHIVE")
     return len(seen)
