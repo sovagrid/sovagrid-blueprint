@@ -142,7 +142,6 @@ python3() { [[ ${TEST_PYTHON_SUPPORTED:-1} == 1 ]]; }
         fixtures = r'''
 docker() {
   printf 'docker %s\n' "$*" >> "$TEST_LOG"
-  if [[ $* == 'context show' ]]; then printf '%s\n' "${TEST_SAVED_CONTEXT:-default}"; return; fi
   if [[ $1 == context && $2 == inspect ]]; then printf '%s\n' "$TEST_CONTEXT_ENDPOINT"; return; fi
   return 99
 }
@@ -161,6 +160,8 @@ require_local_docker_target
         for name in ("run.sh", "bootstrap/run.sh"):
             for environment in ({"DOCKER_HOST": "tcp://foreign.invalid:2375"},
                                 {"DOCKER_CONTEXT": "remote", "TEST_CONTEXT_ENDPOINT": "ssh://foreign.invalid"},
+                                {"DOCKER_CONTEXT": "invalid", "TEST_CONTEXT_ENDPOINT": ""},
+                                {"TEST_CONTEXT_ENDPOINT": ""},
                                 {"TEST_SAVED_CONTEXT": "saved-remote", "TEST_CONTEXT_ENDPOINT": "tcp://foreign.invalid:2375"}):
                 with self.subTest(installer=name, environment=environment):
                     self.log.unlink(missing_ok=True)
@@ -179,6 +180,14 @@ require_local_docker_target
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("docker context inspect custom-local", self.commands())
                 self.assertNotIn("context use", self.commands())
+
+    def test_current_context_is_inspected_without_newer_context_show_command(self) -> None:
+        for name in ("run.sh", "bootstrap/run.sh"):
+            with self.subTest(installer=name):
+                self.log.unlink(missing_ok=True)
+                result = self.docker_target_fixture(name)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.commands(), "docker context inspect --format {{.Endpoints.docker.Host}}\n")
 
     def test_restore_dependency_setup_remains_ubuntu_only(self) -> None:
         start = SOURCE.index("restore_dependencies_only() {")

@@ -331,18 +331,23 @@ require_bootstrap_capabilities() {
 require_bootstrap_capabilities
 
 require_local_docker_target() {
-  local context=${DOCKER_CONTEXT:-} endpoint=${DOCKER_HOST:-}
+  local context=${DOCKER_CONTEXT:-} endpoint=${DOCKER_HOST:-} context_checked=0
   [[ -z $endpoint || $endpoint == unix:///var/run/docker.sock ]] ||
     die 'managed installation requires the local Docker socket; an explicit nonlocal DOCKER_HOST was refused'
-  if [[ -z $context && -z $endpoint ]] && command -v docker >/dev/null 2>&1; then
-    context=$(docker context show 2>/dev/null) || die 'cannot inspect the selected Docker context'
-  fi
   if [[ -n $context ]]; then
     command -v docker >/dev/null 2>&1 || die 'the selected Docker context cannot be inspected without a Docker CLI'
     endpoint=$(docker context inspect "$context" --format '{{.Endpoints.docker.Host}}' 2>/dev/null) ||
       die 'cannot inspect the selected Docker context endpoint'
-    [[ $endpoint == unix:///var/run/docker.sock ]] || die 'managed installation requires a Docker context for the local Unix socket'
+    context_checked=1
+  elif [[ -z $endpoint ]] && command -v docker >/dev/null 2>&1; then
+    # Docker 20.10 supports inspection of the current context without a
+    # separate `context show` command or a context-selection mutation.
+    endpoint=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null) ||
+      die 'cannot inspect the selected Docker context endpoint'
+    context_checked=1
   fi
+  [[ $context_checked == 0 || $endpoint == unix:///var/run/docker.sock ]] ||
+    die 'managed installation requires a Docker context for the local Unix socket'
   unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
   export DOCKER_HOST=unix:///var/run/docker.sock
 }
