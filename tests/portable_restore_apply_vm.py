@@ -1739,7 +1739,7 @@ def verify_live(bundle, since):
     try:
         deadline = time.monotonic() + 40
         while True:
-            rows = module.request("GET", "/api/v1/servers", token=token)[1]["servers"]
+            rows = hub_request("GET", "/api/v1/servers", token)["servers"]
             row = next(item for item in rows if item["id"] == host)
             history = hub_request("GET", "/api/v1/servers/" + host + "/metrics?limit=1", token)["metrics"]
             if row["online"] is True and type(row["last_seen"]) is int and row["last_seen"] >= since and history:
