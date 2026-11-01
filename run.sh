@@ -872,24 +872,87 @@ if (( with_journal )); then
     die 'an unmanaged journal policy already exists; inspect it before installing the journal broker'
   fi
 fi
-if (( with_containers || containers_disable_requested )); then
-  if [[ -e /etc/sovagrid/.containers-managed-by-run-sh || -L /etc/sovagrid/.containers-managed-by-run-sh ]]; then
-    [[ -f /etc/sovagrid/.containers-managed-by-run-sh && ! -L /etc/sovagrid/.containers-managed-by-run-sh &&
-       $(stat -c '%U:%G:%a' /etc/sovagrid/.containers-managed-by-run-sh) == root:root:600 ]] || die 'container inventory marker is unsafe'
+container_inventory_preflight() {
+  local marker=/etc/sovagrid/.containers-managed-by-run-sh directory=/var/lib/sovagrid-containers
+  local receipt=$directory/.prepared-by-run-sh managed=0 pending=0 container_unit
+  if [[ -e $marker || -L $marker ]]; then
+    [[ -f $marker && ! -L $marker && $(stat -c '%U:%G:%a:%h' "$marker") == root:root:600:1 ]] ||
+      die 'container inventory marker is unsafe'
+    managed=1
+  fi
+  if [[ -e $directory || -L $directory ]]; then
+    [[ -d $directory && ! -L $directory && $(stat -c '%U:%G:%a' "$directory") == root:sovagrid:750 ]] ||
+      die 'container inventory directory is unmanaged or unsafe'
+    if [[ -e $receipt || -L $receipt ]]; then
+      [[ -f $receipt && ! -L $receipt && $(stat -c '%U:%G:%a:%h' "$receipt") == root:root:600:1 ]] &&
+        printf 'SOVAGRID_CONTAINER_PREPARED_V1\n' | cmp -s - "$receipt" || die 'container inventory preparation receipt is unsafe'
+      pending=1
+    fi
+    (( managed || pending )) || die 'container inventory directory is unmanaged or unsafe'
+    [[ -z $(find "$directory" -mindepth 1 -maxdepth 1 ! -name snapshot.json ! -name .prepared-by-run-sh -print -quit) ]] ||
+      die 'container inventory directory has unexpected files'
+    if [[ -e $directory/snapshot.json || -L $directory/snapshot.json ]]; then
+      (( managed )) && [[ -f $directory/snapshot.json && ! -L $directory/snapshot.json &&
+        $(stat -c '%U:%G:%a:%h' "$directory/snapshot.json") == root:sovagrid:640:1 ]] || die 'container inventory snapshot is unsafe'
+    fi
+  elif (( containers_disable_requested || managed )); then
+    die 'managed container inventory directory is missing'
   fi
   for container_unit in sovagrid-container-inventory.service sovagrid-container-inventory.timer; do
     if [[ -e /etc/systemd/system/$container_unit || -L /etc/systemd/system/$container_unit ]]; then
-      [[ -f /etc/sovagrid/.containers-managed-by-run-sh && ! -L /etc/sovagrid/.containers-managed-by-run-sh ]] || die "an unmanaged $container_unit already exists"
+      (( managed )) || die "an unmanaged $container_unit already exists"
       [[ -f /etc/systemd/system/$container_unit && ! -L /etc/systemd/system/$container_unit &&
          $(stat -c '%U:%G:%a' "/etc/systemd/system/$container_unit") == root:root:644 ]] || die "$container_unit is unsafe"
     fi
   done
-  if [[ -e /var/lib/sovagrid-containers || -L /var/lib/sovagrid-containers ]]; then
-    [[ -d /var/lib/sovagrid-containers && ! -L /var/lib/sovagrid-containers &&
-       -f /etc/sovagrid/.containers-managed-by-run-sh ]] || die 'container inventory directory is unmanaged or unsafe'
-  elif (( containers_disable_requested )) || [[ -f /etc/sovagrid/.containers-managed-by-run-sh ]]; then
-    die 'managed container inventory directory is missing'
+}
+
+container_inventory_sync() {
+  /usr/bin/python3 -B -I - "$@" <<'PY_SYNC'
+import os, sys
+for path in sys.argv[1:]:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+PY_SYNC
+}
+
+container_inventory_prepare() (
+  # Publish ownership intent, never successful activation. An internal receipt
+  # travels atomically with a fresh directory across interruption before marker publication.
+  local marker=/etc/sovagrid/.containers-managed-by-run-sh directory=/var/lib/sovagrid-containers
+  container_inventory_stage=
+  container_inventory_preflight
+  [[ -d /var/lib && ! -L /var/lib && $(stat -c '%U' /var/lib) == root &&
+     -z $(find /var/lib -maxdepth 0 -perm /022 -print -quit) &&
+     -d /etc/sovagrid && ! -L /etc/sovagrid && $(stat -c '%U:%G:%a' /etc/sovagrid) == root:sovagrid:750 ]] ||
+    die 'container inventory preparation parent is unsafe'
+  trap 'if [[ -n $container_inventory_stage && -d $container_inventory_stage && ! -L $container_inventory_stage ]]; then rm -f -- "$container_inventory_stage/.prepared-by-run-sh"; rmdir -- "$container_inventory_stage" 2>/dev/null || true; fi' EXIT
+  if [[ ! -e $directory && ! -L $directory ]]; then
+    container_inventory_stage=$(mktemp -d /var/lib/.sovagrid-container-prepare.XXXXXXXX)
+    printf 'SOVAGRID_CONTAINER_PREPARED_V1\n' > "$container_inventory_stage/.prepared-by-run-sh"
+    chown root:root "$container_inventory_stage/.prepared-by-run-sh"
+    chmod 0600 "$container_inventory_stage/.prepared-by-run-sh"
+    chown root:sovagrid "$container_inventory_stage"
+    chmod 0750 "$container_inventory_stage"
+    container_inventory_sync "$container_inventory_stage/.prepared-by-run-sh" "$container_inventory_stage"
+    mv -Tn -- "$container_inventory_stage" "$directory"
+    [[ ! -e $container_inventory_stage && ! -L $container_inventory_stage ]] || die 'container inventory directory appeared during preparation'
+    container_inventory_stage=
+    container_inventory_sync /var/lib
   fi
+  container_inventory_preflight
+  if [[ ! -e $marker && ! -L $marker ]]; then
+    ( umask 077; set -o noclobber; : > "$marker" ) || die 'container inventory marker appeared during preparation'
+  fi
+  container_inventory_preflight
+  container_inventory_sync "$marker" /etc/sovagrid
+  rm -f -- "$directory/.prepared-by-run-sh"
+  container_inventory_sync "$directory"
+)
+
+if (( with_containers || containers_disable_requested )); then
+  container_inventory_preflight
 fi
 
 blueprint_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
@@ -1343,17 +1406,7 @@ if (( with_journal )); then
   [[ $(stat -c '%U:%G:%a' /etc/sovagrid-journal) == root:sovagrid-journal:750 ]] || die 'journal policy directory has unsafe ownership or mode'
 fi
 if (( with_containers || containers_disable_requested )); then
-  if [[ -e /var/lib/sovagrid-containers || -L /var/lib/sovagrid-containers ]]; then
-    [[ $(stat -c '%U:%G:%a' /var/lib/sovagrid-containers) == root:sovagrid:750 ]] || die 'container inventory directory has unsafe ownership or mode'
-    [[ -z $(find /var/lib/sovagrid-containers -mindepth 1 -maxdepth 1 ! -name snapshot.json -print -quit) ]] || die 'container inventory directory has unexpected files'
-    if [[ -e /var/lib/sovagrid-containers/snapshot.json || -L /var/lib/sovagrid-containers/snapshot.json ]]; then
-      [[ -f /var/lib/sovagrid-containers/snapshot.json && ! -L /var/lib/sovagrid-containers/snapshot.json &&
-         $(stat -c '%U:%G:%a:%h' /var/lib/sovagrid-containers/snapshot.json) == root:sovagrid:640:1 ]] || die 'container inventory snapshot is unsafe'
-    fi
-  fi
-  if (( with_containers )); then
-    install -d -o root -g sovagrid -m 0750 /var/lib/sovagrid-containers
-  fi
+  container_inventory_prepare
 fi
 if (( ! hub_only )); then
   install -d -o root -g root -m 0755 /opt/sovagrid-agent
@@ -1913,9 +1966,7 @@ from sovagrid_agent.containers import read_snapshot
 if read_snapshot() is None:
     raise SystemExit('container snapshot unreadable')
 PY
-  touch /etc/sovagrid/.containers-managed-by-run-sh
-  chown root:root /etc/sovagrid/.containers-managed-by-run-sh
-  chmod 0600 /etc/sovagrid/.containers-managed-by-run-sh
+  # Ownership intent was published during preparation; only these checks prove activation.
 fi
 if (( with_terminal )); then
   systemctl enable --now sovagrid-terminal-control.socket
