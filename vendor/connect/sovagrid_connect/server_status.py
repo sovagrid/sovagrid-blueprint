@@ -18,7 +18,7 @@ STATUS_MARKER = re.compile(r"SG_STATUS_V1:(managed|agent_only|missing|conflict|u
 
 # No untrusted values enter this command. A non-root account may perform the
 # read-only inventory with passwordless sudo; without it the result is unknown.
-# The later installer has its own root, Ubuntu and empty-host preflight.
+# The later installer has its own root, supported-OS and empty-host preflight.
 STATUS_COMMAND = (
     "sh -c '"
     "if ! command -v python3 >/dev/null 2>&1; then printf \"SG_STATUS_V1:unsupported\\n\"; exit 0; fi; "
@@ -270,6 +270,7 @@ def managed_vpn_source(root=None, owner=0):
 
 STATUS_SCRIPT = r'''# SOVAGRID_SSH_STATUS_V1
 import os
+import re
 from pathlib import Path
 import shutil
 import stat
@@ -277,6 +278,27 @@ import subprocess
 import sys
 ''' + _MANAGED_VPN_SOURCE_CHECK + r'''
 root = Path(sys.argv[1]) if len(sys.argv) == 2 else Path('/')
+SOVAGRID_MIN_PYTHON = '3.10'
+SOVAGRID_MIN_SYSTEMD = '247'
+
+def runtime_supported():
+    if sys.platform != 'linux' or sys.version_info < tuple(map(int, SOVAGRID_MIN_PYTHON.split('.'))) or not (root / 'proc/self').is_dir() or not (root / 'run/systemd/system').is_dir():
+        return False
+    try:
+        python = subprocess.run(['/usr/bin/python3', '-B', '-I', '-c',
+                                 'import sys; sys.exit(0 if sys.version_info >= tuple(map(int, sys.argv[1].split("."))) else 1)', SOVAGRID_MIN_PYTHON],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        if python.returncode != 0: return False
+        version = subprocess.run(['/usr/bin/systemctl', 'show', '--property=Version', '--value'], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        match = re.match(rb'([0-9]+)', version.stdout[:256])
+        active = subprocess.run(['/usr/bin/systemctl', 'is-system-running'], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        return (version.returncode == 0 and match is not None and int(match.group(1)) >= int(SOVAGRID_MIN_SYSTEMD)
+                and active.returncode in (0, 1) and active.stdout.strip() in (b'running', b'degraded'))
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
 
 def node(path):
     target = root / path.lstrip('/')
@@ -303,12 +325,7 @@ def result(kind):
 try:
     if root == Path('/') and os.geteuid() != 0:
         result('unknown')
-    release = root / 'etc/os-release'
-    if not release.is_file():
-        result('unsupported')
-    raw = release.read_text(encoding='utf-8')[:8192]
-    values = dict(line.split('=', 1) for line in raw.splitlines() if '=' in line and not line.startswith('#'))
-    if values.get('ID', '').strip('"\'') != 'ubuntu':
+    if not runtime_supported():
         result('unsupported')
     full = directory('/opt/sovagrid-src') and regular('/opt/sovagrid-src/sovagrid-bundle.json') and \
         regular('/var/lib/sovagrid/.managed-by-run-sh')

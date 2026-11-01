@@ -286,17 +286,67 @@ PY
 }
 
 [[ ${EUID} -eq 0 ]] || die 'запустите команду через sudo (права root нужны для установки)'
-[[ -r /etc/os-release ]] || die 'не удалось определить ОС'
-# shellcheck disable=SC1091
-. /etc/os-release
-[[ ${ID:-} == ubuntu ]] || die 'первичная установка поддерживает Ubuntu'
-[[ ${VERSION_ID:-} == 22.04 || ${VERSION_ID:-} == 24.04 || ${VERSION_ID:-} == 26.04 ]] ||
-  die 'нужна Ubuntu 22.04, 24.04 или 26.04'
-command -v curl >/dev/null || die 'нужен curl для загрузки установщика'
-command -v sha256sum >/dev/null || die 'нужна утилита sha256sum'
-command -v tar >/dev/null || die 'нужна утилита tar'
-command -v flock >/dev/null || die 'нужна утилита flock'
-[[ -d /run/systemd/system ]] || die 'нужен сервер Ubuntu с systemd'
+SOVAGRID_MIN_SYSTEMD='247'
+SOVAGRID_MIN_PYTHON='3.10'
+
+bootstrap_python_supported() {
+  "$1" -B -I -c 'import sys; minimum=tuple(map(int, sys.argv[1].split("."))); sys.exit(sys.version_info[:2] < minimum)' \
+    "$SOVAGRID_MIN_PYTHON"
+}
+
+require_bootstrap_capabilities() {
+  local tool state version major record
+  local -a missing=()
+  (( BASH_VERSINFO[0] >= 4 )) || die 'нужен Bash 4 или новее'
+  for tool in bash cat chmod curl cut find flock getent grep install mktemp mv rm sha256sum stat systemctl systemd-analyze tar uname; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  (( ${#missing[@]} == 0 )) || die "отсутствуют необходимые инструменты: ${missing[*]}; установите их и повторите команду"
+  [[ $(uname -s) == Linux ]] || die 'нужно ядро Linux'
+  [[ -d /run/systemd/system ]] || die 'нужен работающий systemd'
+  state=$(systemctl is-system-running 2>/dev/null) || true
+  [[ $state == running || $state == degraded ]] || die 'нужен работающий systemd (running или degraded)'
+  version=$(systemctl show --property=Version --value 2>/dev/null) || die 'не удалось узнать версию работающего systemd'
+  [[ $version =~ ^([1-9][0-9]*) ]] || die 'не удалось разобрать версию systemd'
+  major=${BASH_REMATCH[1]}
+  (( ${#major} <= 4 && 10#$major >= SOVAGRID_MIN_SYSTEMD )) || die "нужен systemd $SOVAGRID_MIN_SYSTEMD или новее"
+  [[ -d /proc/self/fd && -r /proc/stat && -r /proc/meminfo && -r /proc/net/dev ]] ||
+    die 'нужен Linux procfs с дескрипторами процессов и счётчиками CPU, памяти и сети'
+  record=$(getent passwd root) || die 'пользователь root должен быть доступен через getent'
+  [[ $record == root:*:0:0:* ]] || die 'для root нужны UID и основной GID 0'
+  record=$(getent group root) || die 'группа root должна быть доступна через getent'
+  [[ $record == root:*:0:* ]] || die 'для группы root нужен GID 0'
+  [[ $(stat -c '%u:%g' /) == 0:0 ]] || die 'нужны Linux stat -c и корень файловой системы с владельцем root'
+  if command -v python3 >/dev/null 2>&1; then
+    bootstrap_python_supported python3 || die "нужен Python $SOVAGRID_MIN_PYTHON или новее"
+  fi
+  if [[ -x /usr/bin/python3 ]]; then
+    bootstrap_python_supported /usr/bin/python3 || die "в /usr/bin/python3 нужен Python $SOVAGRID_MIN_PYTHON или новее"
+  fi
+  if ! command -v python3 >/dev/null 2>&1 || [[ ! -x /usr/bin/python3 ]]; then
+    [[ $setup_mode == install ]] && command -v apt-get >/dev/null 2>&1 ||
+      die "отсутствует Python $SOVAGRID_MIN_PYTHON+ в /usr/bin/python3; установите его вручную и повторите команду"
+  fi
+}
+require_bootstrap_capabilities
+
+require_local_docker_target() {
+  local context=${DOCKER_CONTEXT:-} endpoint=${DOCKER_HOST:-}
+  [[ -z $endpoint || $endpoint == unix:///var/run/docker.sock ]] ||
+    die 'managed installation requires the local Docker socket; an explicit nonlocal DOCKER_HOST was refused'
+  if [[ -z $context && -z $endpoint ]] && command -v docker >/dev/null 2>&1; then
+    context=$(docker context show 2>/dev/null) || die 'cannot inspect the selected Docker context'
+  fi
+  if [[ -n $context ]]; then
+    command -v docker >/dev/null 2>&1 || die 'the selected Docker context cannot be inspected without a Docker CLI'
+    endpoint=$(docker context inspect "$context" --format '{{.Endpoints.docker.Host}}' 2>/dev/null) ||
+      die 'cannot inspect the selected Docker context endpoint'
+    [[ $endpoint == unix:///var/run/docker.sock ]] || die 'managed installation requires a Docker context for the local Unix socket'
+  fi
+  unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+  export DOCKER_HOST=unix:///var/run/docker.sock
+}
+require_local_docker_target
 [[ -d /opt && ! -L /opt && $(stat -c %u /opt) == 0 &&
    -z $(find /opt -maxdepth 0 -perm /022 -print -quit) ]] ||
   die 'каталог /opt должен принадлежать root и быть недоступным для записи другим'
@@ -328,7 +378,7 @@ if [[ -z ${SOVAGRID_SETUP_NONINTERACTIVE:-} ]] &&
   IFS= read -r answer <&"$tty_fd" || answer=''
   [[ -z $answer ]] || panel_path=$answer
   say 'Адрес веб-панели — ссылка для открытия этой панели с телефона и в браузере через интернет без SSH-туннеля.'
-  say 'Введите публичный IPv4 этого Ubuntu-сервера из панели провайдера или домен, указывающий на него.'
+  say 'Введите публичный IPv4 этого Linux-сервера из панели провайдера или домен, указывающий на него.'
   say 'Домен не обязателен. Если используете домен, вы должны управлять его DNS и направить его на этот сервер.'
   say 'Это адрес самой панели; дополнительные серверы подключаются позже по SSH в интерфейсе.'
   say 'Для HTTPS сервер должен принимать входящие TCP-соединения на портах 80 и 443.'
@@ -396,9 +446,12 @@ mv -Tn -- "$stage/source" "$source_root"
 
 say 'Ставлю Hub, Web, Agent и зависимости; включаю терминал, файлы и WireGuard…'
 options=(--with-terminal --with-files --with-wireguard --with-containers)
-if systemctl list-unit-files ssh.service --no-legend 2>/dev/null | grep -q '^ssh\.service '; then
-  options+=(--with-journal --journal-unit ssh.service)
-fi
+for ssh_unit in ssh.service sshd.service; do
+  if [[ $(systemctl show "$ssh_unit" --property=LoadState --value 2>/dev/null) == loaded ]]; then
+    options+=(--with-journal --journal-unit "$ssh_unit")
+    break
+  fi
+done
 SOVAGRID_INSTALLATION_LOCK_FD=6 bash "$source_root/sovagrid-blueprint/run.sh" "${options[@]}" ||
   die 'установка прервалась; исходники сохранены для диагностики, состояние служб не очищено'
 

@@ -55,6 +55,9 @@ images = _sibling("host_image_export.py", "_sovagrid_backup_images")
 PROTOCOL = "sovagrid-host-backup-operation-v1"
 PORTABLE_RECEIPT_V1 = "sovagrid-portable-host-receipt-v1"
 PORTABLE_RECEIPT = "sovagrid-portable-host-receipt-v2"
+SOVAGRID_PORTABLE_PLATFORM_PAIRS = "ubuntu:22.04 ubuntu:24.04 ubuntu:26.04"
+_PORTABLE_OS_RELEASE_PATHS = (Path("/usr/lib/os-release"), Path("/etc/os-release"))
+_MAX_OS_RELEASE_BYTES = 8192
 DEFAULT_STATE_DIR = Path("/var/lib/sovagrid-host-backup-operations")
 STATE_DIR = DEFAULT_STATE_DIR
 SOURCE = Path("/opt/sovagrid-src")
@@ -119,6 +122,49 @@ def _utc() -> str:
 def _require_root() -> None:
     if os.geteuid() != 0:
         raise Refused("ROOT_REQUIRED")
+
+
+def _require_portable_source_platform() -> None:
+    """Keep old portable archives within their Ubuntu-only restore contract.
+
+    The vendor file avoids the usual /etc/os-release symlink. Only a missing
+    vendor file permits the fixed /etc fallback; an unsafe file fails closed.
+    """
+    try:
+        raw = None
+        for path in _PORTABLE_OS_RELEASE_PATHS:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            except FileNotFoundError:
+                continue
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or
+                        stat.S_IMODE(info.st_mode) & 0o022 or
+                        not 0 < info.st_size <= _MAX_OS_RELEASE_BYTES):
+                    raise ValueError("unsafe OS release")
+                raw = os.read(fd, _MAX_OS_RELEASE_BYTES + 1)
+                if len(raw) != info.st_size:
+                    raise ValueError("OS release changed")
+            finally:
+                os.close(fd)
+            break
+        if raw is None or b"\0" in raw:
+            raise ValueError("OS release unavailable")
+        fields = {}
+        for line in raw.decode("utf-8").splitlines():
+            line = line.strip()
+            if not re.match(r"(?:ID|VERSION_ID)(?:=|\s|$)", line):
+                continue
+            match = re.fullmatch(r"(ID|VERSION_ID)=(?:'([A-Za-z0-9._-]+)'|\"([A-Za-z0-9._-]+)\"|([A-Za-z0-9._-]+))", line)
+            if match is None or match[1] in fields:
+                raise ValueError("invalid OS release fields")
+            fields[match[1]] = next(value for value in match.groups()[1:] if value is not None)
+        if (set(fields) != {"ID", "VERSION_ID"} or
+                fields["ID"] + ":" + fields["VERSION_ID"] not in SOVAGRID_PORTABLE_PLATFORM_PAIRS.split()):
+            raise ValueError("unsupported portable source")
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise Refused("PORTABLE_PLATFORM_UNSUPPORTED") from exc
 
 
 def _id(value: str) -> str:
@@ -868,6 +914,8 @@ def _spawn(action: str, identity: str, *, portable: bool = False) -> None:
 
 def start(identity: str, expected_manifest: str, *, portable: bool = False) -> dict[str, Any]:
     _require_root()
+    if portable:
+        _require_portable_source_platform()
     identity, expected_manifest = _id(identity), _hash(expected_manifest)
     with _global_lock():
         active = _active()

@@ -233,6 +233,8 @@ class AgentEnrollment:
         self.target = self.rpc_factory(ConnectionOptions(**target_connection), role="target", progress=self.progress)
         self.progress("Проверяем SSH-доступ к Hub и новому серверу…")
         self.hub.preflight(); target_platform = self.target.preflight()
+        target_platform = {key: value for key, value in target_platform.items()
+                           if key not in ("protocol", "ok", "euid")}
         hub = self.hub.call("hub-preview", {"protocol": 1})
         self._guard()
         self.record = self.journal.create({"protocol": 1, "request_id": request_id, "name": name,
@@ -274,6 +276,8 @@ class AgentEnrollment:
         self._login(username, password, credentials, session_token); password = None
         self._rpcs()
         self.hub.preflight(); target_platform = self.target.preflight()
+        target_platform = {key: value for key, value in target_platform.items()
+                           if key not in ("protocol", "ok", "euid")}
         self._bind_hub(self.hub.call("hub-preview", {"protocol": 1}))
         self.api.verify()
         reply = self._target_call("target-preview", {"protocol": 1, "request_id": request_id})

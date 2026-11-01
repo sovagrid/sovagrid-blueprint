@@ -101,6 +101,7 @@ OPERATION_ERROR = re.compile(r"[A-Z][A-Z0-9_]{1,63}\Z")
 UNIT = re.compile(r"sovagrid-[a-z0-9_.@-]{1,80}\.(?:service|socket|timer)\Z")
 CONTAINER = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 ERRORS = {
+    "PORTABLE_PLATFORM_UNSUPPORTED": "Переносимая копия хоста пока доступна только на Ubuntu 22.04/24.04/26.04; для Debian используйте копию данных Hub.",
     "SERVICES_RUNNING": "Перед полной копией остановите службы SovaGrid на сервере.",
     "CONTAINERS_RUNNING": "Перед полной копией остановите контейнеры SovaGrid на сервере.",
     "OFFLINE_CHECK_UNAVAILABLE": "Не удалось подтвердить, что службы и контейнеры остановлены.",

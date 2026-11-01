@@ -38,6 +38,8 @@ sys.dont_write_bytecode = True
 
 
 ROOT = Path("/")
+SOVAGRID_MIN_PYTHON = '3.10'
+SOVAGRID_MIN_SYSTEMD = '247'
 SOURCE = Path("/opt/sovagrid-src")
 CANDIDATES = Path("/opt/sovagrid-candidates")
 TRANSACTIONS = CANDIDATES / "hub-only-transactions"
@@ -368,11 +370,28 @@ def _container_health() -> None:
     need(inventory.is_file() and not inventory.is_symlink(), "VPN_INVENTORY")
 
 
+def runtime_supported():
+    if sys.platform != 'linux' or sys.version_info < tuple(map(int, SOVAGRID_MIN_PYTHON.split('.'))) or not Path('/proc/self').is_dir() or not Path('/run/systemd/system').is_dir():
+        return False
+    try:
+        python = subprocess.run(['/usr/bin/python3', '-B', '-I', '-c',
+                                 'import sys; sys.exit(0 if sys.version_info >= tuple(map(int, sys.argv[1].split("."))) else 1)', SOVAGRID_MIN_PYTHON],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        if python.returncode != 0: return False
+        version = subprocess.run(['/usr/bin/systemctl', 'show', '--property=Version', '--value'], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        match = re.match(rb'([0-9]+)', version.stdout[:256])
+        active = subprocess.run(['/usr/bin/systemctl', 'is-system-running'], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        return (version.returncode == 0 and match is not None and int(match.group(1)) >= int(SOVAGRID_MIN_SYSTEMD)
+                and active.returncode in (0, 1) and active.stdout.strip() in (b'running', b'degraded'))
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
 def inspect(*, external_apply_request_id: str | None = None,
             read_only_uncertain: bool = False) -> tuple[str, dict, dict[str, str], str]:
     need(os.geteuid() == 0, "ROOT")
-    release = Path("/etc/os-release").read_text()
-    need(re.search(r"(?m)^ID=ubuntu$", release) is not None, "UBUNTU")
+    need(runtime_supported(), 'UBUNTU')
     external_recovery_dependency = Path(
         "/etc/systemd/system/sovagrid-agent.service.requires/"
         "sovagrid-external-agent-recovery.service")

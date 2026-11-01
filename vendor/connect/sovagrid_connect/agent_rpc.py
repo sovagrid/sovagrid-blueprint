@@ -27,7 +27,7 @@ import uuid
 from .core import ConnectionOptions
 from .installer import InstallError, ServerInstaller, _snapshot_with_digest
 from .enrollment_protocol import (ACTIONS, FEATURE_ACTIONS, ERROR_MESSAGES, MAX_RPC, HelperError, ProtocolError,
-    decode_reply, validate_request, validate_stage_descriptor)
+    decode_reply, validate_platform, validate_request, validate_stage_descriptor)
 
 LOCAL_ERRORS = {
     "INVALID_REPLY": "Не удалось подтвердить ответ установщика. Проверьте состояние перед повтором.",
@@ -261,24 +261,39 @@ def installed_target(caller_manifest=None):
 '''
 
 _PREFLIGHT = r'''
-import json,os,platform,subprocess,sys
+import json,os,platform,re,subprocess,sys
+SOVAGRID_MIN_PYTHON = '3.10'
+SOVAGRID_MIN_SYSTEMD = '247'
 try:
-    if sys.version_info<(3,10): raise ValueError('platform')
-    values={}
-    with open('/usr/lib/os-release',encoding='utf-8') as stream:
-        for line in stream:
-            key,sep,value=line.strip().partition('=')
-            if sep: values[key]=value.strip('"')
-    if values.get('ID')!='ubuntu' or values.get('VERSION_ID') not in ('22.04','24.04','26.04'): raise ValueError('platform')
+    if sys.platform!='linux' or sys.version_info<tuple(map(int,SOVAGRID_MIN_PYTHON.split('.'))) or not os.path.isdir('/proc/self'): raise ValueError('platform')
     if not os.path.isdir('/run/systemd/system'): raise ValueError('systemd')
-    child=subprocess.Popen(['/usr/bin/systemctl','--version'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+    values={}
+    for name in ('/usr/lib/os-release','/etc/os-release'):
+        try:
+            with open(name,encoding='utf-8') as stream: raw=stream.read(8193)
+            if len(raw)>8192: continue
+        except (OSError,UnicodeError): continue
+        for line in raw.splitlines():
+            key,sep,value=line.partition('=')
+            if sep: values[key]=value.strip('"\'')
+        break
+    distribution=values.get('ID','linux')
+    if re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,63}',distribution) is None: distribution='linux'
+    release=values.get('VERSION_ID','rolling' if distribution=='arch' else 'unknown')
+    if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,63}',release) is None: release='unknown'
+    child=subprocess.Popen(['/usr/bin/systemctl','show','--property=Version','--value'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
     try: data=child.stdout.read(256)
     finally:
         if child.poll() is None: child.kill()
-        child.wait(timeout=5); child.stdout.close()
-    version=data.decode('ascii').splitlines()[0].split()[1]
-    if int(version.split('.')[0])<247: raise ValueError('systemd')
-    result={'protocol':1,'ok':True,'euid':os.geteuid(),'ubuntu_version':values['VERSION_ID'],'python_version':platform.python_version(),'systemd_version':version}
+        exit_status=child.wait(timeout=5); child.stdout.close()
+    match=re.match(rb'([0-9]+)',data)
+    if exit_status != 0 or match is None or int(match.group(1))<int(SOVAGRID_MIN_SYSTEMD): raise ValueError('systemd')
+    version=match.group(1).decode('ascii')
+    active=subprocess.run(['/usr/bin/systemctl','is-system-running'],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10,check=False)
+    if active.returncode not in (0,1) or active.stdout.strip() not in (b'running',b'degraded'): raise ValueError('systemd')
+    identity=({'ubuntu_version':release} if distribution=='ubuntu' else
+              {'distribution':distribution,'version':release})
+    result={'protocol':1,'ok':True,'euid':os.geteuid(),**identity,'python_version':platform.python_version(),'systemd_version':version}
 except ValueError as error:
     result={'protocol':1,'ok':False,'error':'UNSUPPORTED_SYSTEMD' if str(error)=='systemd' else 'UNSUPPORTED_PLATFORM'}
 except Exception:
@@ -592,18 +607,16 @@ class AgentRPC:
 
     def preflight(self):
         with self._operation():
-            self._progress("Проверка Ubuntu, Python и прав установки по SSH…")
+            self._progress("Проверка Linux, Python, systemd и прав установки по SSH…")
             def probe(prefix):
                 raw, code = self._exchange(_PREFLIGHT, (), self._timeouts["preflight"], prefix=prefix)
                 value = self._public(raw, code)
-                expected = {"protocol", "ok", "euid", "ubuntu_version", "python_version", "systemd_version"}
-                if set(value) != expected or type(value["euid"]) is not int or not 0 <= value["euid"] <= 2**31 - 1:
+                if type(value.get("euid")) is not int or not 0 <= value["euid"] <= 2**31 - 1:
                     raise RPCError("INVALID_REPLY")
-                if any(not isinstance(value[key], str) or not 1 <= len(value[key]) <= 64 or not value[key].isprintable() for key in
-                       ("ubuntu_version", "python_version", "systemd_version")):
-                    raise RPCError("INVALID_REPLY")
-                if value["ubuntu_version"] not in ("22.04", "24.04", "26.04"):
-                    raise RPCError("UNSUPPORTED_PLATFORM")
+                try:
+                    validate_platform({key: item for key, item in value.items() if key not in {"protocol", "ok", "euid"}})
+                except ProtocolError:
+                    raise RPCError("INVALID_REPLY") from None
                 return value
             value = probe("")
             prefix = ""

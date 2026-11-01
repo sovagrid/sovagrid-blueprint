@@ -14,6 +14,8 @@ import struct
 import uuid
 
 MAX_RPC = 32768
+SOVAGRID_MIN_PYTHON = '3.10'
+SOVAGRID_MIN_SYSTEMD = '247'
 CAS_FIELDS = {"source_manifest_sha256", "features_sha256", "policy_sha256", "state_sha256"}
 PHASES = ("prepared", "transport_ready", "registered", "active")
 FEATURE_ACTIONS = frozenset(("target-features-status", "target-features-preview", "target-features-apply"))
@@ -22,7 +24,8 @@ ACTIONS = frozenset(("target-preview", "target-prepare", "target-transport", "ta
 ERROR_MESSAGES = {
     "INVALID_REQUEST": "Помощник отклонил параметры установки.",
     "ROOT_REQUIRED": "Нужен SSH-вход root или пользователь с доступом sudo без пароля.",
-    "UNSUPPORTED_PLATFORM": "Нужен Ubuntu 22.04, 24.04 или 26.04 с Python 3.10 или новее.",
+    "UNSUPPORTED_PLATFORM": "Нужен Linux с Python 3.10 или новее, systemd 247 или новее и доступным /proc.",
+    "UNSUPPORTED_DEPENDENCIES": "На сервере отсутствуют необходимые зависимости; установите Python, доверенные сертификаты и OpenSSH client доступным пакетным менеджером.",
     "UNSUPPORTED_SYSTEMD": "На сервере недоступны systemd и защищённая передача ключа службе.",
     "SOURCE_UNTRUSTED": "Не удалось подтвердить происхождение установщика. Обновите Hub проверенным пакетом.",
     "SOURCE_CHANGED": "Исходники изменились. Повторите проверку установки.",
@@ -97,6 +100,38 @@ def _text(value, maximum):
 def validate_cas(value):
     exact(value, CAS_FIELDS)
     return {key: _sha(value[key]) for key in sorted(CAS_FIELDS)}
+
+
+def validate_platform_identity(distribution, version):
+    _require(isinstance(distribution, str) and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", distribution) is not None)
+    _require(isinstance(version, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", version) is not None)
+
+
+def validate_platform(value):
+    """Validate runtime capabilities and bounded display metadata, preserving Ubuntu v1."""
+    _require(isinstance(value, dict))
+    if set(value) == {"ubuntu_version", "python_version", "systemd_version"}:
+        distribution, version = "ubuntu", _text(value["ubuntu_version"], 64)
+    else:
+        exact(value, {"distribution", "version", "python_version", "systemd_version"})
+        distribution = _text(value["distribution"], 64)
+        version = _text(value["version"], 64)
+    validate_platform_identity(distribution, version)
+    python_version = _text(value["python_version"], 64)
+    systemd_version = _text(value["systemd_version"], 64)
+    match = re.fullmatch(r"([0-9]+)\.([0-9]+)(?:\.[0-9]+)?", python_version)
+    _require(match is not None and tuple(map(int, match.groups())) >= tuple(map(int, SOVAGRID_MIN_PYTHON.split('.'))))
+    _require(re.fullmatch(r"[0-9]+", systemd_version) is not None and int(systemd_version) >= int(SOVAGRID_MIN_SYSTEMD))
+    return value
+
+
+def platform_label(value):
+    """Display only the validated OS identity from either public record."""
+    validate_platform(value)
+    if "ubuntu_version" in value:
+        return "Ubuntu " + value["ubuntu_version"]
+    return {"ubuntu": "Ubuntu", "debian": "Debian", "arch": "Arch Linux", "fedora": "Fedora",
+            "linux": "Linux"}.get(value["distribution"], value["distribution"]) + " " + value["version"]
 
 
 def public_key_fingerprint(value):
@@ -308,8 +343,7 @@ def validate_reply(action, value, *, request=None):
             if action == "target-activate":
                 _require(value["target"]["phase"] == "active")
         if "platform" in value:
-            exact(value["platform"], {"ubuntu_version", "python_version", "systemd_version"})
-            for item in value["platform"].values(): _text(item, 64)
+            validate_platform(value["platform"])
         if "services" in value:
             exact(value["services"], {"tunnel", "agent"})
             _require(all(type(item) is bool for item in value["services"].values()))

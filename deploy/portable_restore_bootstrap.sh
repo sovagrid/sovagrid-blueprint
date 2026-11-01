@@ -25,9 +25,14 @@ manifest_sha=$4
 [[ $EUID == 0 ]] || fail ROOT_REQUIRED
 [[ -r /etc/os-release ]] || fail UNSUPPORTED_TARGET
 # shellcheck disable=SC1091
+unset ID VERSION_ID
 . /etc/os-release
-[[ ${ID:-} == ubuntu && ( ${VERSION_ID:-} == 22.04 || ${VERSION_ID:-} == 24.04 || ${VERSION_ID:-} == 26.04 ) &&
-   -d /run/systemd/system && $(cat /proc/1/comm) == systemd ]] || fail UNSUPPORTED_TARGET
+SOVAGRID_PORTABLE_PLATFORM_PAIRS='ubuntu:22.04 ubuntu:24.04 ubuntu:26.04'
+restore_platform_supported=0
+for restore_pair in $SOVAGRID_PORTABLE_PLATFORM_PAIRS; do
+  if [[ $restore_pair == "${ID:-}:${VERSION_ID:-}" ]]; then restore_platform_supported=1; break; fi
+done
+[[ $restore_platform_supported == 1 && -d /run/systemd/system && $(cat /proc/1/comm) == systemd ]] || fail UNSUPPORTED_TARGET
 for tool in stat sha256sum timeout head dd tar find flock sync install mktemp cmp cut; do
   command -v "$tool" >/dev/null || fail BOOTSTRAP_TOOL_UNAVAILABLE
 done

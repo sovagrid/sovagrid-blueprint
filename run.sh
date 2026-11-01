@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Jigokuraku01
 # Additional author attribution terms: see ATTRIBUTION.md.
-# Install or update only the SovaGrid stack on an Ubuntu host.
+# Install or update only the SovaGrid stack on a supported Linux host.
 # SOVAGRID_JOURNAL_INSTALL_V1
 # SOVAGRID_CONTAINER_INVENTORY_V1
 # SOVAGRID_PUBLIC_WEB_V1
@@ -26,7 +26,7 @@ installation_lock() {
   # older updaters may already hold the later candidate/public locks.
   local lock=/run/sovagrid-installation.lock inherited=${SOVAGRID_INSTALLATION_LOCK_FD:-}
   command -v flock >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 ||
-    die 'installation requires flock and stat from Ubuntu core utilities'
+    die 'installation requires flock and stat from Linux core utilities'
   [[ ! -L $lock ]] || die 'installation lock is unsafe'
   if [[ ! -e $lock ]]; then
     ( set -o noclobber; : > "$lock" ) 2>/dev/null ||
@@ -53,17 +53,81 @@ installation_lock() {
 }
 
 [[ ${EUID} -eq 0 ]] || die 'run as root (sudo ./run.sh)'
-[[ -r /etc/os-release ]] || die 'cannot identify the operating system'
-# shellcheck disable=SC1091
-. /etc/os-release
-[[ ${ID:-} == ubuntu ]] || die 'this installer currently supports Ubuntu only'
+SOVAGRID_MIN_SYSTEMD='247'
+SOVAGRID_MIN_PYTHON='3.10'
+
+python_version_supported() {
+  "$1" -B -I -c 'import sys; minimum=tuple(map(int, sys.argv[1].split("."))); sys.exit(sys.version_info[:2] < minimum)' \
+    "$SOVAGRID_MIN_PYTHON"
+}
+
+require_host_capabilities() {
+  local tool state version major record
+  local -a missing=()
+  (( BASH_VERSINFO[0] >= 4 )) || die 'Bash 4 or newer is required'
+  for tool in basename cat chmod chown cmp cut dirname env find flock getent grep groupadd id \
+              install ln mkdir mktemp mv rm runuser sha256sum stat systemctl systemd-analyze touch tr uname useradd; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  (( ${#missing[@]} == 0 )) || die "missing required host tools: ${missing[*]}; prepare these tools before installing"
+  [[ $(uname -s) == Linux ]] || die 'a Linux kernel is required'
+  [[ -d /run/systemd/system ]] || die 'an active systemd manager is required'
+  state=$(systemctl is-system-running 2>/dev/null) || true
+  [[ $state == running || $state == degraded ]] || die 'an active systemd manager is required (running or degraded)'
+  version=$(systemctl show --property=Version --value 2>/dev/null) || die 'cannot query the active systemd manager version'
+  [[ $version =~ ^([1-9][0-9]*) ]] || die 'cannot parse the active systemd manager version'
+  major=${BASH_REMATCH[1]}
+  (( ${#major} <= 4 && 10#$major >= SOVAGRID_MIN_SYSTEMD )) || die "systemd $SOVAGRID_MIN_SYSTEMD or newer is required"
+  [[ -d /proc/self/fd && -r /proc/stat && -r /proc/meminfo && -r /proc/net/dev ]] ||
+    die 'Linux procfs with process descriptors, CPU, memory and network counters is required'
+  record=$(getent passwd root) || die 'the root user must resolve through getent'
+  [[ $record == root:*:0:0:* ]] || die 'the root user must have UID and primary GID 0'
+  record=$(getent group root) || die 'the root group must resolve through getent'
+  [[ $record == root:*:0:* ]] || die 'the root group must have GID 0'
+  [[ -x /usr/sbin/nologin ]] || die 'service identities require /usr/sbin/nologin'
+  [[ $(stat -c '%u:%g' /) == 0:0 ]] || die 'Linux stat -c and a root-owned filesystem root are required'
+  if command -v python3 >/dev/null 2>&1; then
+    python_version_supported python3 || die "Python $SOVAGRID_MIN_PYTHON or newer is required"
+  fi
+  if [[ -x /usr/bin/python3 ]]; then
+    python_version_supported /usr/bin/python3 || die "/usr/bin/python3 must be Python $SOVAGRID_MIN_PYTHON or newer"
+  fi
+}
+require_host_capabilities
+
+require_local_docker_target() {
+  local context=${DOCKER_CONTEXT:-} endpoint=${DOCKER_HOST:-}
+  [[ -z $endpoint || $endpoint == unix:///var/run/docker.sock ]] ||
+    die 'managed installation requires the local Docker socket; an explicit nonlocal DOCKER_HOST was refused'
+  if [[ -z $context && -z $endpoint ]] && command -v docker >/dev/null 2>&1; then
+    context=$(docker context show 2>/dev/null) || die 'cannot inspect the selected Docker context'
+  fi
+  if [[ -n $context ]]; then
+    command -v docker >/dev/null 2>&1 || die 'the selected Docker context cannot be inspected without a Docker CLI'
+    endpoint=$(docker context inspect "$context" --format '{{.Endpoints.docker.Host}}' 2>/dev/null) ||
+      die 'cannot inspect the selected Docker context endpoint'
+    [[ $endpoint == unix:///var/run/docker.sock ]] || die 'managed installation requires a Docker context for the local Unix socket'
+  fi
+  unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+  export DOCKER_HOST=unix:///var/run/docker.sock
+}
 
 apt_refreshed=0
 apt_refresh() {
+  command -v apt-get >/dev/null 2>&1 || die 'automatic package installation is unavailable; prepare the missing dependencies manually'
   if (( ! apt_refreshed )); then
     DEBIAN_FRONTEND=noninteractive apt-get update
     apt_refreshed=1
   fi
+}
+
+install_packages() {
+  local capabilities=$1
+  shift
+  command -v apt-get >/dev/null 2>&1 ||
+    die "missing dependencies: $capabilities; no automatic package adapter is available, install them manually and rerun"
+  apt_refresh
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-remove "$@"
 }
 
 restore_docker_with_binary() {
@@ -99,41 +163,190 @@ restore_retained_docker_empty() {
   done
 }
 
+require_new_docker_target() {
+  if command -v dockerd >/dev/null 2>&1 || systemctl is-active --quiet docker.service; then
+    die 'an existing Docker engine requires manual inspection before dependency installation'
+  fi
+  restore_retained_docker_empty /
+}
+
+compose_plugin_supported() {
+  local version major
+  version=$("$@" compose version --short 2>/dev/null) || return 1
+  [[ $version =~ ^v?([1-9][0-9]*)\.[0-9]+\.[0-9]+([+-][[:alnum:]._-]+)?$ ]] || return 1
+  major=${BASH_REMATCH[1]}
+  (( ${#major} <= 4 && 10#$major >= 2 ))
+}
+
+apt_compose_candidate_supported() {
+  local policy field candidate rest major
+  command -v apt-get >/dev/null 2>&1 && command -v apt-cache >/dev/null 2>&1 || return 1
+  policy=$(LC_ALL=C apt-cache policy "$1") || return 1
+  while read -r field candidate rest; do
+    [[ $field == Candidate: ]] || continue
+    candidate=${candidate#*:}
+    [[ $candidate =~ ^([1-9][0-9]*)\. ]] || return 1
+    major=${BASH_REMATCH[1]}
+    (( ${#major} <= 4 && 10#$major >= 2 ))
+    return
+  done <<< "$policy"
+  return 1
+}
+
+apt_compose_preserves_docker() {
+  # A Compose dependency must not install, replace, upgrade or restart an
+  # existing Docker engine/CLI/runtime. Use the independent plugin instead.
+  local plan action package rest
+  command -v apt-get >/dev/null 2>&1 || return 1
+  plan=$(LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get --simulate install \
+    --no-install-recommends --no-remove "$1") || return 1
+  while read -r action package rest; do
+    package=${package%%:*}
+    case $action:$package in
+      Remv:*|Inst:docker.io|Conf:docker.io|Inst:docker-ce|Conf:docker-ce|\
+      Inst:docker-ce-cli|Conf:docker-ce-cli|Inst:docker-cli|Conf:docker-cli|Inst:docker-ce-rootless-extras|Conf:docker-ce-rootless-extras|\
+      Inst:containerd|Conf:containerd|Inst:containerd.io|Conf:containerd.io|Inst:runc|Conf:runc|\
+      Inst:moby-engine|Conf:moby-engine|Inst:moby-cli|Conf:moby-cli|\
+      Inst:moby-containerd|Conf:moby-containerd|Inst:moby-runc|Conf:moby-runc) return 1 ;;
+    esac
+  done <<< "$plan"
+}
+
+install_compose_binary() (
+  # Docker documents this system-wide plugin path. Pin the official stable
+  # release and asset digests reviewed at:
+  # https://api.github.com/repos/docker/compose/releases/tags/v5.6.1
+  # https://docs.docker.com/compose/install/linux/#install-the-plugin-manually
+  local version=v5.6.1 architecture digest directory mode
+  local destination=/usr/local/lib/docker/cli-plugins/docker-compose
+  case $(uname -m) in
+    x86_64|amd64) architecture=x86_64; digest=47737f4236e6d3ccea7291995203f8f018058783b4c3a9469119811a0b5db8c0 ;;
+    aarch64|arm64) architecture=aarch64; digest=42cfa75f51ad0ccf290bad37899e0038a8c10a0069e85233ecc1d53e3ff1347d ;;
+    *) die 'automatic Compose download supports amd64 and arm64 only' ;;
+  esac
+  if ! command -v curl >/dev/null 2>&1; then
+    install_packages 'curl with HTTPS support and trusted CA certificates' curl ca-certificates
+  fi
+  command -v sha256sum >/dev/null 2>&1 || die 'Compose verification requires sha256sum'
+  for directory in /usr /usr/local /usr/local/lib /usr/local/lib/docker /usr/local/lib/docker/cli-plugins; do
+    if [[ ! -e $directory && ! -L $directory ]]; then
+      install -d -o root -g root -m 0755 "$directory"
+    fi
+    [[ -d $directory && ! -L $directory && $(stat -c '%u:%g' "$directory") == 0:0 ]] ||
+      die 'system-wide Docker plugin directory is unsafe'
+    mode=$(stat -c '%a' "$directory")
+    [[ $mode =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 022) == 0 )) ||
+      die 'system-wide Docker plugin directory permissions are unsafe'
+  done
+  [[ ! -e $destination && ! -L $destination ]] ||
+    die 'existing system-wide Compose plugin requires manual inspection'
+  # This variable belongs to the subshell, so it remains available to its
+  # EXIT trap after Bash has unwound function-local variables.
+  compose_download_stage=$(mktemp -d /usr/local/lib/docker/cli-plugins/.sovagrid-compose.XXXXXXXX) ||
+    die 'cannot create a private Compose download directory'
+  trap 'rm -rf -- "$compose_download_stage"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+    --connect-timeout 15 --max-time 240 --max-filesize 67108864 \
+    --output "$compose_download_stage/docker-compose" \
+    "https://github.com/docker/compose/releases/download/$version/docker-compose-linux-$architecture" ||
+    die 'cannot download the pinned official Compose plugin over HTTPS; curl and trusted CA certificates are required'
+  [[ -s $compose_download_stage/docker-compose && ! -L $compose_download_stage/docker-compose && \
+     $(stat -c '%s' "$compose_download_stage/docker-compose") -le 67108864 ]] || die 'Compose download is empty or too large'
+  printf '%s  %s\n' "$digest" "$compose_download_stage/docker-compose" | sha256sum --check --status ||
+    die 'the downloaded Compose plugin SHA-256 does not match the reviewed release'
+  chmod 0755 "$compose_download_stage/docker-compose"
+  [[ $("$compose_download_stage/docker-compose" version --short) == "${version#v}" ]] ||
+    die 'the verified Compose plugin cannot run on this host'
+  [[ ! -e $destination && ! -L $destination ]] || die 'system-wide Compose plugin appeared during download'
+  # No-clobber publication preserves a plugin installed by another administrator.
+  ln -- "$compose_download_stage/docker-compose" "$destination" || die 'cannot safely install the verified Compose plugin'
+)
+
 install_core_dependencies() {
-  local restore_mode=${1:-0} docker_available=0
-  local -a docker_command=(docker)
-  if [[ $restore_mode == restore ]]; then
-    docker_command=(restore_local_docker)
-    [[ ! -x /usr/bin/docker ]] || docker_available=1
-  elif command -v docker >/dev/null 2>&1; then
+  local restore_mode=${1:-0} docker_available=0 package
+  local -a missing=()
+  local -a docker_command=(restore_local_docker)
+  if [[ -x /usr/bin/docker ]]; then
     docker_available=1
+  elif command -v docker >/dev/null 2>&1; then
+    die 'missing dependency: /usr/bin/docker; prepare the existing Docker installation manually before continuing'
   fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    apt_refresh
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3
+  if (( docker_available )); then
+    "${docker_command[@]}" info >/dev/null || die 'Docker daemon is unavailable; existing containers were not changed'
+    [[ $("${docker_command[@]}" info --format '{{.OSType}}') == linux ]] ||
+      die 'Docker Engine must support Linux containers on this managed host'
   fi
-  python3 -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ is required"' || die 'Python 3.10+ is required'
+  if ! command -v python3 >/dev/null 2>&1 || [[ ! -x /usr/bin/python3 ]]; then missing+=("Python $SOVAGRID_MIN_PYTHON+ at /usr/bin/python3"); fi
+  (( docker_available )) || missing+=('Docker CLI at /usr/bin/docker and running Engine')
+  command -v ip >/dev/null 2>&1 || missing+=('ip')
+  command -v ss >/dev/null 2>&1 || missing+=('ss')
+  if (( ${#missing[@]} )) && ! command -v apt-get >/dev/null 2>&1; then
+    die "missing dependencies: ${missing[*]}; no automatic package adapter is available, install them manually and rerun"
+  fi
+  if (( ! docker_available )); then require_new_docker_target; fi
+  if ! command -v python3 >/dev/null 2>&1 || [[ ! -x /usr/bin/python3 ]]; then
+    install_packages "Python $SOVAGRID_MIN_PYTHON+ at /usr/bin/python3" python3
+  fi
+  python_version_supported python3 && python_version_supported /usr/bin/python3 ||
+    die "Python $SOVAGRID_MIN_PYTHON or newer is required at /usr/bin/python3 and on PATH"
+  if ! command -v ip >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then
+    install_packages 'iproute2 commands: ip ss' iproute2
+  fi
+  command -v ip >/dev/null 2>&1 && command -v ss >/dev/null 2>&1 || die 'missing dependencies: ip ss (iproute2)'
 
   if (( ! docker_available )); then
-    say 'installing Docker from Ubuntu packages'
-    apt_refresh
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker.io
+    say 'installing Docker from Linux distribution packages'
+    install_packages 'Docker CLI and Engine' docker.io
     systemctl enable --now docker
   fi
   "${docker_command[@]}" info >/dev/null || die 'Docker daemon is unavailable; existing containers were not changed'
+  [[ $("${docker_command[@]}" info --format '{{.OSType}}') == linux ]] ||
+    die 'Docker Engine must support Linux containers on this managed host'
 
-  if ! "${docker_command[@]}" compose version >/dev/null 2>&1; then
+  if ! compose_plugin_supported "${docker_command[@]}"; then
     say 'installing the Docker Compose plugin'
-    apt_refresh
-    if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-compose-v2
-    elif apt-cache show docker-compose-plugin >/dev/null 2>&1; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-compose-plugin
-    else
-      die 'no Compose plugin package is available in configured APT repositories'
-    fi
+    if command -v apt-get >/dev/null 2>&1; then apt_refresh; fi
+    # Debian 13 calls its V2 package docker-compose; Debian 12's package of
+    # the same name is V1 and must never satisfy this prerequisite.
+    for package in docker-compose-v2 docker-compose-plugin docker-compose; do
+      if apt_compose_candidate_supported "$package" && apt_compose_preserves_docker "$package"; then
+        install_packages 'Docker Compose V2 or newer plugin' "$package"
+        compose_plugin_supported "${docker_command[@]}" && break
+      fi
+    done
+    if ! compose_plugin_supported "${docker_command[@]}"; then install_compose_binary; fi
   fi
-  "${docker_command[@]}" compose version >/dev/null || die 'Docker Compose is unavailable'
+  compose_plugin_supported "${docker_command[@]}" || die 'Docker Compose V2 or newer is unavailable'
+  # Version output alone does not prove that this plugin can negotiate with
+  # the installed daemon. This only lists containers; it creates no resources.
+  printf 'services:\n  probe:\n    image: scratch\n' | \
+    "${docker_command[@]}" compose --project-name sovagrid-installer-preflight --file - ps --all --quiet >/dev/null ||
+    die 'Docker Compose cannot communicate with the existing daemon; existing containers were not changed'
+  "${docker_command[@]}" compose version
+}
+
+install_wireguard_dependencies() {
+  (( ${with_wireguard:-0} )) || return 0
+  local tool crypto_available=0
+  local -a missing=()
+  for tool in wg wg-quick ip; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  if /usr/bin/python3 -B -I -c 'import cryptography' >/dev/null 2>&1; then crypto_available=1; fi
+  (( crypto_available )) || missing+=('Python cryptography')
+  if (( ${#missing[@]} )) && ! command -v apt-get >/dev/null 2>&1; then
+    die "missing WireGuard dependencies: ${missing[*]}; no automatic package adapter is available, install them manually and rerun"
+  fi
+  if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1 || ! command -v ip >/dev/null 2>&1; then
+    install_packages 'WireGuard wg wg-quick and iproute2 ip' wireguard-tools iproute2
+  fi
+  if (( ! crypto_available )); then
+    install_packages 'Python cryptography for sealed client-profile export' python3-cryptography
+  fi
+  command -v wg >/dev/null && command -v wg-quick >/dev/null && command -v ip >/dev/null &&
+    /usr/bin/python3 -B -I -c 'import cryptography' >/dev/null || die 'WireGuard feature dependencies are incomplete'
 }
 
 restore_target_empty() {
@@ -314,7 +527,18 @@ PY
 
 restore_dependencies_only() {
   local expected=$1 blueprint_dir source_root source_manifest actual_manifest
-  [[ ${VERSION_ID:-} == 22.04 || ${VERSION_ID:-} == 24.04 || ${VERSION_ID:-} == 26.04 ]] ||
+  local restore_platform_supported=0 restore_pair
+  [[ -r /etc/os-release ]] || die 'restore dependency setup requires Ubuntu 22.04, 24.04 or 26.04'
+  # This restriction belongs to the archived portable-restore schema only.
+  # Ordinary installation is admitted by capabilities above.
+  unset ID VERSION_ID
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  SOVAGRID_PORTABLE_PLATFORM_PAIRS='ubuntu:22.04 ubuntu:24.04 ubuntu:26.04'
+  for restore_pair in $SOVAGRID_PORTABLE_PLATFORM_PAIRS; do
+    if [[ $restore_pair == "${ID:-}:${VERSION_ID:-}" ]]; then restore_platform_supported=1; break; fi
+  done
+  (( restore_platform_supported )) ||
     die 'restore dependency setup requires Ubuntu 22.04, 24.04 or 26.04'
   [[ -d /run/systemd/system ]] || die 'restore dependency setup requires systemd'
   [[ $expected =~ ^[0-9a-f]{64}$ ]] || die 'expected source manifest must be a SHA-256 digest'
@@ -347,8 +571,7 @@ restore_dependencies_only() {
   restore_target_empty /
   install_core_dependencies restore
   if [[ ! -x /usr/bin/ss ]]; then
-    apt_refresh
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2
+    install_packages 'iproute2 command /usr/bin/ss' iproute2
   fi
   [[ -x /usr/bin/docker && -x /usr/bin/ss ]] ||
     die 'restore requires the Ubuntu Docker and iproute2 binaries in /usr/bin'
@@ -357,8 +580,7 @@ restore_dependencies_only() {
   if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1 ||
      ! command -v nft >/dev/null 2>&1 ||
      ! /usr/bin/python3 -I -c 'import cryptography' >/dev/null 2>&1; then
-    apt_refresh
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    install_packages 'WireGuard wg wg-quick, Python cryptography, nftables' \
       wireguard-tools python3-cryptography nftables
   fi
   command -v wg >/dev/null && command -v wg-quick >/dev/null && command -v nft >/dev/null &&
@@ -375,6 +597,7 @@ if [[ ${1:-} == --restore-dependencies-only ]]; then
   restore_dependencies_only "$3"
   exit 0
 fi
+require_local_docker_target
 installation_lock
 # An older SSH updater does not snapshot the new timer units. Refuse before
 # changing this host if it supervises an upgrade without that rollback support.
@@ -698,6 +921,8 @@ if (( ! backup_broker_deferred )) && [[ ${SOVAGRID_PUBLIC_WEB_LOCK_HELD:-0} != 1
 fi
 
 install_core_dependencies
+docker() { restore_local_docker "$@"; }
+install_wireguard_dependencies
 
 for repo in sovagrid-hub sovagrid-web sovagrid-agent sovagrid-vpn; do
   path="$source_root/$repo"
@@ -707,8 +932,7 @@ for repo in sovagrid-hub sovagrid-web sovagrid-agent sovagrid-vpn; do
     github_owner=${SOVAGRID_GITHUB_OWNER:-sovagrid}
     [[ $github_owner =~ ^[A-Za-z0-9-]+$ ]] || die 'invalid GitHub owner name'
     if ! command -v git >/dev/null 2>&1; then
-      apt_refresh
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git
+      install_packages 'git for SOVAGRID_FETCH_MISSING' git
     fi
     say "cloning $repo from GitHub over HTTPS"
     git clone -- "https://github.com/${github_owner}/${repo}.git" "$path"
@@ -1447,15 +1671,7 @@ if (( with_wireguard )); then
   for required in sovagrid-vpn-ctl sovagrid-vpn-broker sovagrid-vpn-control.service sovagrid-vpn-control.socket; do
     [[ -f $source_root/sovagrid-vpn/deploy/$required && ! -L $source_root/sovagrid-vpn/deploy/$required ]] || die "VPN control source $required is missing or a symlink"
   done
-  if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1 || ! command -v ip >/dev/null 2>&1; then
-    apt_refresh
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends wireguard-tools iproute2
-  fi
-  if ! /usr/bin/python3 -I -c 'import cryptography' >/dev/null 2>&1; then
-    apt_refresh
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-cryptography
-  fi
-  /usr/bin/python3 -I -c 'import cryptography' >/dev/null 2>&1 || die 'Python cryptography is required for sealed client-profile export'
+  /usr/bin/python3 -B -I -c 'import cryptography' >/dev/null 2>&1 || die 'Python cryptography is required for sealed client-profile export'
   if [[ -f /etc/apparmor.d/wg-quick ]]; then
     python3 "$source_root/sovagrid-vpn/deploy/install-wg-quick-apparmor.py"
   fi

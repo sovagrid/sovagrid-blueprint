@@ -1,0 +1,47 @@
+{
+  "format": 1,
+  "hub_runtime": {
+    "container_os": "linux",
+    "python_minimum": "3.10"
+  },
+  "managed_host": {
+    "kernel": "linux",
+    "python_executable": "/usr/bin/python3",
+    "python_minimum": "3.10",
+    "systemd_minimum": "247",
+    "systemd_states": [
+      "running",
+      "degraded"
+    ],
+    "identity": "posix-root-uid-and-gid-0",
+    "nologin": "/usr/sbin/nologin",
+    "procfs": [
+      "/proc/stat",
+      "/proc/meminfo",
+      "/proc/net/dev",
+      "/proc/self/fd"
+    ],
+    "command_semantics": [
+      "gnu-coreutils",
+      "util-linux",
+      "iproute2"
+    ],
+    "automatic_package_adapters": [
+      "apt"
+    ],
+    "container_engine": "docker",
+    "compose_minimum_major": 2,
+    "bash_minimum_major": 4,
+    "journal": "systemd-journal-runtime",
+    "docker_executable": "/usr/bin/docker",
+    "docker_endpoint": "unix:///var/run/docker.sock"
+  },
+  "portable_restore": {
+    "contract": "full/v2",
+    "platform_pairs": [
+      "ubuntu:22.04",
+      "ubuntu:24.04",
+      "ubuntu:26.04"
+    ]
+  }
+}

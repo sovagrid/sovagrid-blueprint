@@ -221,19 +221,24 @@ class FilesTests(unittest.TestCase):
         with self.assertRaises(helper.Refuse):
             enrollment.policy_snapshot("hub")
 
+    @mock.patch.object(helper.sys, 'platform', 'linux')
     def test_supported_ubuntu26_and_loadcredential_gate(self):
         self.files.mkdir("/usr/lib",0o755)
         self.files.write("/usr/lib/os-release",b'ID=ubuntu\nVERSION_ID="26.04"\n',mode=0o644)
         self.files.mkdir("/run/systemd/system",0o755)
+        self.files.mkdir("/proc/self",0o755)
         commands=mock.Mock()
-        commands.run.return_value=(0,b"systemd 259 (259.1)\n")
+        commands.run.side_effect=lambda argv, **kwargs: (0, b"259.1\n" if 'show' in argv else b"running\n" if 'is-system-running' in argv else b"")
         enrollment=helper.Enrollment(root=self.root,owner=os.getuid(),commands=commands)
         self.assertEqual(enrollment.platform()["ubuntu_version"],"26.04")
         self.assertEqual(enrollment.platform()["systemd_version"],"259")
-        commands.run.return_value=(0,b"systemd 246\n")
+        commands.run.side_effect=None
+        commands.run.return_value=(0,b"246\n")
         with self.assertRaises(helper.Refuse):
             enrollment.platform()
 
+    @mock.patch.object(helper.sys, 'platform', 'linux')
+    @mock.patch.object(helper.Enrollment, 'dependencies_present', lambda self: True)
     def test_real_key_target_prepare_is_repeatable_and_never_exports_secrets(self):
         source, _ = self.source_fixture()
         root = "/opt/sovagrid-src"
@@ -252,6 +257,7 @@ class FilesTests(unittest.TestCase):
         self.files.mkdir("/usr/lib",0o755)
         self.files.write("/usr/lib/os-release",b'ID=ubuntu\nVERSION_ID="26.04"\n',mode=0o644)
         self.files.mkdir("/run/systemd/system",0o755)
+        self.files.mkdir("/proc/self",0o755)
         entries={};groups={};calls=[];real=helper.Commands();files=self.files
         def lookup(name):
             if name not in entries:raise KeyError(name)
@@ -261,7 +267,9 @@ class FilesTests(unittest.TestCase):
             return groups[name]
         def command(argv,**options):
             calls.append(argv)
-            if argv[:2]==["/usr/bin/systemctl","--version"]:return 0,b"systemd 259\n"
+            if argv[:2]==["/usr/bin/systemctl","show"]:return 0,b"259\n"
+            if argv[:2]==["/usr/bin/systemctl","is-system-running"]:return 0,b"running\n"
+            if argv[0]=="/usr/bin/python3":return 0,b""
             if argv[0]=="/usr/bin/dpkg-query":return 0,b"install ok installed\n"*3
             if argv[0]=="/usr/sbin/useradd":
                 comment = argv[argv.index("--comment")+1]
@@ -358,6 +366,7 @@ class StateCapacityTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.runner = helper.Enrollment(root=Path(self.temp.name), owner=os.getuid(), commands=mock.Mock())
+        self.runner.commands.run.side_effect = lambda argv, **kwargs: (0, b"loaded\n" if '--property=LoadState' in argv else b"")
         self.runner.check_cas = mock.Mock()
         self.runner.cas = mock.Mock(return_value=dict.fromkeys(helper.CAS_FIELDS, "a" * 64))
         self.files = self.runner.files

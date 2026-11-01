@@ -3,7 +3,7 @@
 # Additional author attribution terms: see ATTRIBUTION.md.
 """Rootless journal and interruption tests for managed host snapshots."""
 
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import io
 import json
 import hashlib
@@ -64,6 +64,7 @@ class OrchestratorTests(unittest.TestCase):
         patches = (
             patch.object(operation, "STATE_DIR", self.state_dir),
             patch.object(operation, "_require_root"),
+            patch.object(operation, "_require_portable_source_platform"),
             patch.object(operation.backup, "_source_manifest", return_value=MANIFEST),
             patch.object(operation.backup, "plan", return_value=PLAN),
             patch.object(operation.backup, "list_archives", return_value={"archives": []}),
@@ -96,6 +97,14 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(stored["expected_manifest_sha256"], MANIFEST)
         self.assertRegex(stored["archive_id"], r"^[0-9a-f]{32}$")
         self.assertEqual(stored["container_ids"], {"hub": "c" * 64, "web": "d" * 64})
+
+    def test_ordinary_backup_does_not_apply_portable_platform_restriction(self):
+        with patch.object(operation, "_require_portable_source_platform",
+                          side_effect=operation.Refused("PORTABLE_PLATFORM_UNSUPPORTED")) as platform:
+            accepted = self._start()
+        platform.assert_not_called()
+        self.assertEqual(accepted["phase"], "accepted")
+        operation._spawn.assert_called_once_with("run", REQUEST)
 
     def test_corrupted_journal_types_return_stable_error(self):
         self._start()
@@ -626,6 +635,88 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(recovery_unit, "--unit=sg-host-backup-recover-" + REQUEST)
             REAL_SPAWN("run", REQUEST, portable=True)
             self.assertIn("--property=RuntimeMaxSec=2700", run.call_args.args[0])
+
+
+class PortableSourcePlatformTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.vendor = self.root / "usr/lib/os-release"
+        self.fallback = self.root / "etc/os-release"
+        self.vendor.parent.mkdir(parents=True)
+        self.fallback.parent.mkdir(parents=True)
+        paths = patch.object(operation, "_PORTABLE_OS_RELEASE_PATHS", (self.vendor, self.fallback))
+        paths.start()
+        self.addCleanup(paths.stop)
+        # Rootless fixtures model the fixed root-owned system files only.
+        real_fstat = os.fstat
+
+        def owned_by_root(fd):
+            info = list(real_fstat(fd))
+            info[4] = 0
+            return os.stat_result(info)
+
+        owner = patch.object(operation.os, "fstat", side_effect=owned_by_root)
+        owner.start()
+        self.addCleanup(owner.stop)
+
+    def release(self, raw, *, fallback=False):
+        path = self.fallback if fallback else self.vendor
+        path.write_bytes(raw.encode() if isinstance(raw, str) else raw)
+        path.chmod(0o644)
+
+    def test_only_supported_ubuntu_source_versions_pass(self):
+        for version in ("22.04", "24.04", "26.04"):
+            with self.subTest(version=version):
+                self.release(f'NAME="Ubuntu Linux"\nID=ubuntu\nVERSION_ID="{version}"\n')
+                operation._require_portable_source_platform()
+
+    def test_debian_derivatives_and_malformed_release_are_refused(self):
+        for raw in (
+            'ID=debian\nVERSION_ID=12\n', 'ID=debian\nVERSION_ID=13\n',
+            'ID=ubuntu\nVERSION_ID=20.04\n', 'ID=linuxmint\nID_LIKE=ubuntu\nVERSION_ID=24.04\n',
+            'ID=ubuntu\n', 'VERSION_ID=24.04\n',
+            'ID=ubuntu\nID=debian\nVERSION_ID=24.04\n',
+            'ID=ubuntu\nVERSION_ID=24.04\nVERSION_ID=24.04\n',
+            'ID=ubuntu\nVERSION_ID="24.04 "\n', 'ID=ubuntu\nVERSION_ID=24.04;echo\n',
+            'ID =ubuntu\nVERSION_ID=24.04\n', 'ID=ubuntu\nVERSION_ID=24.04\n' + '#' * 8192,
+            b'ID=ubuntu\nVERSION_ID=24.04\n\0', b'ID=ubuntu\nVERSION_ID=24.04\n\xff',
+        ):
+            with self.subTest(release=raw):
+                self.release(raw)
+                with self.assertRaisesRegex(operation.Refused, '^PORTABLE_PLATFORM_UNSUPPORTED$'):
+                    operation._require_portable_source_platform()
+        self.vendor.unlink()
+        with self.assertRaisesRegex(operation.Refused, '^PORTABLE_PLATFORM_UNSUPPORTED$'):
+            operation._require_portable_source_platform()
+
+    def test_vendor_is_authoritative_and_fallback_requires_vendor_absence(self):
+        self.release('ID=ubuntu\nVERSION_ID=24.04\n', fallback=True)
+        operation._require_portable_source_platform()
+        self.release('ID=debian\nVERSION_ID=12\n')
+        with self.assertRaisesRegex(operation.Refused, '^PORTABLE_PLATFORM_UNSUPPORTED$'):
+            operation._require_portable_source_platform()
+        self.vendor.unlink()
+        self.vendor.symlink_to(self.fallback)
+        with self.assertRaisesRegex(operation.Refused, '^PORTABLE_PLATFORM_UNSUPPORTED$'):
+            operation._require_portable_source_platform()
+
+    def test_portable_start_refuses_before_locks_state_journal_spawn_or_stop(self):
+        for raw in ('ID=debian\nVERSION_ID=12\n', 'ID=debian\nVERSION_ID=13\n',
+                    'ID=ubuntu\n', 'ID=linuxmint\nID_LIKE=ubuntu\nVERSION_ID=24.04\n'):
+            with self.subTest(release=raw), ExitStack() as patches:
+                self.release(raw)
+                state = self.root / "operations"
+                patches.enter_context(patch.object(operation, "STATE_DIR", state))
+                patches.enter_context(patch.object(operation, "_require_root"))
+                methods = [patches.enter_context(patch.object(operation, name)) for name in
+                           ("_global_lock", "_state_dir", "_write_record", "_set_active", "_spawn", "_stop")]
+                with self.assertRaisesRegex(operation.Refused, '^PORTABLE_PLATFORM_UNSUPPORTED$'):
+                    operation.start(REQUEST, MANIFEST, portable=True)
+                for method in methods:
+                    method.assert_not_called()
+                self.assertFalse(state.exists())
 
 
 if __name__ == "__main__":

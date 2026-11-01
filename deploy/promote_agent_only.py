@@ -34,6 +34,8 @@ import uuid
 
 
 STATE_DIR = Path("/var/lib/sovagrid-promotion")
+SOVAGRID_MIN_PYTHON = '3.10'
+SOVAGRID_MIN_SYSTEMD = '247'
 BASELINE = STATE_DIR / "baseline.json"
 PIN = STATE_DIR / "bundle-pin.json"
 LOCAL = STATE_DIR / "local-agent.json"
@@ -163,16 +165,28 @@ def _additional_reverse_tunnels(systemd_dir: Path = Path("/etc/systemd/system"))
     return found
 
 
+def runtime_supported():
+    if sys.platform != 'linux' or sys.version_info < tuple(map(int, SOVAGRID_MIN_PYTHON.split('.'))) or not Path('/proc/self').is_dir() or not Path('/run/systemd/system').is_dir():
+        return False
+    try:
+        python = subprocess.run(['/usr/bin/python3', '-B', '-I', '-c',
+                                 'import sys; sys.exit(0 if sys.version_info >= tuple(map(int, sys.argv[1].split("."))) else 1)', SOVAGRID_MIN_PYTHON],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        if python.returncode != 0: return False
+        version = subprocess.run(['/usr/bin/systemctl', 'show', '--property=Version', '--value'], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        match = re.match(rb'([0-9]+)', version.stdout[:256])
+        active = subprocess.run(['/usr/bin/systemctl', 'is-system-running'], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        return (version.returncode == 0 and match is not None and int(match.group(1)) >= int(SOVAGRID_MIN_SYSTEMD)
+                and active.returncode in (0, 1) and active.stdout.strip() in (b'running', b'degraded'))
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
 def capture_external() -> dict:
     """Snapshot public hashes/metadata only; never serialize a token."""
     need(os.geteuid() == 0, "Root authority is required")
-    release_path = Path("/etc/os-release")
-    if release_path.is_symlink():
-        need(release_path.resolve(strict=True) == Path("/usr/lib/os-release"),
-             "Unexpected OS release link")
-        release_path = Path("/usr/lib/os-release")
-    release = _read_regular(release_path, 8192).decode("utf-8")
-    need(re.search(r"(?m)^ID=ubuntu$", release) is not None, "Ubuntu is required")
+    need(runtime_supported(), 'Linux, Python and active systemd are required')
     files = {}
     tracked = CRITICAL + tuple(name for name in OPTIONAL_CRITICAL
                                if Path(name).exists() or Path(name).is_symlink())

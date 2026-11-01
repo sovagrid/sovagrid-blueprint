@@ -55,7 +55,7 @@ _PROGRESS_MARKERS = {
     "SG_INSTALL_STAGE:TRANSFER": "Пакет передан на сервер",
     "SG_INSTALL_STAGE:EXTRACT": "Проверка и распаковка на сервере",
     "SG_INSTALL_STAGE:RUN": "Установка Hub, Agent и компонентов…",
-    "SG_INSTALL_STAGE:DOCKER": "Установка Docker на Ubuntu…",
+    "SG_INSTALL_STAGE:DOCKER": "Подготовка Docker на Linux…",
     "SG_INSTALL_STAGE:COMPOSE": "Установка Docker Compose…",
     "SG_INSTALL_STAGE:BUILD": "Сборка и запуск Hub и веб-панели…",
     "SG_INSTALL_STAGE:HEALTH": "Hub и веб-панель отвечают; настройка Agent…",
@@ -98,7 +98,7 @@ _SERVER_TIMER_ACTIONS = frozenset({
 })
 _REFUSALS = {
     "SG_INSTALL_REFUSE:ROOT": "Нужен SSH-вход root или пользователь с правом sudo без запроса пароля. Пароль sudo приложение не запрашивает.",
-    "SG_INSTALL_REFUSE:UBUNTU": "Первая установка сейчас поддерживает только Ubuntu.",
+    "SG_INSTALL_REFUSE:UBUNTU": "Для установки нужны Linux, Python 3.10 или новее и работающий systemd 247 или новее.",
     "SG_INSTALL_REFUSE:EXISTING": (
         "На сервере уже есть SovaGrid или занято его место. Автоматическая первая установка "
         "ничего не меняла. Для проверки нового пакета выберите «Обновить сервер…»."
@@ -138,7 +138,7 @@ _REFUSALS = {
     ),
     "SG_UPDATE_REFUSE:CANDIDATE": "Подготовленный пакет или его содержимое изменились; подготовьте пакет заново.",
     "SG_UPDATE_REFUSE:HASH": "SHA-256 подготовленного пакета не совпал; обновление не началось.",
-    "SG_UPDATE_REFUSE:HOST": "Обновление поддерживается только для Ubuntu с root/sudo SSH-доступом.",
+    "SG_UPDATE_REFUSE:HOST": "Для обновления нужны Linux, Python 3.10 или новее, работающий systemd 247 или новее и root/sudo SSH-доступ.",
     "SG_UPDATE_REFUSE:ACTIVE": "Активная установка не имеет проверенного манифеста или признаков управления run.sh.",
     "SG_UPDATE_REFUSE:RESTORE_RECOVERY": "На сервере не завершено восстановление SovaGrid. Сначала продолжите или отмените его, затем повторите обновление.",
     "SG_UPDATE_REFUSE:HUB_ONLY_LAYOUT": "На узле есть отдельный Agent или незавершённое преобразование в собственный Hub. Используйте специальное обновление Hub; полная установка не будет заменена.",
@@ -363,9 +363,15 @@ _CHECKS = r'''
 set -Eeuo pipefail
 umask 077
 if [[ $(id -u) != 0 ]]; then printf 'SG_INSTALL_REFUSE:ROOT\n'; exit 20; fi
-if [[ ! -r /etc/os-release ]]; then printf 'SG_INSTALL_REFUSE:UBUNTU\n'; exit 21; fi
-. /etc/os-release
-if [[ ${ID:-} != ubuntu ]]; then printf 'SG_INSTALL_REFUSE:UBUNTU\n'; exit 21; fi
+SOVAGRID_MIN_PYTHON='3.10'
+SOVAGRID_MIN_SYSTEMD='247'
+[[ $(uname -s) == Linux && -d /proc/self && -d /run/systemd/system ]] || { printf 'SG_INSTALL_REFUSE:UBUNTU\n'; exit 21; }
+/usr/bin/python3 -B -I -c 'import sys; sys.exit(0 if sys.version_info >= tuple(map(int, sys.argv[1].split("."))) else 1)' "$SOVAGRID_MIN_PYTHON" || { printf 'SG_INSTALL_REFUSE:UBUNTU\n'; exit 21; }
+systemd_version=$(/usr/bin/systemctl show --property=Version --value 2>/dev/null) || { printf 'SG_INSTALL_REFUSE:UBUNTU\n'; exit 21; }
+[[ $systemd_version =~ ^([0-9]+) ]] || { printf 'SG_INSTALL_REFUSE:UBUNTU\n'; exit 21; }
+(( 10#${BASH_REMATCH[1]} >= 10#$SOVAGRID_MIN_SYSTEMD )) || { printf 'SG_INSTALL_REFUSE:UBUNTU\n'; exit 21; }
+systemd_state=$(/usr/bin/systemctl is-system-running 2>/dev/null) || true
+[[ $systemd_state == running || $systemd_state == degraded ]] || { printf 'SG_INSTALL_REFUSE:UBUNTU\n'; exit 21; }
 for path in /opt/sovagrid-src /opt/sovagrid-agent /opt/sovagrid-vpn /etc/sovagrid /etc/sovagrid-hub /var/lib/sovagrid /var/lib/sovagrid-agent /var/lib/sovagrid-first-install; do
   if [[ -e $path || -L $path ]]; then printf 'SG_INSTALL_REFUSE:EXISTING\n'; exit 22; fi
 done
@@ -429,7 +435,7 @@ mv -T -- "$stage" /opt/sovagrid-src
 printf 'SG_INSTALL_STAGE:RUN\n'
 SOVAGRID_INSTALLATION_LOCK_FD=6 bash /opt/sovagrid-src/sovagrid-blueprint/run.sh "$@" 2>&1 | while IFS= read -r line; do
   case "$line" in
-    'SovaGrid: installing Docker from Ubuntu packages') printf 'SG_INSTALL_STAGE:DOCKER\n' ;;
+    'SovaGrid: installing Docker from Ubuntu packages'|'SovaGrid: installing Docker from Debian packages') printf 'SG_INSTALL_STAGE:DOCKER\n' ;;
     'SovaGrid: installing the Docker Compose plugin') printf 'SG_INSTALL_STAGE:COMPOSE\n' ;;
     'SovaGrid: building and starting only SovaGrid Hub and Web') printf 'SG_INSTALL_STAGE:BUILD\n' ;;
     'SovaGrid: Hub and Web health checks passed on loopback; no public ports were opened') printf 'SG_INSTALL_STAGE:HEALTH\n' ;;
@@ -553,9 +559,15 @@ set -Eeuo pipefail
 umask 077
 refuse() { printf 'SG_INSTALL_REFUSE:%s\n' "$1"; exit 30; }
 [[ $(id -u) == 0 ]] || refuse ROOT
-[[ -r /etc/os-release ]] || refuse UBUNTU
-. /etc/os-release
-[[ ${ID:-} == ubuntu ]] || refuse UBUNTU
+SOVAGRID_MIN_PYTHON='3.10'
+SOVAGRID_MIN_SYSTEMD='247'
+[[ $(uname -s) == Linux && -d /proc/self && -d /run/systemd/system ]] || { refuse UBUNTU; }
+/usr/bin/python3 -B -I -c 'import sys; sys.exit(0 if sys.version_info >= tuple(map(int, sys.argv[1].split("."))) else 1)' "$SOVAGRID_MIN_PYTHON" || { refuse UBUNTU; }
+systemd_version=$(/usr/bin/systemctl show --property=Version --value 2>/dev/null) || { refuse UBUNTU; }
+[[ $systemd_version =~ ^([0-9]+) ]] || { refuse UBUNTU; }
+(( 10#${BASH_REMATCH[1]} >= 10#$SOVAGRID_MIN_SYSTEMD )) || { refuse UBUNTU; }
+systemd_state=$(/usr/bin/systemctl is-system-running 2>/dev/null) || true
+[[ $systemd_state == running || $systemd_state == degraded ]] || { refuse UBUNTU; }
 source_root=/opt/sovagrid-src
 for path in /opt "$source_root" "$source_root/sovagrid-blueprint" "$source_root/sovagrid-hub" "$source_root/sovagrid-web" "$source_root/sovagrid-agent" "$source_root/sovagrid-vpn"; do
   [[ -d $path && ! -L $path && $(stat -c %u "$path") == 0 ]] || refuse SOURCE
@@ -701,7 +713,7 @@ done
 printf 'SG_INSTALL_STAGE:RUN\n'
 bash /opt/sovagrid-src/sovagrid-blueprint/run.sh "$@" 2>&1 | while IFS= read -r line; do
   case "$line" in
-    'SovaGrid: installing Docker from Ubuntu packages') printf 'SG_INSTALL_STAGE:DOCKER\n' ;;
+    'SovaGrid: installing Docker from Ubuntu packages'|'SovaGrid: installing Docker from Debian packages') printf 'SG_INSTALL_STAGE:DOCKER\n' ;;
     'SovaGrid: installing the Docker Compose plugin') printf 'SG_INSTALL_STAGE:COMPOSE\n' ;;
     'SovaGrid: building and starting only SovaGrid Hub and Web') printf 'SG_INSTALL_STAGE:BUILD\n' ;;
     'SovaGrid: Hub and Web health checks passed on loopback; no public ports were opened') printf 'SG_INSTALL_STAGE:HEALTH\n' ;;
@@ -1004,7 +1016,7 @@ class ServerInstaller:
                             raise InstallError("В пакете нет компонента защищённого просмотра журналов")
             self._progress(f"Пакет проверен: {summary.files} файлов, {summary.size // 1024} КиБ")
             with self._session() as (config, helper):
-                self._progress("Проверка Ubuntu и прав администратора по SSH…")
+                self._progress("Проверка Linux, systemd и прав администратора по SSH…")
                 preflight = self._ssh(config, helper, _PREFLIGHT_COMMAND)
                 markers = self._read_markers(preflight, timeout=180)
                 if preflight.returncode != 0 or _PREFLIGHT_OK not in markers:

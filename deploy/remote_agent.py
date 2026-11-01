@@ -39,6 +39,8 @@ import urllib.request
 import uuid
 
 PROTOCOL = 1
+SOVAGRID_MIN_PYTHON = '3.10'
+SOVAGRID_MIN_SYSTEMD = '247'
 MAX_RPC = 32768
 MAX_STATE = 4 * 1024**2
 MAX_HUB_ENROLLMENTS = 2048
@@ -566,23 +568,39 @@ class Enrollment:
         return projection
 
     def platform(self):
-        # Ubuntu commonly makes /etc/os-release a symlink. Read the fixed
-        # canonical vendor file instead of following an arbitrary link.
-        release_path = "/usr/lib/os-release" if self.files.path("/usr/lib/os-release").exists() else "/etc/os-release"
-        raw = self.files.read(release_path, limit=8192).decode("utf-8")
+        require(sys.platform == 'linux' and self.files.path('/proc/self').is_dir(), 'UNSUPPORTED_PLATFORM')
+        require(sys.version_info >= tuple(map(int, SOVAGRID_MIN_PYTHON.split('.')))
+                and self.files.path('/run/systemd/system').is_dir(), 'UNSUPPORTED_SYSTEMD')
+        code, raw_version = self.commands.run(['/usr/bin/systemctl', 'show', '--property=Version', '--value'], check=False)
+        match = re.match(rb'([0-9]+)', raw_version)
+        require(code == 0 and match is not None and int(match.group(1)) >= int(SOVAGRID_MIN_SYSTEMD), 'UNSUPPORTED_SYSTEMD')
+        code, active = self.commands.run(['/usr/bin/systemctl', 'is-system-running'], check=False)
+        require(code in (0, 1) and active.strip() in (b'running', b'degraded'), 'UNSUPPORTED_SYSTEMD')
+        code, _ = self.commands.run(['/usr/bin/python3', '-B', '-I', '-c',
+                                    'import sys; sys.exit(0 if sys.version_info >= tuple(map(int, sys.argv[1].split("."))) else 1)',
+                                    SOVAGRID_MIN_PYTHON], check=False)
+        require(code == 0, 'UNSUPPORTED_PLATFORM')
         values = {}
-        for line in raw.splitlines():
-            if "=" in line:
-                key, value = line.split("=", 1)
-                values[key] = value.strip('"')
-        require(values.get("ID") == "ubuntu" and values.get("VERSION_ID") in ("22.04", "24.04", "26.04"),
-                "UNSUPPORTED_PLATFORM")
-        require(sys.version_info >= (3, 10) and self.files.path("/run/systemd/system").is_dir(), "UNSUPPORTED_SYSTEMD")
-        _, raw_version = self.commands.run(["/usr/bin/systemctl", "--version"])
-        match = re.match(rb"systemd ([0-9]+)", raw_version)
-        require(match is not None and int(match.group(1)) >= 247, "UNSUPPORTED_SYSTEMD")
-        return {"ubuntu_version": values["VERSION_ID"], "python_version": platform.python_version(),
-                "systemd_version": match.group(1).decode("ascii")}
+        for name in ('/usr/lib/os-release', '/etc/os-release'):
+            try:
+                raw = self.files.read(name, limit=8192, missing=True)
+                if raw is None: continue
+                raw = raw.decode('utf-8')
+            except (Refuse, OSError, UnicodeError):
+                continue
+            for line in raw.splitlines():
+                if '=' in line and not line.startswith('#'):
+                    key, value = line.split('=', 1)
+                    values[key] = value.strip('"\'')
+            break
+        distribution = values.get('ID', 'linux')
+        if re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,63}', distribution) is None: distribution = 'linux'
+        version = values.get('VERSION_ID', 'rolling' if distribution == 'arch' else 'unknown')
+        if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,63}', version) is None: version = 'unknown'
+        identity = ({'ubuntu_version': version} if distribution == 'ubuntu' else
+                    {'distribution': distribution, 'version': version})
+        return {**identity, 'python_version': platform.python_version(),
+                'systemd_version': match.group(1).decode('ascii')}
 
     def features(self, side):
         paths = ("/etc/sovagrid/.agent-unit-managed-by-run-sh",
@@ -903,13 +921,26 @@ class Enrollment:
         self.save_state(side, state)
         return entry
 
+    def dependencies_present(self):
+        for name in ('/usr/bin/python3', '/usr/bin/ssh', '/usr/bin/ssh-keygen'):
+            target = self.files.path(name)
+            if not target.is_file() or not os.access(target, os.X_OK):
+                return False
+        try:
+            return bool(ssl.create_default_context().get_ca_certs())
+        except (OSError, ssl.SSLError):
+            return False
+
     def prerequisites(self):
-        args = ["/usr/bin/dpkg-query", "-W", "-f=${Status}\\n", "python3", "ca-certificates", "openssh-client"]
-        code, output = self.commands.run(args, check=False)
-        if code != 0 or output.decode("ascii", "replace").splitlines() != ["install ok installed"] * 3:
-            self.commands.run(["/usr/bin/apt-get", "-o", "DPkg::Lock::Timeout=30", "update"], timeout=180, capture=False)
-            self.commands.run(["/usr/bin/apt-get", "-o", "DPkg::Lock::Timeout=30", "install", "-y", "--no-install-recommends",
-                               "python3", "ca-certificates", "openssh-client"], timeout=180, capture=False)
+        if self.dependencies_present():
+            return
+        for name in ('/usr/bin/apt-get', '/usr/bin/dpkg-query'):
+            info = self.files.inspect(name, missing=True)
+            require(info is not None and info.st_mode & 0o111, 'UNSUPPORTED_DEPENDENCIES')
+        self.commands.run(['/usr/bin/apt-get', '-o', 'DPkg::Lock::Timeout=30', 'update'], timeout=180, capture=False)
+        self.commands.run(['/usr/bin/apt-get', '-o', 'DPkg::Lock::Timeout=30', 'install', '-y', '--no-install-recommends',
+                           'python3', 'ca-certificates', 'openssh-client'], timeout=180, capture=False)
+        require(self.dependencies_present(), 'UNSUPPORTED_DEPENDENCIES')
 
     def verify_credentials(self, state):
         token_info = self.files.inspect("/etc/sovagrid/agent.token")
@@ -1282,7 +1313,15 @@ class Enrollment:
         require(not any(matches(part, HUB_GROUP) for part in denied_groups), "SSH_POLICY_CONFLICT")
         return actual
 
-    def restore_policy(self, state, previous):
+    def ssh_service(self):
+        for service in ('ssh.service', 'sshd.service'):
+            code, loaded = self.commands.run(['/usr/bin/systemctl', 'show', '--property=LoadState', '--value', service], check=False)
+            if code == 0 and loaded.strip() == b'loaded':
+                return service
+        raise Refuse('SSH_RELOAD_FAILED')
+
+    def restore_policy(self, state, previous, service):
+        require(service in ('ssh.service', 'sshd.service'), 'SSH_RELOAD_FAILED')
         raw = self.files.read(POLICY_PATH, missing=True)
         require(raw == POLICY and state["owned_files"].get(POLICY_PATH) == digest(POLICY), "CLEANUP_REQUIRED")
         if previous is None:
@@ -1293,7 +1332,7 @@ class Enrollment:
             state["owned_files"][POLICY_PATH] = digest(previous)
         self.save_state("hub", state)
         self.commands.run(["/usr/sbin/sshd", "-t"])
-        self.commands.run(["/usr/bin/systemctl", "reload", "ssh.service"])
+        self.commands.run(["/usr/bin/systemctl", "reload", service])
 
     def hub_authorize(self, value):
         with self.locked("hub"):
@@ -1321,6 +1360,8 @@ class Enrollment:
                         and sum(not item["revoked"] for item in enrollments.values()) < MAX_HUB_ACTIVE_ENROLLMENTS,
                         "STATE_CONFLICT")
                 require(not any(item["server_id"] == sid for item in state["enrollments"].values()), "STATE_CONFLICT")
+            service = self.ssh_service()
+            if entry is None:
                 state["enrollments"][eid] = proposed
                 self.save_state("hub", state)
             root_before = self.effective("root")
@@ -1338,10 +1379,10 @@ class Enrollment:
                 self.commands.run(["/usr/sbin/sshd", "-t"])
                 self.enforce_tunnel_policy(proposed["username"])
                 require(self.effective("root") == root_before, "SSH_POLICY_CONFLICT")
-                self.commands.run(["/usr/bin/systemctl", "reload", "ssh.service"])
+                self.commands.run(["/usr/bin/systemctl", "reload", service])
             except Refuse as exc:
                 try:
-                    self.restore_policy(state, previous)
+                    self.restore_policy(state, previous, service)
                 except (Refuse, OSError):
                     raise Refuse("CLEANUP_REQUIRED") from None
                 raise Refuse("SSH_RELOAD_FAILED" if exc.code == "SERVICE_FAILED" else exc.code) from None

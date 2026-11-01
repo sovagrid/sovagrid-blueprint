@@ -29,6 +29,8 @@ import time
 import urllib.request
 
 ROOT = Path('/')
+SOVAGRID_MIN_PYTHON = '3.10'
+SOVAGRID_MIN_SYSTEMD = '247'
 PUBLIC_OWNER = 0
 BROKER_OWNER_GID = 0
 COMPONENTS = {'sovagrid-blueprint', 'sovagrid-hub', 'sovagrid-web', 'sovagrid-agent', 'sovagrid-vpn'}
@@ -1483,9 +1485,27 @@ def restore(folder, state):
     emit('SG_APPLY_STAGE:ROLLED_BACK')
     return True
 
+def runtime_supported():
+    if sys.platform != 'linux' or sys.version_info < tuple(map(int, SOVAGRID_MIN_PYTHON.split('.'))) or not path('/proc/self').is_dir() or not path('/run/systemd/system').is_dir():
+        return False
+    try:
+        python = subprocess.run(['/usr/bin/python3', '-B', '-I', '-c',
+                                 'import sys; sys.exit(0 if sys.version_info >= tuple(map(int, sys.argv[1].split("."))) else 1)', SOVAGRID_MIN_PYTHON],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        if python.returncode != 0: return False
+        version = subprocess.run(['/usr/bin/systemctl', 'show', '--property=Version', '--value'], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        match = re.match(rb'([0-9]+)', version.stdout[:256])
+        active = subprocess.run(['/usr/bin/systemctl', 'is-system-running'], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        return (version.returncode == 0 and match is not None and int(match.group(1)) >= int(SOVAGRID_MIN_SYSTEMD)
+                and active.returncode in (0, 1) and active.stdout.strip() in (b'running', b'degraded'))
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
 def inspect_state():
     refuse_hub_only_layout()
-    if os.geteuid() != 0 or path('/etc/os-release').read_text().find('ID=ubuntu') < 0:
+    if os.geteuid() != 0 or not runtime_supported():
         fail('HOST')
     source = path('/opt/sovagrid-src')
     if source.is_symlink() or not source.is_dir():
