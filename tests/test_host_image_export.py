@@ -192,7 +192,7 @@ def oci_daemon_ids(raw):
             for item in top["manifests"]}
 
 
-def classic_image_archive(*, legacy_change=None, metadata_change=None):
+def classic_image_archive(*, legacy_change=None, metadata_change=None, legacy_onbuild=False):
     """Small counterpart of actual Docker29 classic-store product exports.
 
     Unlike containerd, Moby writes raw OCI layers, LayerSources, repositories,
@@ -204,6 +204,9 @@ def classic_image_archive(*, legacy_change=None, metadata_change=None):
             "OpenStdin": False, "StdinOnce": False, "Env": None, "Cmd": None,
             "Image": "", "Volumes": None, "WorkingDir": "", "Entrypoint": None,
             "Labels": None}
+    if legacy_onbuild:
+        # Docker27/28 container.Config has no omitempty on OnBuild.
+        zero["OnBuild"] = None
 
     def encode(value):
         raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -420,6 +423,29 @@ class ImageExportTest(unittest.TestCase):
                          lambda record, *_: record.update(foreign="unreferenced")):
             with self.subTest(mutation=mutation.__name__):
                 raw, ids, rootfs, _ = classic_image_archive(legacy_change=mutation)
+                with self.assertRaisesRegex(images.Refused, "INVALID_IMAGE_ARCHIVE"):
+                    self.inspect(raw, ids, source_rootfs=rootfs)
+
+    def test_real_classic_28_mandatory_onbuild_null_keeps_a_closed_single_schema(self):
+        raw, ids, rootfs, compatibility_ids = classic_image_archive(legacy_onbuild=True)
+        runtime = {}
+        self.assertGreater(self.inspect(raw, ids, source_rootfs=rootfs, runtime_ids=runtime), 0)
+        self.assertFalse(compatibility_ids.intersection(
+            identity for values in runtime.values() for identity in values))
+
+        def mixed_schema(record, service, final):
+            if service == "hub" and final:
+                del record["container_config"]["OnBuild"]
+
+        for mutation in (
+            mixed_schema,
+            *(lambda record, _service, _final, value=value:
+                record["container_config"].update(OnBuild=value)
+              for value in (False, 0, "", {}, [])),
+        ):
+            with self.subTest(mutation=mutation.__name__):
+                raw, ids, rootfs, _ = classic_image_archive(
+                    legacy_onbuild=True, legacy_change=mutation)
                 with self.assertRaisesRegex(images.Refused, "INVALID_IMAGE_ARCHIVE"):
                     self.inspect(raw, ids, source_rootfs=rootfs)
 

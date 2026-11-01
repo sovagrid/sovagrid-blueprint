@@ -435,17 +435,27 @@ def _classic_same(left: object, right: object) -> bool:
         raise Refused("INVALID_IMAGE_ARCHIVE") from exc
 
 
-def _classic_config(value: object) -> dict:
+def _classic_config(value: object, *, legacy_onbuild: bool = False) -> dict:
     if value is None:
         value = {}
     if (not isinstance(value, dict) or
             set(value) - (set(_CLASSIC_CONFIG_DEFAULTS) | _CLASSIC_CONFIG_OPTIONAL)):
         raise Refused("INVALID_IMAGE_ARCHIVE")
+    if (value.get("OnBuild") is not None and
+            (not isinstance(value["OnBuild"], list) or
+             any(not isinstance(command, str) for command in value["OnBuild"]))):
+        raise Refused("INVALID_IMAGE_ARCHIVE")
     result = dict(_CLASSIC_CONFIG_DEFAULTS)
+    if legacy_onbuild:
+        # Docker27/28 always marshal this field, including a nil slice. Later
+        # container.Config versions add omitempty. These are separate schemas.
+        result["OnBuild"] = None
     result.update(value)
     # StopTimeout is a pointer: a present zero remains present. Other optional
     # fields in Docker's container.Config omit empty values when marshalled.
     for key in _CLASSIC_CONFIG_OPTIONAL:
+        if key == "OnBuild" and legacy_onbuild:
+            continue
         if key in result and (result[key] is None or
                               key != "StopTimeout" and not result[key]):
             del result[key]
@@ -494,6 +504,20 @@ def _classic_metadata(fd: int, files: dict, offsets: dict, metadata: list[int],
                                         not _sha("sha256:" + value["parent"]))):
             raise Refused("INVALID_IMAGE_ARCHIVE")
         by_parent.setdefault(value.get("parent"), []).append((name, value))
+    # The entire compatibility graph must use one known Docker Config schema.
+    # Do not let individual records choose arbitrary omitted/empty fields.
+    for legacy_onbuild in (False, True):
+        try:
+            return _classic_v1_graph(by_parent, configs, unreferenced,
+                                     legacy_onbuild=legacy_onbuild, deadline=deadline)
+        except Refused as exc:
+            if str(exc) != "INVALID_IMAGE_ARCHIVE":
+                raise
+    raise Refused("INVALID_IMAGE_ARCHIVE")
+
+
+def _classic_v1_graph(by_parent: dict, configs: dict[str, dict], unreferenced: set[str], *,
+                       legacy_onbuild: bool, deadline: float) -> set[str]:
     used: set[str] = set()
     epoch = _classic_instant("1970-01-01T00:00:00Z")
     for config in configs.values():
@@ -506,12 +530,14 @@ def _classic_metadata(fd: int, files: dict, offsets: dict, metadata: list[int],
             chain = (difference if not chain else "sha256:" +
                      hashlib.sha256((chain + " " + difference).encode()).hexdigest())
             final = number == len(differences) - 1
-            expected = {"container_config": _classic_config(None), "os": config["os"]}
+            expected = {"container_config": _classic_config(None, legacy_onbuild=legacy_onbuild),
+                        "os": config["os"]}
             created = epoch
             if final:
-                expected["container_config"] = _classic_config(config.get("container_config"))
+                expected["container_config"] = _classic_config(
+                    config.get("container_config"), legacy_onbuild=legacy_onbuild)
                 if config.get("config") is not None:
-                    expected["config"] = _classic_config(config["config"])
+                    expected["config"] = _classic_config(config["config"], legacy_onbuild=legacy_onbuild)
                 for key in ("comment", "container", "docker_version", "author",
                             "architecture", "variant", "Size"):
                     if config.get(key):
