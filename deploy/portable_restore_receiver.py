@@ -241,8 +241,9 @@ def installation_lock():
 
 
 @contextmanager
-def _locked(operation, *, mutation=False):
+def _locked(operation, *, mutation=False, shared=False):
     need(os.geteuid() == UID, "ROOT_REQUIRED")
+    need(not mutation or not shared, "INVALID_RECEIVER_LOCK")
     with ExitStack() as stack:
         if mutation:
             stack.enter_context(installation_lock())
@@ -254,7 +255,7 @@ def _locked(operation, *, mutation=False):
         _private(os.fstat(descriptor))
         need(os.fstat(descriptor).st_size == 0, "UNSAFE_RECEIVER_STATE")
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise Refused("BUSY") from exc
         yield parent
@@ -376,7 +377,7 @@ def _request(parent, operation):
 
 
 def load_request(operation):
-    with _locked(operation) as parent:
+    with _locked(operation, shared=True) as parent:
         return _request(parent, operation)
 
 
@@ -610,7 +611,7 @@ def receive(operation, part, offset, length, digest, payload):
 
 
 def request_status(operation):
-    with _locked(operation) as parent:
+    with _locked(operation, shared=True) as parent:
         request = _request(parent, operation)
         state = _state(parent, request)
         for name, part in state["parts"].items():

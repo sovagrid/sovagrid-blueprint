@@ -103,6 +103,41 @@ class ReceiverTest(unittest.TestCase):
         for part, raw in self.payloads.items():
             receiver.receive(OP, part, 0, len(raw), hashlib.sha256(raw).hexdigest(), raw)
 
+    def test_readers_share_receiver_lock_but_mutating_commands_still_refuse(self):
+        receiver.initialize(OP, self.request)
+        with receiver._locked(OP, shared=True):
+            self.assertEqual(receiver.load_request(OP), self.request)
+            self.assertFalse(receiver.request_status(OP)["registered"])
+            with self.assertRaisesRegex(receiver.Refused, "BUSY"):
+                receiver.initialize(OP, self.request)
+            raw = self.payloads["host"]
+            with self.assertRaisesRegex(receiver.Refused, "BUSY"):
+                receiver.receive(OP, "host", 0, len(raw), hashlib.sha256(raw).hexdigest(), raw)
+            with self.assertRaisesRegex(receiver.Refused, "BUSY"):
+                receiver.register(OP)
+        self.assertEqual(receiver.request_status(OP)["artifacts"]["host"]["received"], 0)
+
+    def test_exclusive_receiver_writer_blocks_both_readers(self):
+        receiver.initialize(OP, self.request)
+        with receiver._locked(OP):
+            with self.assertRaisesRegex(receiver.Refused, "BUSY"):
+                receiver.load_request(OP)
+            with self.assertRaisesRegex(receiver.Refused, "BUSY"):
+                receiver.request_status(OP)
+
+    def test_dependencies_publish_keeps_exclusive_lock_without_mutation_flag(self):
+        self.runner_record["dependencies_ready"] = False
+        self.write_json(self.operation / "runner.json", self.runner_record)
+        with receiver._locked(OP, shared=True), patch.object(receiver.subprocess, "run", return_value=SimpleNamespace(returncode=0)):
+            with self.assertRaisesRegex(receiver.Refused, "BUSY"):
+                receiver.dependencies(OP)
+        self.assertFalse(json.loads((self.operation / "runner.json").read_bytes())["dependencies_ready"])
+
+    def test_mutation_cannot_request_shared_lock(self):
+        with self.assertRaisesRegex(receiver.Refused, "INVALID_RECEIVER_LOCK"):
+            with receiver._locked(OP, mutation=True, shared=True):
+                self.fail("mutation acquired a shared receiver lock")
+
     def test_runner_is_hash_verified_before_loading_any_backup_parser(self):
         self.assertEqual(receiver.verified_runner(OP), self.runner)
         selected = self.runner / "sovagrid-hub/README"
