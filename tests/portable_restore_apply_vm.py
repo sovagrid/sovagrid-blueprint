@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import copy
 import grp
 import hashlib
 import importlib.util
@@ -52,6 +53,7 @@ ROOTS = frozenset((
     "/etc/sovagrid-service", "/etc/sovagrid-vpn-routing",
     "/var/lib/sovagrid", "/var/lib/sovagrid-agent", "/var/lib/sovagrid-shell",
     "/var/lib/sovagrid-containers", "/var/lib/sovagrid-vpn",
+    "/var/lib/sovagrid-hub-tunnels",
     "/var/lib/sovagrid-host-backup-operations", "/opt/sovagrid-src",
     "/var/cache/sovagrid-web-restores",
     "/opt/sovagrid-agent", "/opt/sovagrid-vpn", "/opt/sovagrid-candidates",
@@ -321,6 +323,229 @@ def record_guest(name, state):
     need(name not in value["guests"], "guest fixture already recorded")
     value["guests"][name] = guest_identity(name, state)
     fixture.save(value)
+
+
+def hub_transport_snapshot(fixture, helper, expected):
+    """Match exact producer identities before sealing any transport resource."""
+    runner = helper.Enrollment(executable=str(SOURCE / "sovagrid-blueprint/deploy/remote_agent.py"))
+    with runner.locked("hub", readonly=True):
+        state = runner.hub_state()
+        need(isinstance(state, dict) and set(state) == {"protocol", "kind", "created_at", "group", "enrollments",
+             "accounts", "owned_files", "owned_directories", "pending_writes", "file_metadata"} and
+             type(state["protocol"]) is int and state["protocol"] == 1 and state["kind"] == "hub" and
+             type(state["created_at"]) is int and state["pending_writes"] == {} and
+             state["enrollments"] == expected, "Hub transport enrollment set differs from the two producers")
+        names = {entry["username"] for entry in expected.values()}
+        need(len(expected) == len(names) == 2 and set(state["accounts"]) == names,
+             "Hub transport account set differs from the two producers")
+        group = grp.getgrnam(helper.HUB_GROUP)
+        need(state["group"] == {"name": helper.HUB_GROUP, "gid": group.gr_gid} and
+             64200 <= group.gr_gid <= 64999 and not group.gr_mem and
+             {item.pw_name for item in pwd.getpwall() if item.pw_gid == group.gr_gid} == names,
+             "Hub transport group has an unknown member")
+        directories = {"/etc/ssh/sovagrid-tunnels": 0o755}
+        files = {helper.POLICY_PATH: helper.POLICY}
+        users = {}
+        for entry in expected.values():
+            name, eid, sid = entry["username"], entry["enrollment_id"], entry["server_id"]
+            directories["/var/empty/" + name] = 0o755
+            files["/etc/ssh/sovagrid-tunnels/" + name] = (
+                'restrict,port-forwarding,permitopen="127.0.0.1:8767",command="/bin/false" '
+                + entry["ssh_public_key"] + " sovagrid:" + sid + ":" + eid + "\n").encode("ascii")
+            account = state["accounts"][name]
+            user = pwd.getpwnam(name)
+            need(set(account) == {"uid", "gid", "home", "comment", "requested_uid"} and
+                 type(account["uid"]) is int and 100 <= account["uid"] <= 999 and
+                 account["requested_uid"] == user.pw_uid == account["uid"] and
+                 account["gid"] == user.pw_gid == group.gr_gid and
+                 account["home"] == user.pw_dir == "/var/empty/" + name and
+                 account["comment"] == user.pw_gecos == "sovagrid-" + eid + "-hub-tunnel" and
+                 user.pw_shell == "/usr/sbin/nologin" and set(os.getgrouplist(name, user.pw_gid)) == {user.pw_gid} and
+                 {item.pw_name for item in pwd.getpwall() if item.pw_uid == user.pw_uid} == {name},
+                 "Hub transport account differs from its producer")
+            users[name] = list(user) + [sorted(os.getgrouplist(name, user.pw_gid))]
+        need(state["owned_directories"] == directories and
+             state["owned_files"] == {path: hashlib.sha256(raw).hexdigest() for path, raw in files.items()} and
+             state["file_metadata"] == {path: {"mode": 0o644, "gid": 0} for path in files},
+             "Hub transport resource set differs from its producers")
+        trees = {helper.HUB_STATE_DIR: fixture.transport_inventory()}
+        for path, mode in directories.items():
+            runner.files.inspect(path, directory=True)
+            records = fixture.inventory(Path(path))
+            allowed = {""} | (names if path == "/etc/ssh/sovagrid-tunnels" else set())
+            need(set(records) == allowed and records[""]["uid"] == records[""]["gid"] == 0 and
+                 records[""]["mode"] == mode, "unknown Hub transport directory descendant")
+            trees[path] = records
+        for path, raw in files.items():
+            need(runner.files.read(path) == raw, "Hub transport policy or key differs from its producer")
+            records = fixture.inventory(Path(path))
+            need(set(records) == {""} and records[""]["uid"] == records[""]["gid"] == 0 and
+                 records[""]["mode"] == 0o644, "unsafe Hub transport policy or key")
+            if path == helper.POLICY_PATH:
+                trees[path] = records
+        return {"state": state, "trees": trees, "users": users, "group": list(group)}
+
+
+def record_hub_transports(web_request):
+    """Called by the Web enrollment producer, never by cleanup discovery."""
+    guard()
+    fixture = fixture_module()
+    value = fixture.ledger()
+    need("hub_transports" not in value and fixture.HUB_TRANSPORT not in value["trees"],
+         "Hub transport fixture was already recorded")
+    fixture.source_pin(SOURCE, value["manifest_sha256"], allow_generated=True)
+    helper = load(SOURCE, "remote_agent.py", "sovagrid_ci_transport_producer")
+    state = private_json(Path(os.environ["RUNNER_TEMP"]) / "sovagrid-remote-ci/state.json")
+    suffix = re.fullmatch(r"sovagrid-ci-target-([0-9a-f]{12})", state.get("container", ""))
+    need(suffix and state.get("web_container") == "sovagrid-ci-web-target-" + suffix[1] and
+         set(value["guests"]) == {state["container"], state["web_container"]}, "unknown enrollment guest producers")
+    expected = {}
+    for name in (state["container"], state["web_container"]):
+        need(guest_identity(name, state) == value["guests"][name], "enrollment guest producer changed")
+        target = private_json(Path("/var/lib/machines") / name / "var/lib/sovagrid-agent-enrollment/state.json",
+                              maximum=4 * 1024**2)
+        identity = target.get("identity", {})
+        need(target.get("protocol") == 1 and type(target.get("protocol")) is int and target.get("kind") == "target" and
+             target.get("phase") == "active" and not target.get("removed") and target.get("pending_writes") == {} and
+             target.get("source_manifest_sha256") == value["manifest_sha256"] and
+             set(identity) == {"request_id", "enrollment_id", "server_id"}, "unknown active target producer")
+        for item in identity.values():
+            need(isinstance(item, str) and str(uuid.UUID(item)) == item, "invalid enrollment producer identity")
+        public, fingerprint = helper.public_key(target.get("ssh_public_key"))
+        need(target.get("ssh_key_fingerprint") == fingerprint, "enrollment producer key differs")
+        journal_path = (Path("/var/lib/sovagrid/web-agent/jobs") if name == state["web_container"] else
+                        Path("/run/sovagrid-ci-connect-" + suffix[1])) / (identity["request_id"] + ".json")
+        journal = private_json(journal_path)
+        registration = journal.get("registration") or {}
+        need(journal.get("request_id") == identity["request_id"] and journal.get("phase") == "active" and
+             journal.get("cleanup_required") is False and journal.get("hub_authorized") is True and
+             journal.get("target") == helper.Enrollment.public_target(target) and registration.get("state") == "active" and
+             registration.get("id") == identity["enrollment_id"] and registration.get("server_id") == identity["server_id"],
+             "enrollment journal differs from its target producer")
+        if name == state["web_container"]:
+            need(identity["request_id"] == web_request and journal.get("name") == name,
+                 "Web job differs from the exact creating request")
+        else:
+            need(journal.get("name") == "ci-remote-agent-" + suffix[1], "Connect journal belongs to another producer")
+        eid, sid = identity["enrollment_id"], identity["server_id"]
+        need(eid not in expected and sid not in {row["server_id"] for row in expected.values()},
+             "enrollment producers reused an identity")
+        expected[eid] = {"enrollment_id": eid, "server_id": sid, "username": helper.username(sid),
+                         "ssh_public_key": public, "ssh_key_fingerprint": fingerprint, "revoked": False}
+    proof = hub_transport_snapshot(fixture, helper, expected)
+    value["hub_transports"] = proof
+    value["trees"][fixture.HUB_TRANSPORT] = proof["trees"][fixture.HUB_TRANSPORT]
+    fixture.save(value)
+
+
+def check_transport_remainder(fixture, helper, proof, after):
+    """A known revocation permits only its exact account/home/key removal."""
+    names = set(after["accounts"])
+    group = grp.getgrnam(helper.HUB_GROUP)
+    need(list(group) == proof["group"] and
+         {user.pw_name for user in pwd.getpwall() if user.pw_gid == group.gr_gid} == names,
+         "Hub transport group changed during revocation")
+    for name, expected in proof["users"].items():
+        need({user.pw_name for user in pwd.getpwall() if user.pw_uid == expected[2]} ==
+             ({name} if name in names else set()), "Hub transport UID was aliased or reused")
+        try:
+            user = pwd.getpwnam(name)
+        except KeyError:
+            need(name not in names, "known Hub transport account disappeared")
+        else:
+            need(name in names and list(user) + [sorted(os.getgrouplist(name, user.pw_gid))] == expected,
+                 "Hub transport account changed during revocation")
+    for path, sealed in proof["trees"].items():
+        if path == helper.HUB_STATE_DIR:
+            continue
+        if path.startswith("/var/empty/") and Path(path).name not in names:
+            need(not os.path.lexists(path), "revoked Hub transport home returned")
+            continue
+        if path == "/etc/ssh/sovagrid-tunnels":
+            sealed = {name: record for name, record in sealed.items() if not name or name in names}
+        fixture.compare(path, sealed, allow_mutable=False)
+    records = fixture.transport_inventory()
+    need(all(records[name] == proof["trees"][helper.HUB_STATE_DIR][name] for name in ("", "lock")) and
+         records["state.json"]["sha256"] == hashlib.sha256(helper.encode(after) + b"\n").hexdigest(),
+         "Hub transport state is not the exact public-helper transition")
+    return records
+
+
+def finish_hub_transport_cleanup(fixture, helper, runner, value, after):
+    # Shared SSH/NSS cleanup never writes this tree. Retain the exact inventory
+    # from the second known revoke, including its state-file inode.
+    with runner.locked("hub", readonly=True):
+        need(runner.hub_state() == after, "Hub transport state changed after shared cleanup")
+        fixture.compare(fixture.HUB_TRANSPORT, value["trees"][fixture.HUB_TRANSPORT], allow_mutable=False)
+        value["hub_transports"]["removed"] = True
+        value["hub_transport_cleanup"]["phase"] = "removed"
+        fixture.save(value)
+
+
+def remove_hub_transports(bundle):
+    """Revoke only the two sealed test enrollments after both guests stopped."""
+    fixture = fixture_module()
+    value = fixture.ledger()
+    proof = value.get("hub_transports")
+    need(isinstance(proof, dict) and not proof.get("removed") and "hub_transport_cleanup" not in value,
+         "missing or interrupted Hub transport producer proof")
+    verified_bundle(bundle)
+    fixture.source_pin(SOURCE, value["manifest_sha256"], allow_generated=True)
+    helper = load(bundle, "remote_agent.py", "sovagrid_ci_transport_cleanup")
+    expected = proof["state"]["enrollments"]
+    need(hub_transport_snapshot(fixture, helper, expected) == proof, "Hub transport producer proof changed")
+    # The public helper verifies source, CAS, exact account identity and each
+    # owned key before revocation. It does not write the Hub database or any
+    # preserved snapshot input.
+    runner = helper.Enrollment(executable=str(SOURCE / "sovagrid-blueprint/deploy/remote_agent.py"))
+    after = copy.deepcopy(proof["state"])
+    value["hub_transport_cleanup"] = {"phase": "revoking", "completed": []}
+    fixture.save(value)  # A failure remains explicit; cleanup cannot recapture/adopt it on retry.
+    for eid, entry in sorted(expected.items()):
+        need(runner.hub_state() == after, "Hub transport changed before exact revocation")
+        fixture.compare(fixture.HUB_TRANSPORT, value["trees"][fixture.HUB_TRANSPORT], allow_mutable=False)
+        check_transport_remainder(fixture, helper, proof, after)
+        result = runner.dispatch("hub-revoke", {"protocol": 1, "enrollment_id": eid, "server_id": entry["server_id"],
+                                 "ssh_key_fingerprint": entry["ssh_key_fingerprint"], "expected": runner.cas("hub")})
+        need(result == {"revoked": True, "cleanup_required": False}, "known Hub transport did not revoke")
+        name = entry["username"]
+        after["enrollments"][eid]["revoked"] = True
+        del after["accounts"][name]
+        del after["owned_directories"]["/var/empty/" + name]
+        del after["owned_files"]["/etc/ssh/sovagrid-tunnels/" + name]
+        del after["file_metadata"]["/etc/ssh/sovagrid-tunnels/" + name]
+        need(runner.hub_state() == after and not os.path.lexists("/var/empty/" + name),
+             "Hub transport revocation changed unrelated state")
+        value["trees"][fixture.HUB_TRANSPORT] = check_transport_remainder(fixture, helper, proof, after)
+        value["hub_transport_cleanup"]["completed"].append(eid)
+        fixture.save(value)
+    _restore, core, _runtime = api(bundle)
+    for path in (helper.POLICY_PATH, "/etc/ssh/sovagrid-tunnels"):
+        sealed = proof["trees"][path]
+        if path == "/etc/ssh/sovagrid-tunnels":
+            sealed = {"": sealed[""]}  # The two known public revocations removed only their key files.
+        fixture.compare(path, sealed, allow_mutable=False)
+        parent, leaf = core._safe_parent(Path("/"), path, uid=0)
+        try:
+            info = os.fstat(parent)
+            held = {"parent": [info.st_dev, info.st_ino], "resource": core.tree_proof(parent, leaf)}
+            identity = uuid.uuid4().hex
+            shadow = ".sovagrid-restore-" + identity + "-0"
+            step = {"kind": "publish", "resource": path,
+                    "desired": {"shadow": shadow, "sha256": held["resource"]["sha256"]}}
+            fixture.compare(path, sealed, allow_mutable=False)
+            core.Publisher(Path("/"), identity, {path}).undo(step, held)
+            remove_quarantined(fixture, core, parent, shadow, path, held, sealed)
+        finally:
+            os.close(parent)
+    group = grp.getgrnam(helper.HUB_GROUP)
+    need(list(group) == proof["group"] and not group.gr_mem and
+         not any(user.pw_gid == group.gr_gid for user in pwd.getpwall()), "Hub transport group acquired another user")
+    command("/usr/sbin/groupdel", helper.HUB_GROUP)
+    command("/usr/sbin/sshd", "-t")
+    command("systemctl", "reload", "ssh.service")
+    finish_hub_transport_cleanup(fixture, helper, runner, value, after)
+    print("PORTABLE_RESTORE_VM_TWO_OWNED_TRANSPORTS_REVOKED", flush=True)
 
 
 def transition_fixture(action, old, target, candidate):
@@ -595,6 +820,7 @@ def stop_ci_guests_and_retag(bundle):
                command("machinectl", "show", name, accepted=(0, 1)).returncode == 0):
             need(time.monotonic() < deadline, "guest remained active or registered")
             time.sleep(0.2)
+    remove_hub_transports(bundle)
     reference = state["image"]
     image = text(*DOCKER, "image", "inspect", "--format", "{{.Id}}", reference)
     need(IMAGE.fullmatch(image) is not None and image == provenance["guest_image"], "unverified guest image")
@@ -732,7 +958,13 @@ def uninstall(bundle, identity, receipt, *, restore_id=None):
             continue
         for entry in root.iterdir():
             if entry.name == "sovagrid" or entry.name.startswith("sovagrid-"):
-                need(str(entry) in allowed | set(PRESERVED), "unknown SovaGrid namespace in disposable cleanup")
+                reason = "unknown SovaGrid namespace in disposable cleanup"
+                if (os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
+                        and os.environ.get("RUNNER_OS") == "Linux" and
+                        os.environ.get("SOVAGRID_PORTABLE_RESTORE_DISPOSABLE") == "1"):
+                    safe_name = entry.name if re.fullmatch(r"sovagrid(?:-[A-Za-z0-9_.@-]{1,160})?", entry.name) else "<invalid>"
+                    reason += ": " + safe_name
+                need(str(entry) in allowed | set(PRESERVED), reason)
     for name, digest in units.items():
         info = Path(name).lstat()
         need(stat.S_ISREG(info.st_mode) and info.st_uid == info.st_gid == 0 and info.st_nlink == 1 and

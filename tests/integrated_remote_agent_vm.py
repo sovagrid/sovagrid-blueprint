@@ -92,6 +92,7 @@ def portable_fixture(action, *args):
         fixture = module.fixture_module()
         record = fixture.read(Path("/var/lib/sovagrid/web-agent/jobs") / (args[0] + ".json"))
         fixture.optional_hook("web-job", args[0], record["bundle"]["path"])
+        module.record_hub_transports(args[0])
     else:
         raise RuntimeError("Unknown portable fixture producer")
 

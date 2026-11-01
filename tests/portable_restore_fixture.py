@@ -33,6 +33,7 @@ MUTABLE = {"/var/lib/sovagrid/hub/hub.sqlite", "/var/lib/sovagrid/vpn/status.jso
            "/var/lib/sovagrid-containers/snapshot.json"}
 OPTIONAL = {"/var/lib/sovagrid/hub/hub.sqlite-wal": "/var/lib/sovagrid/hub/hub.sqlite",
             "/var/lib/sovagrid/hub/hub.sqlite-shm": "/var/lib/sovagrid/hub/hub.sqlite"}
+HUB_TRANSPORT = "/var/lib/sovagrid-hub-tunnels"
 
 
 def need(value, reason):
@@ -275,6 +276,19 @@ def check_all(value, roots):
             compare(root, value["trees"][root])
         else:
             need(root not in value["trees"], "recorded cleanup root disappeared")
+
+
+def transport_inventory():
+    """Only the enrollment producer's closed private state tree is sealable."""
+    records = inventory(Path(HUB_TRANSPORT))
+    need(set(records) == {"", "lock", "state.json"}, "unknown Hub transport descendant")
+    for name, record in records.items():
+        need(record["uid"] == record["gid"] == 0 and
+             record["kind"] == ("dir" if not name else "file") and
+             record["mode"] == (0o700 if not name else 0o600), "unsafe Hub transport state")
+    need(records["lock"]["size"] == 0 and records["lock"]["sha256"] == hashlib.sha256(b"").hexdigest(),
+         "foreign Hub transport lock")
+    return records
 
 
 def extend(value, additions, *, changed=frozenset()):

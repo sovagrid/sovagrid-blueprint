@@ -10,8 +10,10 @@
 
 | Схема | Включено | Исключено |
 |---|---|---|
-| Full Hub+Agent | База Hub, снимки Hub и их root-only журналы, Caddy CA и ключи, пароль первого администратора, Agent config/token и его локальный код, управляемые WireGuard state/client keys, локальная политика Amnezia, VPN, service, routing и journal broker, точные unit-файлы | `/root/.ssh`, `/home`, пользовательские файлы Agent `/var/lib/sovagrid-agent/files`, сторонние Docker volumes, чужие VPN и systemd-службы |
+| Full Hub+Agent | База Hub, снимки Hub и их root-only журналы, Caddy CA и ключи, пароль первого администратора, Agent config/token и его локальный код, управляемые WireGuard state/client keys, локальная политика Amnezia, VPN, service, routing и journal broker, точные unit-файлы | `/root/.ssh`, `/home`, пользовательские файлы Agent `/var/lib/sovagrid-agent/files`, SSH-транспорты внешних Agent и ключи SSH самого Ubuntu, сторонние Docker volumes, чужие VPN и systemd-службы |
 | Hub-only + внешний Agent | База и снимки локального Hub, его Caddy CA, пароль администратора, локальный Agent config/token и код, локальные политики, точные unit-файлы, установленный source bundle | Конфиг, токен, CA, код, данные и SSH-туннель внешнего Agent; его WireGuard/Amnezia state и ключи; `/var/lib/sovagrid-agent-local/files` |
+
+**Внешние Agent после переноса.** База Hub сохраняет строки удалённых серверов, но архив не переносит состояние `/var/lib/sovagrid-hub-tunnels`, соответствующие SSH policy/authorized keys и учётные записи `sgt_*`. Системные ключи SSH самого Ubuntu также исключены. После восстановления Hub такие SSH-подключения нужно заново подготовить через Connect или Web-мастер; наличие старой строки сервера не означает работающий транспорт. Эти данные не удаляются с исходного пользовательского сервера операцией создания копии.
 
 Если на Hub-only узле включён локальный сбор контейнеров, архив дополнительно содержит его root-owned состояние, точные два systemd unit и очищенный снимок `/var/lib/sovagrid-containers-local/snapshot.json`. Это только локальные данные; инвентарь внешнего Agent не копируется. Незавершённое включение или выключение коллектора блокирует создание архива до `recover`.
 
