@@ -46,7 +46,7 @@ trace=pathlib.Path(os.environ['TEST_TRACE'])
 if trace.exists():
  for line in trace.read_text().splitlines():
   event=json.loads(line)
-  if event[:2]==['chown',str(info.st_ino)]: owner,group=event[2].split(':')
+  if event[:2]==['chown',file_identity(path)]: owner,group=event[2].split(':')
 if str(path)==os.environ.get('TEST_BAD_OWNER'): owner='foreign'
 if str(path)==os.environ.get('TEST_BAD_GROUP'): group='foreign'
 values={'%U':owner,'%G':group,'%a':format(stat.S_IMODE(info.st_mode),'o'),'%h':str(info.st_nlink)}
@@ -65,7 +65,7 @@ else:
         self.tool('chown', r'''
 import json, os, pathlib, sys
 with open(os.environ['TEST_TRACE'],'a') as stream:
- stream.write(json.dumps(['chown',str(pathlib.Path(sys.argv[-1]).stat().st_ino),sys.argv[1]])+'\n')
+ stream.write(json.dumps(['chown',file_identity(pathlib.Path(sys.argv[-1])),sys.argv[1]])+'\n')
 ''')
         self.tool('python-sync', r'''
 import json, os, pathlib, subprocess, sys
@@ -73,7 +73,7 @@ result=subprocess.run([sys.executable,*sys.argv[1:]],input=sys.stdin.buffer.read
 if result.returncode: sys.exit(result.returncode)
 with open(os.environ['TEST_TRACE'],'a') as stream:
  for name in sys.argv[sys.argv.index('-')+1:]:
-  stream.write(json.dumps(['sync',str(pathlib.Path(name).stat().st_ino)])+'\n')
+  stream.write(json.dumps(['sync',file_identity(pathlib.Path(name))])+'\n')
 if os.environ.get('TEST_FAIL_MARKER_SYNC')=='1' and any(path.endswith('/.containers-managed-by-run-sh') for path in sys.argv): sys.exit(98)
 ''')
         self.tool('mv', r'''
@@ -83,7 +83,7 @@ if os.environ.get('TEST_RACE_TARGET')=='1':
  destination.mkdir(mode=0o750); (destination/'foreign').write_text('preserve')
 if destination.name=='.containers-managed-by-run-sh':
  events=[json.loads(line) for line in pathlib.Path(os.environ['TEST_TRACE']).read_text().splitlines()]
- inode=str(source.stat().st_ino)
+ inode=file_identity(source)
  assert ['chown',inode,'root:root'] in events and ['sync',inode] in events
  assert events.index(['chown',inode,'root:root']) < events.index(['sync',inode])
  assert stat.S_IMODE(source.stat().st_mode)==0o600
@@ -92,7 +92,7 @@ if destination.name=='.containers-managed-by-run-sh':
 if destination.exists() or destination.is_symlink(): sys.exit(0)
 os.rename(source,destination)
 with open(os.environ['TEST_TRACE'],'a') as stream:
- stream.write(json.dumps(['publish',str(destination.stat().st_ino)])+'\n')
+ stream.write(json.dumps(['publish',file_identity(destination)])+'\n')
 if os.environ.get('TEST_FAIL_AFTER_PUBLISH')=='1': sys.exit(97)
 ''')
         self.functions = FUNCTIONS.replace('/etc/systemd/system', str(self.units)).replace('/etc/sovagrid', str(self.etc))
@@ -100,7 +100,10 @@ if os.environ.get('TEST_FAIL_AFTER_PUBLISH')=='1': sys.exit(97)
 
     def tool(self, name, code):
         path = self.bin / name
-        path.write_text('#!' + sys.executable + ' -B\n' + code)
+        path.write_text('#!' + sys.executable + ' -B\n' +
+                        'def file_identity(path):\n'
+                        ' info=path.stat()\n'
+                        ' return f"{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}"\n' + code)
         path.chmod(0o755)
 
     def run_shell(self, operation, **environment):
@@ -153,7 +156,8 @@ if os.environ.get('TEST_FAIL_AFTER_PUBLISH')=='1': sys.exit(97)
         result = self.run_shell('container_inventory_prepare', TEST_MARKER_DEFAULT_GROUP='nonroot')
         self.assertEqual(result.returncode, 0, result.stderr)
         events = [json.loads(line) for line in (self.root / 'trace').read_text().splitlines()]
-        inode = str(self.marker.stat().st_ino)
+        info = self.marker.stat()
+        inode = f'{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}'
         self.assertLess(events.index(['chown', inode, 'root:root']), events.index(['sync', inode]))
         self.assertLess(events.index(['sync', inode]), events.index(['publish', inode]))
         self.assertEqual(self.marker.stat().st_mode & 0o777, 0o600)
@@ -227,6 +231,17 @@ if os.environ.get('TEST_FAIL_AFTER_PUBLISH')=='1': sys.exit(97)
         self.assertEqual((self.directory / 'foreign').read_text(), 'preserve')
         self.assertFalse(self.marker.exists())
         self.assertEqual(list(self.lib.glob('.sovagrid-container-prepare.*')), [])
+
+    def test_reused_inode_with_stale_receipt_generation_does_not_change_snapshot_group(self):
+        self.prepare()
+        snapshot = self.directory / 'snapshot.json'
+        snapshot.write_text('{}')
+        snapshot.chmod(0o640)
+        info = snapshot.stat()
+        stale = f'{info.st_dev}:{info.st_ino}:{info.st_mtime_ns - 1}:29'
+        with (self.root / 'trace').open('a') as stream:
+            stream.write(json.dumps(['chown', stale, 'root:root']) + '\n')
+        self.prepare()
 
     def test_marker_and_legacy_managed_snapshot_validation(self):
         self.prepare()
