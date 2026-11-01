@@ -255,6 +255,177 @@ class TransactionTest(TransactionFixture):
                 self.journal.save(value)
 
 
+class AtomicJournalReadTest(TransactionFixture):
+    def setUp(self):
+        super().setUp()
+        apply.run(self.journal, self.driver, BINDINGS, STEPS)
+        self.target = self.folder / self.journal.name
+        self.next_value = json.loads(self.target.read_bytes())
+        self.next_value["generation"] += 1
+
+    def replace(self, value=None):
+        temporary = self.folder / "replacement.json"
+        temporary.write_text(json.dumps(value or self.next_value))
+        temporary.chmod(0o600)
+        os.replace(temporary, self.target)
+
+    def read_after(self, effect):
+        read = os.read
+        fired = False
+        def changed(descriptor, length):
+            nonlocal fired
+            raw = read(descriptor, length)
+            if not fired:
+                fired = True
+                effect(descriptor)
+            return raw
+        with patch.object(apply.os, "read", side_effect=changed):
+            return self.journal.read()
+
+    def test_atomic_replace_during_read_reopens_and_returns_new_generation(self):
+        value = self.read_after(lambda _fd: self.replace())
+        self.assertEqual(value["generation"], self.next_value["generation"])
+
+    def test_replace_before_first_stat_reopens_without_reading_detached_bytes(self):
+        opened = os.open
+        calls = []
+        def changed(name, *args, **kwargs):
+            descriptor = opened(name, *args, **kwargs)
+            if name == self.journal.name:
+                calls.append(descriptor)
+                if len(calls) == 1:
+                    self.replace()
+            return descriptor
+        with patch.object(apply.os, "open", side_effect=changed):
+            value = self.journal.read()
+        self.assertEqual(value["generation"], self.next_value["generation"])
+        self.assertEqual(len(calls), 2)
+
+    def test_name_stat_resolving_old_inode_during_unlink_reopens_current_name(self):
+        read, lookup = os.read, os.stat
+        held = []
+        replaced = False
+        def reading(descriptor, length):
+            held.append(descriptor)
+            return read(descriptor, length)
+        def resolving(name, *args, **kwargs):
+            nonlocal replaced
+            if name == self.journal.name and kwargs.get("dir_fd") == self.fd and not replaced:
+                replaced = True
+                self.replace()
+                # Linux lookup may resolve the old dentry before replacement
+                # and obtain inode metadata after it has become unlinked.
+                return os.fstat(held[0])
+            return lookup(name, *args, **kwargs)
+        with patch.object(apply.os, "read", side_effect=reading), patch.object(apply.os, "stat", side_effect=resolving):
+            value = self.journal.read()
+        self.assertEqual(value["generation"], self.next_value["generation"])
+
+    def test_new_atomic_json_is_still_validated_instead_of_returning_old_bytes(self):
+        forged = {**self.next_value, "id": "b" * 32}
+        with self.assertRaisesRegex(apply.Refused, "INVALID_RESTORE_JOURNAL"):
+            self.read_after(lambda _fd: self.replace(forged))
+
+    def test_in_place_write_and_permission_change_are_not_retried(self):
+        def append(_fd):
+            with self.target.open("ab") as output:
+                output.write(b" ")
+        with self.assertRaisesRegex(apply.Refused, "RESTORE_JOURNAL_CHANGED"):
+            self.read_after(append)
+        with self.assertRaisesRegex(apply.Refused, "RESTORE_JOURNAL_CHANGED"):
+            self.read_after(lambda fd: os.fchmod(fd, 0o640))
+
+    def test_permission_change_on_old_inode_cannot_be_hidden_by_replacement(self):
+        def changed(descriptor):
+            os.fchmod(descriptor, 0o640)
+            self.replace()
+        with self.assertRaisesRegex(apply.Refused, "RESTORE_JOURNAL_CHANGED"):
+            self.read_after(changed)
+
+    @unittest.skipUnless(os.geteuid() == 0, "changing inode ownership requires root")
+    def test_owner_change_on_old_inode_cannot_be_hidden_by_replacement(self):
+        def changed(descriptor):
+            os.fchown(descriptor, 65534, 65534)
+            self.replace()
+        with self.assertRaisesRegex(apply.Refused, "RESTORE_JOURNAL_CHANGED"):
+            self.read_after(changed)
+
+    def test_hardlinked_old_inode_cannot_be_adopted_after_replacement(self):
+        def changed(_fd):
+            os.link(self.target, self.folder / "kept.json")
+            self.replace()
+        with self.assertRaisesRegex(apply.Refused, "RESTORE_JOURNAL_CHANGED"):
+            self.read_after(changed)
+
+    def test_observed_in_place_change_is_not_lost_after_later_restore_and_replace(self):
+        before = self.target.stat()
+        original = self.target.read_bytes()
+        fstat = os.fstat
+        observations = 0
+        def observed(descriptor):
+            nonlocal observations
+            info = fstat(descriptor)
+            if info.st_ino == before.st_ino:
+                observations += 1
+                if observations == 2:
+                    # Preserve this actual changed stat result even though a
+                    # later stat would only see the restored, detached inode.
+                    self.target.write_bytes(original)
+                    os.utime(self.target, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    self.replace()
+            return info
+        with patch.object(apply.os, "fstat", side_effect=observed):
+            with self.assertRaisesRegex(apply.Refused, "RESTORE_JOURNAL_CHANGED"):
+                self.read_after(lambda _fd: self.target.write_bytes(b"x"))
+
+    def test_disappearance_after_confirmed_replacement_is_not_absent_status(self):
+        opened = os.open
+        calls = 0
+        def changed(name, *args, **kwargs):
+            nonlocal calls
+            if name == self.journal.name:
+                calls += 1
+                if calls == 2:
+                    self.target.unlink()
+                    raise FileNotFoundError
+            descriptor = opened(name, *args, **kwargs)
+            if name == self.journal.name and calls == 1:
+                self.replace()
+            return descriptor
+        with patch.object(apply.os, "open", side_effect=changed):
+            with self.assertRaisesRegex(apply.Refused, "RESTORE_JOURNAL_CHANGED"):
+                self.journal.read()
+
+    def test_continuous_replacement_has_a_bounded_retry_budget(self):
+        opened = os.open
+        calls = 0
+        def changed(name, *args, **kwargs):
+            nonlocal calls
+            descriptor = opened(name, *args, **kwargs)
+            if name == self.journal.name:
+                calls += 1
+                self.replace()
+            return descriptor
+        with patch.object(apply.os, "open", side_effect=changed):
+            with self.assertRaisesRegex(apply.Refused, "RESTORE_JOURNAL_CHANGED"):
+                self.journal.read()
+        self.assertEqual(calls, 4)
+
+    def test_first_stat_failure_still_closes_the_opened_descriptor(self):
+        opened = os.open
+        descriptors = []
+        def recorded(*args, **kwargs):
+            descriptor = opened(*args, **kwargs)
+            descriptors.append(descriptor)
+            return descriptor
+        with patch.object(apply.os, "open", side_effect=recorded), patch.object(apply.os, "fstat", side_effect=OSError("stat failed")):
+            with self.assertRaisesRegex(OSError, "stat failed"):
+                self.journal.read()
+        self.assertEqual(len(descriptors), 1)
+        with self.assertRaises(OSError):
+            os.fstat(descriptors[0])
+
+
 class PublisherTest(TransactionFixture):
     def make_publisher(self, *, directory=False):
         (self.folder / "etc").mkdir(mode=0o755)

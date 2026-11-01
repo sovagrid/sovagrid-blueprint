@@ -78,14 +78,10 @@ def _lock(core, fd, name):
 
 def _control(core, fd, identity, request_sha):
     try:
-        descriptor = os.open(CONTROL, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+        raw, _ = core._read_atomic_private_at(fd, CONTROL, maximum=16384, uid=ROOT_UID, gid=ROOT_GID)
     except FileNotFoundError:
         return None
-    try:
-        raw, _ = core._read_private_fd(descriptor, maximum=16384, uid=ROOT_UID, gid=ROOT_GID)
-        value = json.loads(raw, object_pairs_hook=core._unique)
-    finally:
-        os.close(descriptor)
+    value = json.loads(raw, object_pairs_hook=core._unique)
     _need(isinstance(value, dict) and set(value) == {"protocol", "operation_id", "request_sha256", "action",
         "worker_nonce", "unit", "phase", "apply_review_sha256", "error"} and value["protocol"] == PROTOCOL and
         value["operation_id"] == identity and value["request_sha256"] == request_sha and

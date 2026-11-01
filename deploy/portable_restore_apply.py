@@ -178,27 +178,11 @@ class Journal:
 
     def read(self) -> dict | None:
         try:
-            descriptor = os.open(self.name, os.O_RDONLY | os.O_NOFOLLOW |
-                                 os.O_CLOEXEC, dir_fd=self.fd)
+            raw, _ = _read_atomic_private_at(self.fd, self.name, maximum=MAX_JOURNAL,
+                uid=self.uid, gid=self.gid, changed_code="RESTORE_JOURNAL_CHANGED",
+                limit_code="INVALID_RESTORE_JOURNAL")
         except FileNotFoundError:
             return None
-        try:
-            before = os.fstat(descriptor)
-            _private(before, directory=False, uid=self.uid, gid=self.gid)
-            if before.st_size > MAX_JOURNAL:
-                raise Refused("INVALID_RESTORE_JOURNAL")
-            raw = bytearray()
-            while len(raw) <= MAX_JOURNAL:
-                block = os.read(descriptor, min(65536, MAX_JOURNAL + 1 - len(raw)))
-                if not block:
-                    break
-                raw.extend(block)
-            after = os.fstat(descriptor)
-            if (len(raw) != before.st_size or
-                    _fingerprint(before) != _fingerprint(after)):
-                raise Refused("RESTORE_JOURNAL_CHANGED")
-        finally:
-            os.close(descriptor)
         try:
             value = json.loads(raw, object_pairs_hook=_unique)
         except (ValueError, UnicodeError) as exc:
@@ -1521,6 +1505,82 @@ def _read_private_fd(descriptor: int, *, maximum: int, uid: int, gid: int) -> tu
     if len(raw) != before.st_size or _fingerprint(before) != _fingerprint(os.fstat(descriptor)):
         raise Refused("RESTORE_INPUT_CHANGED")
     return bytes(raw), _fingerprint(before)
+
+
+def _atomic_replacement(directory_fd: int, name: str, before: os.stat_result,
+                        after: os.stat_result, *, uid: int, gid: int) -> bool:
+    # Unlink changes ctime/nlink on an otherwise immutable held inode. Every
+    # other ownership/content observation must agree; an in-place write,
+    # permission change or a still-linked/hardlinked old file is not a retry.
+    def stable(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+                info.st_size, info.st_mtime_ns)
+    if (before.st_nlink not in (0, 1) or after.st_nlink != 0 or
+            not stat.S_ISREG(before.st_mode) or stable(before) != stable(after) or
+            (before.st_uid, before.st_gid, stat.S_IMODE(before.st_mode)) != (uid, gid, 0o600)):
+        return False
+    try:
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        _private(named, directory=False, uid=uid, gid=gid)
+    except (FileNotFoundError, Refused):
+        return False
+    return (named.st_dev, named.st_ino) != (after.st_dev, after.st_ino)
+
+
+def _read_atomic_private_at(directory_fd: int, name: str, *, maximum: int, uid: int, gid: int,
+                            changed_code: str = "RESTORE_INPUT_CHANGED",
+                            limit_code: str = "RESTORE_INPUT_LIMIT") -> tuple[bytes, tuple]:
+    """Read current atomic JSON; never accept bytes from a detected old inode."""
+    for attempt in range(4):
+        try:
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                                 dir_fd=directory_fd)
+        except FileNotFoundError:
+            if attempt:
+                raise Refused(changed_code) from None
+            raise
+        try:
+            before = os.fstat(descriptor)
+            if before.st_nlink == 0:
+                # A replacement may win after open but before the first stat.
+                # No bytes from this already detached inode are considered.
+                if not _atomic_replacement(directory_fd, name, before, os.fstat(descriptor), uid=uid, gid=gid):
+                    raise Refused("UNSAFE_RESTORE_JOURNAL")
+            else:
+                _private(before, directory=False, uid=uid, gid=gid)
+                if before.st_size > maximum:
+                    raise Refused(limit_code)
+                raw = bytearray()
+                while len(raw) <= maximum:
+                    block = os.read(descriptor, min(65536, maximum + 1 - len(raw)))
+                    if not block:
+                        break
+                    raw.extend(block)
+                after = os.fstat(descriptor)
+                if len(raw) != before.st_size:
+                    raise Refused(changed_code)
+                if _fingerprint(before) == _fingerprint(after):
+                    try:
+                        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        raise Refused(changed_code) from None
+                    if _fingerprint(named) == _fingerprint(after):
+                        return bytes(raw), _fingerprint(before)
+                    if (named.st_dev, named.st_ino) == (after.st_dev, after.st_ino):
+                        # Name lookup can resolve this inode immediately before
+                        # replacement and report its now-unlinked metadata.
+                        after = named
+                    else:
+                        # No mutation was observed on the held inode. A later
+                        # replacement must now prove unlink; hardlinks refuse.
+                        after = os.fstat(descriptor)
+                if not _atomic_replacement(directory_fd, name, before, after, uid=uid, gid=gid):
+                    raise Refused(changed_code)
+            if attempt == 3:
+                raise Refused(changed_code)
+        finally:
+            os.close(descriptor)
+    raise Refused(changed_code)
 
 
 class Inputs:

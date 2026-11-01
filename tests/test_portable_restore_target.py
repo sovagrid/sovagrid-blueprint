@@ -143,6 +143,26 @@ class TargetWorkerTest(unittest.TestCase):
         self.assertTrue(answer["retry_in_progress"])
         self.assertEqual(answer["terminal_sha256"], REVIEW)
 
+    def test_status_reopens_a_control_record_atomically_replaced_by_worker(self):
+        with patch.object(target, "_tool", return_value="inactive"):
+            target.launch(OP, "apply", REVIEW)
+        state = json.loads((self.root / target.CONTROL).read_bytes())
+        state["phase"] = "running"
+        read = os.read
+        replaced = False
+        def changing(descriptor, length):
+            nonlocal replaced
+            raw = read(descriptor, length)
+            if not replaced:
+                replaced = True
+                with target._lock(core, self.fd, ".control.lock"):
+                    target._save(core, self.fd, state)
+            return raw
+        with patch.object(core.os, "read", side_effect=changing):
+            answer = target._control(core, self.fd, OP, "d" * 64)
+        self.assertEqual(answer["phase"], "running")
+        self.assertEqual(answer["worker_nonce"], state["worker_nonce"])
+
 
 class RetryTest(unittest.TestCase):
     def setUp(self):
