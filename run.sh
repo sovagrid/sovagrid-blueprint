@@ -768,6 +768,7 @@ for web_restore_file in \
     sovagrid-blueprint/deploy/web_agent_local_rpc.py \
     sovagrid-blueprint/deploy/web_agent_bundle.py \
     sovagrid-blueprint/deploy/web_agent_service.py \
+    sovagrid-blueprint/deploy/web_agent_features.py \
     sovagrid-blueprint/deploy/remote_update_worker.py \
     sovagrid-blueprint/deploy/portable_restore_bootstrap.sh \
     sovagrid-blueprint/deploy/portable_restore_receiver.py \
@@ -784,6 +785,7 @@ for web_restore_file in \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/askpass.py \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/core.py \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_api.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/remote_feature_api.py \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_journal.py \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_protocol.py \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/installer.py \
@@ -807,7 +809,9 @@ for web_restore_file in \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/theme.py \
     sovagrid-blueprint/vendor/connect/SOURCE.json \
     sovagrid-web/host-restore.js \
-    sovagrid-web/host-restore.css; do
+    sovagrid-web/host-restore.css \
+    sovagrid-web/agent-features.js \
+    sovagrid-web/agent-features.css; do
   [[ -f $source_root/$web_restore_file && ! -L $source_root/$web_restore_file ]] ||
     die "Web restore source $web_restore_file is missing or a symlink"
 done
@@ -838,7 +842,8 @@ if [[ $source_root != /opt/sovagrid-src ]]; then
   ssh_gateway_deferred=1
 fi
 if (( ! ssh_gateway_deferred )); then
-  for source_file in Dockerfile.ssh-gateway gateway/package.json gateway/package-lock.json gateway/server.js; do
+  for source_file in Dockerfile.ssh-gateway gateway/package.json gateway/package-lock.json gateway/server.js \
+                     agent-features.js agent-features.css; do
     [[ -f $source_root/sovagrid-web/$source_file && ! -L $source_root/sovagrid-web/$source_file ]] ||
       die "SSH gateway source is missing or unsafe: $source_file"
   done

@@ -74,15 +74,28 @@ class WebAgentUpdateSnapshotTest(unittest.TestCase):
                 path = source / "sovagrid-vpn" / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("fixture\n")
+            feature_paths = ("sovagrid-blueprint/vendor/connect/sovagrid_connect/remote_feature_api.py",
+                             "sovagrid-web/agent-features.js", "sovagrid-web/agent-features.css")
+            for name in feature_paths:
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture\n")
             with mock.patch.object(worker, "ROOT", source), \
                  mock.patch.object(worker, "web_agent_managed", return_value=True), \
                  mock.patch.object(worker, "backup_broker_enabled", return_value=False), \
                  mock.patch.object(worker, "ssh_gateway_managed", return_value=False), \
                  mock.patch.object(worker, "managed_routing_enabled", return_value=False):
                 worker.candidate_features_compatible(source, [])
-                (source / "sovagrid-blueprint/deploy/web_agent_features.py").unlink()
-                with self.assertRaises(worker.UpdateFailure):
-                    worker.candidate_features_compatible(source, [])
+                for name in ("sovagrid-blueprint/deploy/web_agent_features.py", *feature_paths):
+                    path = source / name
+                    path.unlink()
+                    with self.assertRaises(worker.UpdateFailure):
+                        worker.candidate_features_compatible(source, [])
+                    path.symlink_to(script)
+                    with self.assertRaises(worker.UpdateFailure):
+                        worker.candidate_features_compatible(source, [])
+                    path.unlink()
+                    path.write_text("fixture\n")
 
     def test_full_rollback_restores_journal_and_starts_socket_before_compose(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -471,6 +471,11 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
                      "sovagrid_vpn/amnezia_provision.py"):
             need((source / "sovagrid-vpn" / name).is_file(),
                  "CANDIDATE_INCOMPATIBLE")
+        for name in ("sovagrid-blueprint/deploy/web_agent_features.py",
+                     "sovagrid-blueprint/vendor/connect/sovagrid_connect/remote_feature_api.py",
+                     "sovagrid-web/agent-features.js", "sovagrid-web/agent-features.css"):
+            item = source / name
+            need(item.is_file() and not item.is_symlink(), "CANDIDATE_INCOMPATIBLE")
     if common.web_restore_managed():
         need(b"# SOVAGRID_WEB_RESTORE_V1" in script.splitlines(), "CANDIDATE_INCOMPATIBLE")
         for name in common.WEB_RESTORE_REQUIRED:
@@ -484,7 +489,8 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
         for name in ("sovagrid-web/Dockerfile.ssh-gateway",
                      "sovagrid-web/gateway/package.json",
                      "sovagrid-web/gateway/package-lock.json",
-                     "sovagrid-web/gateway/server.js"):
+                     "sovagrid-web/gateway/server.js",
+                     "sovagrid-web/agent-features.js", "sovagrid-web/agent-features.css"):
             need((source / name).is_file(), "CANDIDATE_INCOMPATIBLE")
         need(b"/api/v1/browser-ssh/" in
              (source / "sovagrid-web/deploy/Caddyfile.container").read_bytes(),

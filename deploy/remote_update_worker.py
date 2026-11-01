@@ -116,6 +116,8 @@ WEB_RESTORE_REQUIRED = (
     'sovagrid-blueprint/vendor/connect/SOURCE.json',
     'sovagrid-web/host-restore.js',
     'sovagrid-web/host-restore.css',
+    'sovagrid-web/agent-features.js',
+    'sovagrid-web/agent-features.css',
 )
 WEB_AGENT_MARKER_CONTENT = b'SOVAGRID_WEB_AGENT_INSTALL_V1\n'
 BASE_COMPOSE_SERVICES = ('hub', 'web')
@@ -567,6 +569,12 @@ def candidate_features_compatible(source, flags):
                      'sovagrid_vpn/amnezia_provision.py'):
             if not (source / 'sovagrid-vpn' / name).is_file():
                 fail('COMPAT')
+        for name in ('sovagrid-blueprint/deploy/web_agent_features.py',
+                     'sovagrid-blueprint/vendor/connect/sovagrid_connect/remote_feature_api.py',
+                     'sovagrid-web/agent-features.js', 'sovagrid-web/agent-features.css'):
+            item = source / name
+            if not item.is_file() or item.is_symlink():
+                fail('COMPAT')
     if web_restore_managed():
         if b'# SOVAGRID_WEB_RESTORE_V1' not in script.splitlines():
             fail('COMPAT')
@@ -580,6 +588,8 @@ def candidate_features_compatible(source, flags):
             'sovagrid-web/gateway/package.json',
             'sovagrid-web/gateway/package-lock.json',
             'sovagrid-web/gateway/server.js',
+            'sovagrid-web/agent-features.js',
+            'sovagrid-web/agent-features.css',
         )
         if (b'# SOVAGRID_SSH_GATEWAY_INSTALL_V1' not in script or
                 b'# SOVAGRID_PUBLIC_SSH_REFRESH_V1' not in script or
