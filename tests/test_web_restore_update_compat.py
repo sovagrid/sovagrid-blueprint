@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ../ATTRIBUTION.md.
 """Existing restore journals cannot be downgraded out of their runtime."""
 from contextlib import ExitStack
 import importlib.util

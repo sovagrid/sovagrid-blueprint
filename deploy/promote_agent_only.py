@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Opt-in, two-phase promotion of an Agent-only host to its own local Hub.
 
 ``prepare`` records the exact external Agent/tunnel state before run.sh

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Disabled-by-default, signed server release feed for the existing update timer.
 
 The public Ed25519 key is pinned in TRUST_ANCHORS. A server can opt in only

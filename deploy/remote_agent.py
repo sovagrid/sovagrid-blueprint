@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """SOVAGRID_REMOTE_AGENT_HELPER_V1: bounded root enrollment RPC.
 
 Agent token and SSH private key are generated on the target and never emitted.

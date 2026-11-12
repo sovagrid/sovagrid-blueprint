@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """SOVAGRID_REMOTE_AGENT_FEATURES_V1: staged, recoverable Agent opt-ins.
 
 No credential, source projection, enrollment identity or tunnel is replaced.

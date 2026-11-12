@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Explicit public HTTPS for an existing managed Web container; no credentials.
 
 JSON stdin: preview/apply accept config and expected_state_sha256 (apply only).

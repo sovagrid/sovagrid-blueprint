@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 # One-command, first-server bootstrap. Download exactly one reviewed release;
 # the bundled run.sh remains the installer for Docker, systemd and services.
 set -Eeuo pipefail

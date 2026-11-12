@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Install remote Agents through Connect and Web on disposable CI.
 
 Two Ubuntu root filesystems boot with systemd-nspawn and native systemd

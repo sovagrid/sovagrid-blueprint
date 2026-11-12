@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 name: Agent-only promotion on disposable Ubuntu VM
 
 # The root installer runs only after review on main, or by maintainer dispatch.

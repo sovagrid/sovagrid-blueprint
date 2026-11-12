@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ../ATTRIBUTION.md.
 """Pinned SSH bridge to the fixed, opt-in WireGuard broker installer.
 
 The remote installer is already present in the verified VPN source tree. This

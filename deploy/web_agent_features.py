@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ../ATTRIBUTION.md.
 """Reviewed Web opt-ins for a separately enrolled Agent, over pinned SSH.
 
 Each request stages the verified helper, binds the Agent identity to the live

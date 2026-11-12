@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ../ATTRIBUTION.md.
 """Fixed-path, recoverable maintenance for an existing remote VPN broker.
 
 This module never executes VPN commands, changes peer state, or restarts a VPN

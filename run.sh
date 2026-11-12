@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 # Install or update only the SovaGrid stack on a supported Linux host.
 # SOVAGRID_JOURNAL_INSTALL_V1
 # SOVAGRID_CONTAINER_INVENTORY_V1

@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Disposable Ubuntu VM smoke for the installed host backup broker.
 
 Run only from the host-backup GitHub Actions job. The privileged parent sends

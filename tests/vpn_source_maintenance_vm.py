@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Real systemd gate; run only on a clean disposable Ubuntu VM.
 
 SOVAGRID_DISPOSABLE_VM=1 sudo -E python3 tests/vpn_source_maintenance_vm.py BUNDLE_ROOT

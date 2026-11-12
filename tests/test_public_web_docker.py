@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Disposable Docker proof: a validator cannot collide with live Web's IP/CA.
 
 Explicit opt-in only; no host port publications and no production project.

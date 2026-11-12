@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 # Embedded by a client only after verifying its independently pinned RUNNER
 # release. stdin is that complete gzip source bundle, never the host backup.
 set -euo pipefail

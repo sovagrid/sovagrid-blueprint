@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Offline, root-only archive of the SovaGrid-managed part of one Ubuntu host.
 
 This is deliberately a low-level export primitive. It never stops services,

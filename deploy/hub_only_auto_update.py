@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Root-only, opt-in, one-candidate timer for a promoted Hub-only host.
 
 This never discovers or downloads a release. A trusted SSH client must first

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Exercise a signed discovery -> idle timer -> real updater transition.
 
 Run only on a disposable GitHub-hosted Ubuntu with an installed full server or activated Hub-only promotion.

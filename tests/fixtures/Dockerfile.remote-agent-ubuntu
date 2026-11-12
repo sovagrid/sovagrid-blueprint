@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 # Ubuntu rootfs source for disposable systemd-nspawn CI machines. Docker
 # builds and exports this image; it never runs the target's systemd service.
 FROM ubuntu:24.04

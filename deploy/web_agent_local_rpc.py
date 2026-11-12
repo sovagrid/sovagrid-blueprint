@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Local Hub half of the reviewed remote-Agent enrollment protocol.
 
 This module is a substrate for a future root-owned Web enrollment worker. It

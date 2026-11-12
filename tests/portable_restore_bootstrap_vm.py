@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Pinned bootstrap/SSH framing smoke ONLY on a fresh hosted Ubuntu VM.
 
 Run after restore-dependencies-only, before any SovaGrid installation. The

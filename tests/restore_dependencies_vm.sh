@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 # Run only on a disposable, clean Ubuntu VM after unpacking a reviewed bundle
 # under /root. Usage: sudo ./tests/restore_dependencies_vm.sh MANIFEST_SHA256
 set -euo pipefail
