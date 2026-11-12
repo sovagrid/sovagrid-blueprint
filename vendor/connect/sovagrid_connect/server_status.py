@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Read-only SSH inventory before offering a first server installation.
 
 This probe is deliberately conservative. A partial installation is a conflict,

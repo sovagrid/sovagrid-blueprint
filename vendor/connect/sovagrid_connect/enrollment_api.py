@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Short-lived admin session over the already verified panel SSH tunnel.
 
 Only public registration digests enter this client. A remote Agent's token and

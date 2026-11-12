@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Private OpenSSH askpass helper for the desktop GUI.
 
 OpenSSH launches this program with a prompt and reads one answer from stdout.

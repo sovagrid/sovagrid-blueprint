@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Pinned remote updater sent over authenticated SSH by Connect.
 
 The source is embedded in the executable so recovery does not depend on the

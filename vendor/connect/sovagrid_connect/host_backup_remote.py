@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Read-only proof of the exact installed host backup helper and server package."""
 
 from .release_feed_remote import SOURCE_PROOF

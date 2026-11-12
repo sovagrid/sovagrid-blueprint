@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Fixed root-side programs for the opt-in Agent-only promotion wizard.
 
 Only a locally pinned, fully verified bundle may supply the promotion helper.

@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Private, nonsecret checkpoints. A checkpoint never authorizes remote execution.
 
 All readers and writers share a bounded OS lock. Resume still requires explicit

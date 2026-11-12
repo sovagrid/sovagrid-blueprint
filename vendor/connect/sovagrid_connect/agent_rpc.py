@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Bounded SSH RPC for the fixed, verified remote enrollment helper.
 
 UI input is JSON stdin, never shell source. Stage capabilities are bound to this

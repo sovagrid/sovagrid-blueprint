@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
 """Render/check capability minima in standalone SSH/bootstrap clients."""
 
@@ -26,8 +26,8 @@ TARGETS = (
     "sovagrid-apple/SovaGrid/ServerDeployment.swift",
     "sovagrid-android/ssh-core/src/main/kotlin/org/sovagrid/ssh/ServerBootstrap.kt",
     "sovagrid-android/ssh-core/src/main/kotlin/org/sovagrid/ssh/ServerDeployment.kt",
-    "sovagrid-web/gateway/server.js",
-    "sovagrid-web/app.js",
+    "sovagrid-web/gateway/src/protocol/platform.js",
+    "sovagrid-web/assets/js/core/context.js",
 )
 
 

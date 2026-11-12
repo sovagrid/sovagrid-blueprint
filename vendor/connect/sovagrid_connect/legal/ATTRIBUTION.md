@@ -1,23 +1,14 @@
-# Author attribution
+# Authorship
 
-Original SovaGrid material is licensed under the GNU Affero General Public License,
-version 3 only (AGPL-3.0-only), with this additional term under section 7(b).
-The GNU license text in LICENSE is unchanged.
-
-For material in this repository whose copyright holder is Jigokuraku01, preserve
-this reasonable author attribution in source copies and in the Appropriate Legal
-Notices displayed by works containing that material:
-
-> SovaGrid — Copyright (C) 2026 Jigokuraku01
-
-In an interactive interface, a clearly accessible About or Legal screen displaying
-this attribution meets this requirement. The surrounding explanation may be
-translated; keep the author handle Jigokuraku01 intact. Preserve the applicable
-license, warranty, and attribution notices when redistributing source or binaries.
-
-This term concerns notices in the work. It imposes no citation requirement on
-research papers, advertising, or ordinary output produced by running the program.
-Third-party material remains subject to its own license and attribution notices.
+SovaGrid — Copyright (C) 2026 Jigokuraku01
 
 Original author: https://github.com/Jigokuraku01  
 Project: https://github.com/sovagrid
+
+Original SovaGrid material is licensed under the MIT License in LICENSE.
+There are no additional attribution terms beyond that license. MIT requires
+preserving its copyright and permission notices in copies or substantial
+portions of the software; displaying an author credit in the interface is
+optional.
+
+Third-party components retain their own licenses and notices.

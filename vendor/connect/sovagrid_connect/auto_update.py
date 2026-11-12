@@ -1,6 +1,5 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ATTRIBUTION.md.
 """Opt-in, one-candidate update policy for one SSH target.
 
 There is deliberately no "latest" URL here. A candidate is approved by its

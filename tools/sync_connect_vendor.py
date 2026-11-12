@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
-# Additional author attribution terms: see ../ATTRIBUTION.md.
 """Sync or verify the exact Connect Python package carried by the server bundle.
 
 No network fetch is performed. ``sync`` reads committed Git blobs from the
@@ -27,7 +26,7 @@ VENDOR = ROOT / "vendor/connect"
 PACKAGE = VENDOR / "sovagrid_connect"
 LOCK = VENDOR / "SOURCE.json"
 UPSTREAM = "https://github.com/sovagrid/sovagrid-connect"
-UPSTREAM_COMMIT = "8fbba776e336e8a7c20baa7143418cd204661b0f"
+UPSTREAM_COMMIT = "495fe19768fda6af68eeeac14a7461ef8ab827c4"
 # Runtime-only Ubuntu closure for Agent enrollment and portable restore.
 # core.ssh_grant and enrollment_journal.keygen are used only by the desktop UI
 # and Windows branches; the server worker never invokes those paths.
