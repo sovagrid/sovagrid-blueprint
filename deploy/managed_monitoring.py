@@ -333,7 +333,9 @@ def _install(review: Review, authorize: Callable[[], None]) -> dict:
             raise MonitoringError("STALE_PREVIEW")
         applying = True
         bearer_hash = review.token_hash or _create_state()
-        _compose(hub, "up", "-d", "--no-build", "--pull", "never", "prometheus", timeout=32)
+        # A restarted Hub retains its ID but can have a new network namespace.
+        recreate = ("--force-recreate",) if review.collector is not None else ()
+        _compose(hub, "up", "-d", "--no-build", "--pull", "never", *recreate, "prometheus", timeout=32)
         collector = _collector(hub, bearer_hash)
         if collector is None or not collector.current:
             raise MonitoringError("MONITORING_UNAVAILABLE")

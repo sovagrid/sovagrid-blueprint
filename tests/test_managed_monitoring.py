@@ -69,6 +69,27 @@ class ManagedMonitoringTests(TestCase):
             monitoring.rebind()
             self.assertIs(write.call_args.args[0], active)
 
+    def test_stale_collector_is_recreated_even_when_its_hub_id_matches(self):
+        stale = self.review(enabled=True, revision=1, collector=self.fresh,
+                            token="a" * 64, state="needs_reconcile")
+        ready = self.review(enabled=True, revision=1, collector=self.fresh,
+                            token="a" * 64, state="ready")
+        replacement = monitoring.Collector("5" * 64, True)
+        with mock.patch.object(monitoring, "_running_hub", return_value=self.hub), \
+                mock.patch.object(monitoring, "_hub_status", return_value=(True, 1)), \
+                mock.patch.object(monitoring, "_prepare_image") as prepare, \
+                mock.patch.object(monitoring, "_compose") as compose, \
+                mock.patch.object(monitoring, "_create_state") as create_state, \
+                mock.patch.object(monitoring, "_collector", return_value=replacement), \
+                mock.patch.object(monitoring, "_wait"):
+            self.assertEqual(monitoring._install(ready, mock.Mock())["state"], "ready")
+            prepare.assert_not_called()
+            compose.assert_not_called()
+            self.assertEqual(monitoring._install(stale, mock.Mock())["state"], "ready")
+            create_state.assert_not_called()
+        compose.assert_called_once_with(self.hub, "up", "-d", "--no-build", "--pull", "never",
+                                        "--force-recreate", "prometheus", timeout=32)
+
     def test_promtool_must_report_a_successful_scrape_from_this_operation(self):
         base = time.time() - 1
         def result(timestamp):
