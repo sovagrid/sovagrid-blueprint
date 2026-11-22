@@ -427,7 +427,7 @@ def managed_flags():
     if backup_broker_enabled():
         expected.append(BACKUP_BROKER_UNITS[0])
     if web_agent_managed():
-        expected.extend(WEB_AGENT_UNITS)
+        expected.append(WEB_AGENT_UNITS[0])
     feed_marker = '/var/lib/sovagrid/.release-feed-units-managed-by-run-sh'
     feed_config = '/etc/sovagrid/release-feed.json'
     feed_units = ('/etc/systemd/system/sovagrid-release-feed.service',
@@ -805,6 +805,16 @@ def web_agent_socket_ready():
             (endpoint.st_uid, endpoint.st_gid, stat.S_IMODE(endpoint.st_mode)) != (0, 10005, 0o660)):
         fail('STATE')
 
+def web_agent_service_ready():
+    """A healthy socket-activated broker may be inactive before its first request."""
+    result = subprocess.run(['systemctl', 'show', '--property=LoadState', '--property=ActiveState',
+                             WEB_AGENT_UNITS[1]],
+                            capture_output=True, text=True, timeout=10, check=False)
+    fields = set(result.stdout.splitlines())
+    return (result.returncode == 0 and 'LoadState=loaded' in fields and
+            bool(fields & {'ActiveState=active', 'ActiveState=inactive'}))
+
+
 def public_web_overlay():
     base = '/etc/sovagrid/public-web'
     if not path(base).exists() and not path(base).is_symlink():
@@ -1180,9 +1190,8 @@ def health(source, expected_units):
             raise UpdateFailure('inactive unit: ' + unit)
     backup_broker_socket_ready()
     if web_agent_managed():
-        for unit in WEB_AGENT_UNITS:
-            if command(['systemctl', 'is-active', '--quiet', unit], timeout=10, check=False):
-                raise UpdateFailure('inactive unit: ' + unit)
+        if not web_agent_service_ready():
+            raise UpdateFailure('unhealthy unit: ' + WEB_AGENT_UNITS[1])
         web_agent_socket_ready()
     services = compose_services()
     for service in services:

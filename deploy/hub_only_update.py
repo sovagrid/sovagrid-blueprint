@@ -424,7 +424,7 @@ def inspect(*, external_apply_request_id: str | None = None,
         need(_unit_state(BACKUP_BROKER_UNITS[0])["active"], "BACKUP_BROKER")
         common.backup_broker_socket_ready()
     if common.web_agent_managed():
-        need(all(_unit_state(unit)["active"] for unit in WEB_AGENT_UNITS), "WEB_AGENT")
+        need(_unit_state(WEB_AGENT_UNITS[0])["active"] and common.web_agent_service_ready(), "WEB_AGENT")
         common.web_agent_socket_ready()
     _external_apply_idle(external_apply_request_id,
                          read_only_uncertain=read_only_uncertain)

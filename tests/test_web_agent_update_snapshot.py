@@ -4,6 +4,7 @@
 """The two update engines preserve Web Agent journal and Compose wiring."""
 
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -15,6 +16,94 @@ worker = hub_only.common
 
 
 class WebAgentUpdateSnapshotTest(unittest.TestCase):
+    def test_full_health_allows_dormant_web_agent_service_only_with_live_socket(self):
+        socket_unit, service_unit = worker.WEB_AGENT_UNITS
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "etc/sovagrid/agent.json"
+            config.parent.mkdir(parents=True)
+            config.write_text("{}")
+            for socket_active, service_state, healthy in (
+                (True, "inactive", True),
+                (True, "active", True),
+                (False, "inactive", False),
+                (True, "failed", False),
+            ):
+                with self.subTest(socket_active=socket_active, service_state=service_state):
+                    def command(args, **kwargs):
+                        self.assertEqual(args[:3], ["systemctl", "is-active", "--quiet"])
+                        if args[-1] == service_unit:
+                            return int(service_state != "active")
+                        return int(args[-1] == socket_unit and not socket_active)
+
+                    def run(args, **kwargs):
+                        output = (f"LoadState=loaded\nActiveState={service_state}\n"
+                                  if args[0] == "systemctl" else "")
+                        return subprocess.CompletedProcess(args, 0, output, "")
+
+                    with mock.patch.object(worker, "ROOT", root), \
+                         mock.patch.object(worker, "managed_routing_enabled", return_value=False), \
+                         mock.patch.object(worker, "backup_broker_enabled", return_value=False), \
+                         mock.patch.object(worker, "backup_broker_socket_ready"), \
+                         mock.patch.object(worker, "web_agent_managed", return_value=True), \
+                         mock.patch.object(worker, "web_agent_socket_ready") as socket_ready, \
+                         mock.patch.object(worker, "command", side_effect=command), \
+                         mock.patch.object(worker.subprocess, "run", side_effect=run), \
+                         mock.patch.object(worker, "compose_services", return_value=()), \
+                         mock.patch.object(worker.ssl, "create_default_context"), \
+                         mock.patch.object(worker.urllib.request, "urlopen") as urlopen, \
+                         mock.patch.object(worker, "source_manifest"):
+                        urlopen.return_value.__enter__.return_value.status = 200
+                        snapshot = root / "var/lib/sovagrid/vpn/status.json"
+                        snapshot.parent.mkdir(parents=True, exist_ok=True)
+                        snapshot.touch()
+                        _, units = worker.managed_flags()
+                        if healthy:
+                            worker.health(root, units)
+                            socket_ready.assert_called_once()
+                        else:
+                            with self.assertRaises(worker.UpdateFailure):
+                                worker.health(root, units)
+
+    def test_hub_only_inspection_accepts_dormant_web_agent_service_only_with_live_socket(self):
+        socket_unit, service_unit = hub_only.WEB_AGENT_UNITS
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for socket_active, service_state, healthy in (
+                (True, "inactive", True),
+                (True, "active", True),
+                (False, "inactive", False),
+                (True, "failed", False),
+            ):
+                with self.subTest(socket_active=socket_active, service_state=service_state):
+                    def unit_state(unit):
+                        if unit == socket_unit:
+                            return {"active": socket_active}
+                        self.assertEqual(unit, service_unit)
+                        return {"active": service_state == "active"}
+
+                    with mock.patch.object(hub_only, "Path", side_effect=
+                             lambda path: root / path.lstrip("/")), \
+                         mock.patch.object(hub_only.os, "geteuid", return_value=0), \
+                         mock.patch.object(hub_only, "runtime_supported", return_value=True), \
+                         mock.patch.object(hub_only, "_unit_state", side_effect=unit_state), \
+                         mock.patch.object(worker, "managed_routing_enabled", return_value=False), \
+                         mock.patch.object(worker, "backup_broker_enabled", return_value=False), \
+                         mock.patch.object(worker, "web_agent_managed", return_value=True), \
+                         mock.patch.object(worker, "web_agent_socket_ready") as socket_ready, \
+                         mock.patch.object(worker.subprocess, "run", return_value=
+                             subprocess.CompletedProcess([], 0,
+                                 f"LoadState=loaded\nActiveState={service_state}\n", "")), \
+                         mock.patch.object(hub_only, "_external_apply_idle",
+                                           side_effect=StopIteration):
+                        if healthy:
+                            with self.assertRaises(StopIteration):
+                                hub_only.inspect()
+                            socket_ready.assert_called_once()
+                        else:
+                            with self.assertRaisesRegex(hub_only.Refused, "WEB_AGENT"):
+                                hub_only.inspect()
+
     def test_new_layout_extends_both_prior_snapshots(self):
         expected = (
             "/var/lib/sovagrid/.web-agent-installer-managed-by-run-sh",
