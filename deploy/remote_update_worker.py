@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import runpy
 import secrets
 import select
 import shutil
@@ -63,6 +64,8 @@ WEB_AGENT_MARKER = '/var/lib/sovagrid/.web-agent-installer-managed-by-run-sh'
 WEB_AGENT_DIR = '/var/lib/sovagrid/web-agent'
 WEB_AGENT_JOURNAL = WEB_AGENT_DIR + '/jobs'
 WEB_RESTORE_DIR = WEB_AGENT_DIR + '/restores'
+WEB_ASSET_LAYOUT_MARKER = b'# SOVAGRID_WEB_ASSET_LAYOUT_V1'
+WEB_ASSET_LAYOUT_HELPER = 'sovagrid-blueprint/deploy/web_assets.py'
 WEB_RESTORE_REQUIRED = (
     'sovagrid-blueprint/deploy/web_restore.py',
     'sovagrid-blueprint/deploy/host_restore.py',
@@ -115,10 +118,6 @@ WEB_RESTORE_REQUIRED = (
     'sovagrid-blueprint/vendor/connect/sovagrid_connect/release_feed_remote.py',
     'sovagrid-blueprint/vendor/connect/sovagrid_connect/theme.py',
     'sovagrid-blueprint/vendor/connect/SOURCE.json',
-    'sovagrid-web/host-restore.js',
-    'sovagrid-web/host-restore.css',
-    'sovagrid-web/agent-features.js',
-    'sovagrid-web/agent-features.css',
 )
 WEB_AGENT_MARKER_CONTENT = b'SOVAGRID_WEB_AGENT_INSTALL_V1\n'
 BASE_COMPOSE_SERVICES = ('hub', 'web')
@@ -507,8 +506,29 @@ def managed_flags():
         expected.append('sovagrid-container-inventory.timer')
     return flags, expected
 
+def candidate_web_asset_helper_present(source, script):
+    if WEB_ASSET_LAYOUT_MARKER not in script.splitlines():
+        return True
+    helper = source / WEB_ASSET_LAYOUT_HELPER
+    return helper.is_file() and not helper.is_symlink()
+
+
+def candidate_web_assets_present(source, *, restore=False):
+    # Read the layout policy from the installed worker's sibling, never from
+    # executable code in the candidate. run_path also works under python -I.
+    try:
+        assets = runpy.run_path(str(Path(__file__).with_name('web_assets.py')))
+        names = assets['RESTORE_ASSETS'] if restore else assets['AGENT_ASSETS']
+        assets['asset_files'](source / 'sovagrid-web', names)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def candidate_features_compatible(source, flags):
     script = (source / 'sovagrid-blueprint/run.sh').read_bytes()
+    if not candidate_web_asset_helper_present(source, script):
+        fail('COMPAT')
     for flag in ('--with-wireguard', '--with-terminal', '--with-files', '--with-journal', '--with-containers'):
         if flag in flags and flag.encode() not in script:
             fail('COMPAT')
@@ -571,11 +591,12 @@ def candidate_features_compatible(source, flags):
             if not (source / 'sovagrid-vpn' / name).is_file():
                 fail('COMPAT')
         for name in ('sovagrid-blueprint/deploy/web_agent_features.py',
-                     'sovagrid-blueprint/vendor/connect/sovagrid_connect/remote_feature_api.py',
-                     'sovagrid-web/agent-features.js', 'sovagrid-web/agent-features.css'):
+                     'sovagrid-blueprint/vendor/connect/sovagrid_connect/remote_feature_api.py'):
             item = source / name
             if not item.is_file() or item.is_symlink():
                 fail('COMPAT')
+        if not candidate_web_assets_present(source):
+            fail('COMPAT')
     if web_restore_managed():
         if b'# SOVAGRID_WEB_RESTORE_V1' not in script.splitlines():
             fail('COMPAT')
@@ -583,17 +604,18 @@ def candidate_features_compatible(source, flags):
             item = source / name
             if not item.is_file() or item.is_symlink():
                 fail('COMPAT')
+        if not candidate_web_assets_present(source, restore=True):
+            fail('COMPAT')
     if ssh_gateway_managed():
         gateway_required = (
             'sovagrid-web/Dockerfile.ssh-gateway',
             'sovagrid-web/gateway/package.json',
             'sovagrid-web/gateway/package-lock.json',
             'sovagrid-web/gateway/server.js',
-            'sovagrid-web/agent-features.js',
-            'sovagrid-web/agent-features.css',
         )
         if (b'# SOVAGRID_SSH_GATEWAY_INSTALL_V1' not in script or
                 b'# SOVAGRID_PUBLIC_SSH_REFRESH_V1' not in script or
+                not candidate_web_assets_present(source) or
                 any(not (source / name).is_file() for name in gateway_required)):
             fail('COMPAT')
         caddy = (source / 'sovagrid-web/deploy/Caddyfile.container').read_bytes()

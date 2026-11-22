@@ -12,6 +12,7 @@
 # SOVAGRID_SSH_GATEWAY_INSTALL_V1
 # SOVAGRID_WEB_AGENT_INSTALL_V1
 # SOVAGRID_WEB_RESTORE_V1
+# SOVAGRID_WEB_ASSET_LAYOUT_V1
 set -euo pipefail
 umask 077
 # Keep the verified source tree free of generated Python bytecode on fresh installs.
@@ -1120,13 +1121,12 @@ for web_restore_file in \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/release_feed_remote.py \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/theme.py \
     sovagrid-blueprint/vendor/connect/SOURCE.json \
-    sovagrid-web/host-restore.js \
-    sovagrid-web/host-restore.css \
-    sovagrid-web/agent-features.js \
-    sovagrid-web/agent-features.css; do
+    sovagrid-blueprint/deploy/web_assets.py; do
   [[ -f $source_root/$web_restore_file && ! -L $source_root/$web_restore_file ]] ||
     die "Web restore source $web_restore_file is missing or a symlink"
 done
+python3 -B -I "$blueprint_dir/deploy/web_assets.py" "$source_root/sovagrid-web" ||
+  die 'Web Agent and restore assets are incomplete or unsafe'
 for amnezia_provision_file in deploy/sovagrid-amnezia-provision sovagrid_vpn/amnezia_provision.py; do
   [[ -f $source_root/sovagrid-vpn/$amnezia_provision_file &&
      ! -L $source_root/sovagrid-vpn/$amnezia_provision_file ]] ||
@@ -1154,8 +1154,7 @@ if [[ $source_root != /opt/sovagrid-src ]]; then
   ssh_gateway_deferred=1
 fi
 if (( ! ssh_gateway_deferred )); then
-  for source_file in Dockerfile.ssh-gateway gateway/package.json gateway/package-lock.json gateway/server.js \
-                     agent-features.js agent-features.css; do
+  for source_file in Dockerfile.ssh-gateway gateway/package.json gateway/package-lock.json gateway/server.js; do
     [[ -f $source_root/sovagrid-web/$source_file && ! -L $source_root/sovagrid-web/$source_file ]] ||
       die "SSH gateway source is missing or unsafe: $source_file"
   done

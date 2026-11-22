@@ -72,7 +72,8 @@ die() { printf '%s\\n' "$*" >&2; exit 1; }
         start = SOURCE.index("for web_restore_file in ")
         end = SOURCE.index("\ndone\n", start) + len("\ndone\n")
         closure = SOURCE[start:end]
-        for name in worker.WEB_RESTORE_REQUIRED:
+        required = (*worker.WEB_RESTORE_REQUIRED, worker.WEB_ASSET_LAYOUT_HELPER)
+        for name in required:
             self.assertIn(name, closure)
             self.assertTrue((ROOT.parent / name).is_file(), name)
             path = self.root / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text("fixture")
@@ -80,7 +81,7 @@ die() { printf '%s\\n' "$*" >&2; exit 1; }
         def check():
             return subprocess.run(["bash", "-c", script, "closure", str(self.root)], capture_output=True, text=True)
         self.assertEqual(check().returncode, 0)
-        for name in worker.WEB_RESTORE_REQUIRED:
+        for name in required:
             path = self.root / name; path.unlink()
             self.assertNotEqual(check().returncode, 0, name)
             path.symlink_to(ROOT / "run.sh")

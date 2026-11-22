@@ -3,7 +3,8 @@
 # Copyright (C) 2026 Jigokuraku01
 """Create a portable server source archive from the five server repositories.
 
-Only Git-tracked, committed regular files are included. Server credentials,
+Only Git-tracked, committed regular file contents are included, with exact
+copies at the legacy Web paths required by older updaters. Server credentials,
 runtime data, Git metadata and local build caches are never copied.
 """
 
@@ -18,6 +19,8 @@ import re
 import subprocess
 import tarfile
 import tempfile
+
+from deploy.web_assets import ENTRYPOINTS, WebAssetsError, asset_files
 
 
 COMPONENTS = (
@@ -62,6 +65,32 @@ def add_file(archive: tarfile.TarFile, path: Path, name: str, git_mode: int) -> 
     return hashlib.sha256(contents).hexdigest()
 
 
+def web_compatibility_files(repo: Path, entries: list[tuple[Path, int]]) -> list[tuple[Path, str, int]]:
+    """Generate old updater paths from the selected Web commit's split assets."""
+    tracked = dict(entries)
+    if not any(path.parts[0] == "assets" for path in tracked):
+        return []
+    if Path(ENTRYPOINTS) not in tracked:
+        raise SystemExit("The Web entrypoints manifest must be tracked")
+    try:
+        assets = asset_files(repo)
+    except (OSError, WebAssetsError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+    copies = []
+    for legacy_name, path in assets.items():
+        relative = path.relative_to(repo)
+        if relative not in tracked:
+            raise SystemExit(f"Web asset must be tracked: {relative}")
+        legacy = Path(legacy_name)
+        if legacy in tracked:
+            if (repo / legacy).read_bytes() != path.read_bytes():
+                raise SystemExit(f"Tracked legacy Web asset conflicts with {relative}: {legacy}")
+            continue
+        copies.append((path, f"sovagrid-web/{legacy_name}", tracked[relative]))
+    return copies
+
+
 def package(destination: Path) -> None:
     root = Path(__file__).resolve().parent.parent
     manifest: dict[str, object] = {"format": 1, "components": {}}
@@ -94,7 +123,9 @@ def package(destination: Path) -> None:
             if not valid_manifest_source_name(bundled_name):
                 raise SystemExit(f"Unsupported bundled filename in {name}: {relative}")
             files.append((path, bundled_name, git_mode))
-        manifest["components"][name] = {"commit": commit, "file_count": len(entries)}
+        extra_files = web_compatibility_files(repo, entries) if name == "sovagrid-web" else []
+        files.extend(extra_files)
+        manifest["components"][name] = {"commit": commit, "file_count": len(entries) + len(extra_files)}
 
     destination = destination.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)

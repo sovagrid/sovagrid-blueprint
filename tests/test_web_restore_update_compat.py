@@ -3,6 +3,7 @@
 """Existing restore journals cannot be downgraded out of their runtime."""
 from contextlib import ExitStack
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -13,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from tests.test_hub_only_update import update as hub
+from deploy import web_assets
 
 worker = hub.common
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,10 +73,12 @@ class WebRestoreUpdateCompatibility(unittest.TestCase):
             with self.assertRaises(error):
                 check()
         self.script.write_bytes(self.script.read_bytes() + b"# SOVAGRID_WEB_RESTORE_V1\n")
-        for name in worker.WEB_RESTORE_REQUIRED:
+        required = (*worker.WEB_RESTORE_REQUIRED,
+                    *(f"sovagrid-web/{name}" for name in web_assets.RESTORE_ASSETS))
+        for name in required:
             self.file(name)
         self.check_full(); self.check_hub()
-        for name in worker.WEB_RESTORE_REQUIRED:
+        for name in required:
             path = self.source / name
             path.unlink()
             for check, error in ((self.check_full, worker.UpdateFailure), (self.check_hub, hub.Refused)):
@@ -86,6 +90,29 @@ class WebRestoreUpdateCompatibility(unittest.TestCase):
         path.unlink(); path.symlink_to(self.script)
         with self.assertRaises(worker.UpdateFailure): self.check_full()
         with self.assertRaises(hub.Refused): self.check_hub()
+
+    def test_modular_candidate_requires_live_assets_even_with_legacy_copies(self):
+        self.script.write_bytes(self.script.read_bytes() + b"# SOVAGRID_WEB_RESTORE_V1\n"
+                                + worker.WEB_ASSET_LAYOUT_MARKER + b"\n")
+        for name in worker.WEB_RESTORE_REQUIRED:
+            self.file(name)
+        entrypoints = {}
+        for name in web_assets.RESTORE_ASSETS:
+            path = f"assets/{name.rsplit('.', 1)[1]}/features/{name}"
+            self.file(f"sovagrid-web/{name}")
+            self.file(f"sovagrid-web/{path}")
+            entrypoints[name] = path
+        manifest = self.file(f"sovagrid-web/{web_assets.ENTRYPOINTS}")
+        manifest.write_text(json.dumps({"assets": entrypoints}))
+        for check, error in ((self.check_full, worker.UpdateFailure), (self.check_hub, hub.Refused)):
+            with self.assertRaises(error):
+                check()
+        self.file(worker.WEB_ASSET_LAYOUT_HELPER)
+        self.check_full(); self.check_hub()
+        (self.source / "sovagrid-web" / entrypoints["host-restore.js"]).unlink()
+        for check, error in ((self.check_full, worker.UpdateFailure), (self.check_hub, hub.Refused)):
+            with self.assertRaises(error):
+                check()
 
     def test_absent_namespace_allows_the_old_candidate_without_modifying_snapshot_layout(self):
         self.namespace.rmdir()

@@ -459,6 +459,7 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
     script = (source / "sovagrid-blueprint/run.sh").read_bytes()
     need(b"--hub-only" in script and b"local-hub-ca.pem" in script,
          "CANDIDATE_INCOMPATIBLE")
+    need(common.candidate_web_asset_helper_present(source, script), "CANDIDATE_INCOMPATIBLE")
     if Path("/var/lib/sovagrid/.release-feed-units-managed-by-run-sh").is_file():
         need(b"# SOVAGRID_RELEASE_FEED_UNITS_V1" in script,
              "CANDIDATE_INCOMPATIBLE")
@@ -490,15 +491,16 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
             need((source / "sovagrid-vpn" / name).is_file(),
                  "CANDIDATE_INCOMPATIBLE")
         for name in ("sovagrid-blueprint/deploy/web_agent_features.py",
-                     "sovagrid-blueprint/vendor/connect/sovagrid_connect/remote_feature_api.py",
-                     "sovagrid-web/agent-features.js", "sovagrid-web/agent-features.css"):
+                     "sovagrid-blueprint/vendor/connect/sovagrid_connect/remote_feature_api.py"):
             item = source / name
             need(item.is_file() and not item.is_symlink(), "CANDIDATE_INCOMPATIBLE")
+        need(common.candidate_web_assets_present(source), "CANDIDATE_INCOMPATIBLE")
     if common.web_restore_managed():
         need(b"# SOVAGRID_WEB_RESTORE_V1" in script.splitlines(), "CANDIDATE_INCOMPATIBLE")
         for name in common.WEB_RESTORE_REQUIRED:
             item = source / name
             need(item.is_file() and not item.is_symlink(), "CANDIDATE_INCOMPATIBLE")
+        need(common.candidate_web_assets_present(source, restore=True), "CANDIDATE_INCOMPATIBLE")
     if common.ssh_gateway_managed():
         need(b"# SOVAGRID_SSH_GATEWAY_INSTALL_V1" in script,
              "CANDIDATE_INCOMPATIBLE")
@@ -507,9 +509,9 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
         for name in ("sovagrid-web/Dockerfile.ssh-gateway",
                      "sovagrid-web/gateway/package.json",
                      "sovagrid-web/gateway/package-lock.json",
-                     "sovagrid-web/gateway/server.js",
-                     "sovagrid-web/agent-features.js", "sovagrid-web/agent-features.css"):
+                     "sovagrid-web/gateway/server.js"):
             need((source / name).is_file(), "CANDIDATE_INCOMPATIBLE")
+        need(common.candidate_web_assets_present(source), "CANDIDATE_INCOMPATIBLE")
         need(b"/api/v1/browser-ssh/" in
              (source / "sovagrid-web/deploy/Caddyfile.container").read_bytes(),
              "CANDIDATE_INCOMPATIBLE")
