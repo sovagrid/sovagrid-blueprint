@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import os
 from pathlib import Path
@@ -16,18 +15,18 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
+
+from .ssh_route import (ConnectionOptions as ConnectionOptions, _host as _host, _port as _port,
+                        _ssh_config as _ssh_config, _user as _user)
 
 
 class TunnelError(RuntimeError):
     """The requested tunnel could not be created or verified."""
 
 
-_USER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}\Z")
-_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 _SAFE_CONFIG_PATH = re.compile(r"[A-Za-z0-9_./:\\-]+\Z")
 _BOOTSTRAP_PASSWORD = re.compile(r"[A-Za-z0-9_-]{20,128}\Z")
 _PANEL_PATH = re.compile(r"/(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?/){1,3}\Z")
@@ -44,151 +43,6 @@ _SSH_GRANT_COMMAND = "sh -c " + shlex.quote(
     '; fi; exec sudo -n ' + _HUB_GRANT_COMMAND
 )
 _SSH_GRANT_OUTPUT_LIMIT = 513
-
-
-def _host(value: str, field: str) -> str:
-    host = value.strip()
-    if host.startswith("[") and host.endswith("]"):
-        host = host[1:-1]
-    if not host or any(c in host for c in "\r\n\t\x00 /\\@'\"`$;|&<>%"):
-        raise ValueError(f"{field}: use a DNS name or IP address")
-    try:
-        return str(ipaddress.ip_address(host))
-    except ValueError:
-        pass
-    try:
-        ascii_host = host.rstrip(".").encode("idna").decode("ascii").lower()
-    except UnicodeError as exc:
-        raise ValueError(f"{field}: invalid DNS name") from exc
-    if len(ascii_host) > 253 or not all(_LABEL.fullmatch(label) for label in ascii_host.split(".")):
-        raise ValueError(f"{field}: invalid DNS name")
-    return ascii_host
-
-
-def _user(value: str, field: str) -> str:
-    if not _USER.fullmatch(value):
-        raise ValueError(f"{field}: invalid SSH user name")
-    return value
-
-
-def _port(value: int, field: str, *, allow_zero: bool = False) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not (0 if allow_zero else 1) <= value <= 65535:
-        raise ValueError(f"{field}: expected port {0 if allow_zero else 1}–65535")
-    return value
-
-
-def _identity(value: str | None, field: str) -> str | None:
-    if not value:
-        return None
-    try:
-        path = Path(value).expanduser().resolve()
-    except RuntimeError as exc:
-        raise ValueError(f"{field}: cannot expand key path") from exc
-    if not path.is_file():
-        raise ValueError(f"{field}: file does not exist: {path}")
-    return path.as_posix()
-
-
-def _config_word(value: str) -> str:
-    if any(c in value for c in "\r\n\x00"):
-        raise ValueError("SSH configuration value contains a control character")
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-@dataclass(frozen=True)
-class ConnectionOptions:
-    host: str
-    user: str
-    port: int = 22
-    jump_host: str | None = None
-    jump_user: str | None = None
-    jump_port: int = 22
-    identity: str | None = None
-    jump_identity: str | None = None
-    host_key_alias: str | None = None
-    jump_host_key_alias: str | None = None
-    local_port: int = 0
-    remote_port: int = 8766
-    ssh_executable: str = "ssh"
-
-    def validated(self) -> "ConnectionOptions":
-        if self.jump_user and not self.jump_host:
-            raise ValueError("jump_user requires jump_host")
-        if self.jump_identity and not self.jump_host:
-            raise ValueError("jump_identity requires jump_host")
-        if self.jump_host_key_alias and not self.jump_host:
-            raise ValueError("jump_host_key_alias requires jump_host")
-        if not self.ssh_executable or any(c in self.ssh_executable for c in "\r\n\x00"):
-            raise ValueError("invalid SSH executable")
-        return ConnectionOptions(
-            host=_host(self.host, "host"),
-            user=_user(self.user, "user"),
-            port=_port(self.port, "port"),
-            jump_host=_host(self.jump_host, "jump_host") if self.jump_host else None,
-            jump_user=_user(self.jump_user or self.user, "jump_user") if self.jump_host else None,
-            jump_port=_port(self.jump_port, "jump_port"),
-            identity=_identity(self.identity, "identity"),
-            jump_identity=_identity(self.jump_identity, "jump_identity"),
-            host_key_alias=_host(self.host_key_alias, "host_key_alias") if self.host_key_alias else None,
-            jump_host_key_alias=_host(self.jump_host_key_alias, "jump_host_key_alias")
-            if self.jump_host_key_alias else None,
-            local_port=_port(self.local_port, "local_port", allow_zero=True),
-            remote_port=_port(self.remote_port, "remote_port"),
-            ssh_executable=self.ssh_executable,
-        )
-
-
-def _ssh_config(options: ConnectionOptions, *, batch_mode: bool = False, confirm_host_keys: bool = False) -> str:
-    # One generated config is passed with -F. ProxyJump invokes its helper with
-    # the same -F, so strict host key policy covers both SSH connections.
-    lines = [
-        "Host *",
-        f"    StrictHostKeyChecking {'ask' if confirm_host_keys else 'yes'}",
-        "    FingerprintHash sha256",
-        "    UpdateHostKeys no",
-        "    ForwardAgent no",
-        "    ForwardX11 no",
-        "    PermitLocalCommand no",
-        "    ControlMaster no",
-        "    ConnectTimeout 10",
-        "    ServerAliveInterval 15",
-        "    ServerAliveCountMax 3",
-        "    ExitOnForwardFailure yes",
-        "",
-    ]
-    if batch_mode:
-        lines.insert(2, "    BatchMode yes")
-    if options.jump_host:
-        lines.extend(
-            [
-                "Host sovagrid-jump",
-                f"    HostName {options.jump_host}",
-                f"    User {options.jump_user}",
-                f"    Port {options.jump_port}",
-            ]
-        )
-        if options.jump_identity:
-            lines.extend(
-                [f"    IdentityFile {_config_word(options.jump_identity)}", "    IdentitiesOnly yes"]
-            )
-        if options.jump_host_key_alias:
-            lines.append(f"    HostKeyAlias {options.jump_host_key_alias}")
-        lines.append("")
-    lines.extend(
-        [
-            "Host sovagrid-target",
-            f"    HostName {options.host}",
-            f"    User {options.user}",
-            f"    Port {options.port}",
-        ]
-    )
-    if options.jump_host:
-        lines.append("    ProxyJump sovagrid-jump")
-    if options.host_key_alias:
-        lines.append(f"    HostKeyAlias {options.host_key_alias}")
-    if options.identity:
-        lines.extend([f"    IdentityFile {_config_word(options.identity)}", "    IdentitiesOnly yes"])
-    return "\n".join(lines) + "\n"
 
 
 def _available_port() -> int:

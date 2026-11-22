@@ -1097,6 +1097,7 @@ for web_restore_file in \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/agent_rpc.py \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/askpass.py \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/core.py \
+    sovagrid-blueprint/vendor/connect/sovagrid_connect/ssh_route.py \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_api.py \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/remote_feature_api.py \
     sovagrid-blueprint/vendor/connect/sovagrid_connect/enrollment_journal.py \

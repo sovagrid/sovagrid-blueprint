@@ -75,7 +75,7 @@ die() { printf '%s\\n' "$*" >&2; exit 1; }
         required = (*worker.WEB_RESTORE_REQUIRED, worker.WEB_ASSET_LAYOUT_HELPER)
         for name in required:
             self.assertIn(name, closure)
-            self.assertTrue((ROOT.parent / name).is_file(), name)
+            self.assertTrue((ROOT / Path(name).relative_to("sovagrid-blueprint")).is_file(), name)
             path = self.root / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text("fixture")
         script = 'set -euo pipefail\nsource_root=$1\n' + self.shim + closure
         def check():

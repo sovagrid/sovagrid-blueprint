@@ -57,6 +57,9 @@ def source_bundle(path):
 
 def _connection(options):
     options = options.validated()
+    if len(options.ssh_hops) > 1:
+        raise EnrollmentError("Этот мастер сохраняет только один SSH-переход. "
+                              "Для установки удалённого Agent выберите прямой маршрут или один переход.")
     if options.ssh_executable != "ssh":
         raise EnrollmentError("Для мастера установки используйте системный OpenSSH.")
     values = asdict(options)

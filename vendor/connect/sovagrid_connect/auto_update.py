@@ -46,6 +46,9 @@ def target_id(options: ConnectionOptions) -> str:
         "identity": options.identity, "jump_identity": options.jump_identity,
         "ssh_executable": options.ssh_executable,
     }
+    if len(options.ssh_hops) > 1:
+        # Existing direct and single-hop approvals retain the same digest.
+        route["hops"] = [asdict(hop) for hop in options.ssh_hops]
     raw = json.dumps(route, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
     return hashlib.sha256(raw).hexdigest()
 
