@@ -66,7 +66,7 @@ class HubUninstallTest(unittest.TestCase):
         with closing(sqlite3.connect(self.database)) as database:
             return hub.installed_agents(database, self.ledger, local_id=LOCAL_SERVER)
 
-    def run_uninstall(self, *, events, fail=False, routes=None, shared=False):
+    def run_uninstall(self, *, events, fail=False, routes=None, shared=False, vpn_programs=()):
         terminal = MagicMock()
         terminal.__enter__.return_value = terminal
         terminal.readline.return_value = "REMOVE SOVAGRID\n"
@@ -92,7 +92,10 @@ class HubUninstallTest(unittest.TestCase):
             stack.enter_context(redirect_stdout(io.StringIO()))
             stack.enter_context(patch.object(hub, "open", return_value=terminal, create=True))
             stack.enter_context(patch.object(hub.enrollment, "Enrollment", return_value=self.ledger))
-            stack.enter_context(patch.object(hub, "runtime_roots", return_value=[self.data]))
+            runtime_roots = stack.enter_context(patch.object(hub, "runtime_roots", return_value=[self.data]))
+            if vpn_programs:
+                stack.enter_context(patch.object(hub, "VPN_CONTROL_MARKER", str(self.database)))
+                stack.enter_context(patch.object(hub, "reviewed_vpn_programs", return_value=vpn_programs))
             stack.enter_context(patch.object(hub, "reviewed_units", return_value=[]))
             stack.enter_context(patch.object(hub, "reviewed_containers", return_value=[]))
             stack.enter_context(patch.object(hub, "reviewed_network", return_value=None))
@@ -105,8 +108,10 @@ class HubUninstallTest(unittest.TestCase):
                 layout = Mock(local_id=LOCAL_SERVER, retained_paths=())
                 layout.recheck_external.side_effect = lambda: events.append(("external", "Agent"))
                 stack.enter_context(patch.object(hub.hub_only, "inspect", return_value=layout))
-            return hub.uninstall(False, self.routes if routes is None else routes,
-                                 manifest_digest="a" * 64 if shared else None)
+            status = hub.uninstall(False, self.routes if routes is None else routes,
+                                   manifest_digest="a" * 64 if shared else None)
+            self.assertTrue(all(call.kwargs["vpn_programs"] == vpn_programs for call in runtime_roots.call_args_list))
+            return status
 
     def test_roster_requires_matching_registration_and_tunnel_identity(self):
         self.assertEqual([agent.server_id for agent in self.inventory()], [SERVER_A, SERVER_B])
@@ -145,6 +150,25 @@ class HubUninstallTest(unittest.TestCase):
         self.assertTrue((self.source / "sovagrid-bundle.json").is_file())
         self.assertTrue(self.database.is_file())
         self.assertEqual(len(self.inventory()), 2)
+
+    def test_full_hub_includes_verified_vpn_programs_in_cleanup_plan(self):
+        program = self.root / 'sovagrid-vpn-ctl'
+        program.write_text('verified tool')
+        events = []
+        self.assertEqual(self.run_uninstall(events=events, vpn_programs=(program,)), 0)
+        self.assertEqual(events[-2:], [("stop", "Hub"), ("remove", "Hub")])
+
+    def test_vpn_program_must_match_the_manifest_hash(self):
+        program = self.root / 'sovagrid-vpn-ctl'
+        program.write_bytes(b'verified tool')
+        manifest = {'sha256': {'sovagrid-vpn/deploy/sovagrid-vpn-ctl':
+                              hashlib.sha256(b'verified tool').hexdigest()}}
+        with (patch.object(hub.hub_only, 'VPN_PROGRAMS', (program,)),
+              patch.object(hub.installed, 'public_path', side_effect=lambda name, **_: Path(name).read_bytes())):
+            self.assertEqual(hub.reviewed_vpn_programs(manifest), (program,))
+            program.write_bytes(b'operator modified')
+            with self.assertRaisesRegex(hub.UninstallError, 'отличается'):
+                hub.reviewed_vpn_programs(manifest)
 
     def test_hub_only_rechecks_external_agent_without_using_its_local_config(self):
         events = []
