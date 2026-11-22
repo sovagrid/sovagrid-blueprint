@@ -279,11 +279,14 @@ install_core_dependencies
         return self.shell(script, TEST_DOCKER_BINARY=str(binary), **environment)
 
     def test_existing_working_compose_does_not_change_packages_or_daemon(self) -> None:
-        result = self.dependency_fixture(TEST_COMPOSE_VERSION="2.24.6", TEST_APT_PRESENT="0",
-                                         ID="unknown-distro", VERSION_ID="any-version")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("apt-", self.commands())
-        self.assertNotIn("systemctl", self.commands())
+        for version in ("2.24.6", "2.40.3+ds1-0ubuntu1~24.04.1"):
+            with self.subTest(version=version):
+                result = self.dependency_fixture(TEST_COMPOSE_VERSION=version, TEST_APT_PRESENT="0",
+                                                 ID="unknown-distro", VERSION_ID="any-version")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("apt-", self.commands())
+                self.assertNotIn("systemctl", self.commands())
+                self.assertNotIn("verified-binary-fallback", self.commands())
 
     def test_no_package_adapter_reports_all_missing_dependencies_without_changes(self) -> None:
         result = self.dependency_fixture(TEST_APT_PRESENT="0", TEST_DOCKER_PRESENT="0",

@@ -178,7 +178,7 @@ require_new_docker_target() {
 compose_plugin_supported() {
   local version major
   version=$("$@" compose version --short 2>/dev/null) || return 1
-  [[ $version =~ ^v?([1-9][0-9]*)\.[0-9]+\.[0-9]+([+-][[:alnum:]._-]+)?$ ]] || return 1
+  [[ $version =~ ^v?([1-9][0-9]*)\.[0-9]+\.[0-9]+([+~-][[:alnum:].~_-]+)?$ ]] || return 1
   major=${BASH_REMATCH[1]}
   (( ${#major} <= 4 && 10#$major >= 2 ))
 }
