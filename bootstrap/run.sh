@@ -6,9 +6,9 @@
 set -Eeuo pipefail
 umask 077
 
-release='server-v1.1.0'
-archive_sha256='773496d1aa72549853d202a1404c21ac77de1e9bfd406ba61844cd4c7c8ca8e6'
-manifest_sha256='8608c5556d1adf8682188af948d13a372b3caf48d47bf086125bc32d5f989752'
+release='server-v1.2.1'
+archive_sha256='3bb7c48b2072dc363db8c22153d10b5bf0289bd86ca9948ecae261032f7b0be5'
+manifest_sha256='7c47f04f5ef62da8888fa55192a7e45b6fcf21a8b44fbb368e23ae64d985e24d'
 archive_url="https://github.com/sovagrid/sovagrid-blueprint/releases/download/${release}/SovaGrid-server-source.tar.gz"
 source_root='/opt/sovagrid-src'
 default_path='/sovagrid/monitoring/'
