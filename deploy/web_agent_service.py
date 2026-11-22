@@ -26,6 +26,7 @@ import threading
 _DEPLOY = Path(__file__).resolve().parent
 _BEARER = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _ACTIONS = frozenset({"prepare", "apply", "resume", "cleanup", "interrupt", "status", "list",
+                      "managed-monitoring-preview", "managed-monitoring-apply",
                       "agent-features-preview", "agent-features-apply",
                       "vpn-source-preview", "vpn-source-apply", "vpn-source-recover",
                       "wg-control-preview", "wg-control-apply", "wg-control-recover",
@@ -64,6 +65,7 @@ from web_wireguard_control import WireguardControlError, WireguardControlJobs  #
 from web_amnezia_provision import AmneziaProvisionError, AmneziaProvisionJobs  # noqa: E402
 from web_restore import WebRestoreJobs, RestoreError  # noqa: E402
 from web_agent_features import AgentFeatureJobs, AgentFeatureError  # noqa: E402
+import managed_monitoring  # noqa: E402
 from sovagrid_connect.agent_enrollment import AgentEnrollment  # noqa: E402
 from sovagrid_connect.core import ConnectionOptions  # noqa: E402
 from sovagrid_connect.enrollment_api import EnrollmentAPI, EnrollmentAPIError  # noqa: E402
@@ -258,6 +260,11 @@ def dispatch(jobs: WebAgentJobs, request: object, *, authorize=_authorize,
     if not isinstance(action, str) or action not in _ACTIONS:
         raise RequestError("INVALID_INPUT")
     authorize(token)
+    if action in ("managed-monitoring-preview", "managed-monitoring-apply"):
+        operation = action.removeprefix("managed-monitoring-")
+        with managed_monitoring.operation_lock(), _stable_public_web():
+            authorize(token)
+            return managed_monitoring.execute(operation, payload, authorize=lambda: authorize(token))
     with _stable_public_web():
         return _dispatch_authorized(jobs, action, token, payload,
                                     agent_features=agent_features,
@@ -510,7 +517,7 @@ def _handle(connection: socket.socket, jobs: WebAgentJobs,
                               amnezia_provision=amnezia_provision, restore=restore, binary=binary)
             response = {"ok": True, "result": result}
         except (JobError, RequestError, VpnSourceError, WireguardControlError, AgentFeatureError,
-                AmneziaProvisionError, RestoreError) as error:
+                AmneziaProvisionError, RestoreError, managed_monitoring.MonitoringError) as error:
             response = {"ok": False, "error": error.code}
             if getattr(error, "request_id", None) is not None:
                 response["request_id"] = error.request_id

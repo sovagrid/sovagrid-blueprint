@@ -541,9 +541,33 @@ def candidate_security_compatible(source):
         return False
 
 
+def candidate_monitoring_compatible(source):
+    if not os.path.lexists(path('/var/lib/sovagrid-monitoring')):
+        return True
+    required = {
+        'sovagrid-blueprint/run.sh': b'# SOVAGRID_MANAGED_PROMETHEUS_V1',
+        'sovagrid-blueprint/deploy/managed_monitoring.py': b'def rebind(',
+        'sovagrid-blueprint/deploy/compose.monitoring.yaml': b'io.sovagrid.managed-monitoring: v1',
+        'sovagrid-blueprint/deploy/prometheus.yml': b'/internal/metrics/prometheus',
+        'sovagrid-hub/sovagrid_hub/__main__.py': b'add_parser("monitoring-managed"',
+        'sovagrid-hub/sovagrid_hub/managed_monitoring.py': b'def scrape_managed_monitoring(',
+    }
+    try:
+        return all(marker in (source / file).read_bytes() for file, marker in required.items())
+    except OSError:
+        return False
+
+
+def managed_monitoring_lifecycle(source, operation):
+    if os.path.lexists(path('/var/lib/sovagrid-monitoring')):
+        helper = source / 'sovagrid-blueprint/deploy/managed_monitoring.py'
+        command(['python3', '-B', '-I', str(helper), operation], timeout=265)
+
+
 def candidate_features_compatible(source, flags):
     script = (source / 'sovagrid-blueprint/run.sh').read_bytes()
-    if not candidate_web_asset_helper_present(source, script) or not candidate_security_compatible(source):
+    if (not candidate_web_asset_helper_present(source, script) or not candidate_security_compatible(source)
+            or not candidate_monitoring_compatible(source)):
         fail('COMPAT')
     for flag in ('--with-wireguard', '--with-terminal', '--with-files', '--with-journal', '--with-containers'):
         if flag in flags and flag.encode() not in script:
@@ -1436,6 +1460,7 @@ def restore(folder, state):
                       'ssh_gateway_v1', 'web_agent_v1'):
             command(['systemctl', 'stop', *reversed(SERVICE_UNITS)], timeout=40, check=False)
         args, env = rollback_stop_compose_args(source, folder, snapshot, state['phase'])
+        managed_monitoring_lifecycle(source, 'stop-before-recreate')
         command(args + ['stop'], timeout=120, check=False, env=env)
         if (layout in ('ssh_gateway_v1', 'web_agent_v1') and state['phase'] != 'preparing' and
                 SSH_GATEWAY_SERVICE not in state['images'] and 'gateway_before' in state):
@@ -1509,6 +1534,7 @@ def restore(folder, state):
         health(source, state['expected_units'])
         if source_manifest(source, allow_generated=True)[0] != state['old_manifest']:
             raise UpdateFailure('old version was not restored')
+        managed_monitoring_lifecycle(source, 'reconcile')
     except Exception as exc:
         errors.append('restart/health: ' + str(exc))
     if errors:

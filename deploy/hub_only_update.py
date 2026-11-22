@@ -461,6 +461,7 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
          "CANDIDATE_INCOMPATIBLE")
     need(common.candidate_web_asset_helper_present(source, script), "CANDIDATE_INCOMPATIBLE")
     need(common.candidate_security_compatible(source), "CANDIDATE_INCOMPATIBLE")
+    need(common.candidate_monitoring_compatible(source), "CANDIDATE_INCOMPATIBLE")
     if Path("/var/lib/sovagrid/.release-feed-units-managed-by-run-sh").is_file():
         need(b"# SOVAGRID_RELEASE_FEED_UNITS_V1" in script,
              "CANDIDATE_INCOMPATIBLE")
@@ -661,6 +662,7 @@ def _restore(folder: Path, state: dict) -> bool:
                         "sovagrid-vpn-status.service"], timeout=40, check=False)
         common.command(["systemctl", "stop", "sovagrid-agent-local.service"], timeout=40, check=False)
         args, env = common.rollback_stop_compose_args(SOURCE, folder, snapshot, state["phase"])
+        common.managed_monitoring_lifecycle(SOURCE, "stop-before-recreate")
         common.command(args + ["stop"], timeout=120, check=False, env=env)
         if (layout in ("ssh_gateway_v1", "local_web_v1", "local_containers_v1", "web_agent_v1", "external_apply_v1") and state["phase"] != "preparing" and
                 common.SSH_GATEWAY_SERVICE not in state["images"] and
@@ -738,6 +740,7 @@ def _restore(folder: Path, state: dict) -> bool:
         need(_hash_file(promotion.LOCAL) == state["local_record_sha256"] and
              _hash_file(promotion.LOCAL_CONFIG) == state["local_config_sha256"],
              "ROLLBACK_LOCAL_CONFIG")
+        common.managed_monitoring_lifecycle(SOURCE, "reconcile")
     except Exception as exc:
         errors.append("restart/health: " + str(exc))
     if errors:

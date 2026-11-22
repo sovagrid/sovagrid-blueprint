@@ -1,0 +1,41 @@
+# The collector shares only the verified Hub's network namespace.
+name: sovagrid-monitoring
+
+services:
+  prometheus:
+    image: docker.io/prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
+    network_mode: "container:${SOVAGRID_MONITORING_HUB_ID:?Expected the verified running Hub container ID}"
+    user: "65534:65534"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 384m
+    cpus: 1.0
+    pids_limit: 64
+    labels:
+      io.sovagrid.managed-monitoring: v1
+      io.sovagrid.monitoring-manifest: "${SOVAGRID_MONITORING_MANIFEST:?Expected the verified SovaGrid manifest}"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.listen-address=127.0.0.1:9090
+      - --web.max-connections=16
+      - --query.timeout=5s
+      - --query.max-concurrency=4
+      - --query.max-samples=500000
+    volumes:
+      - type: bind
+        source: /opt/sovagrid-src/sovagrid-blueprint/deploy/prometheus.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: /var/lib/sovagrid-monitoring/hub-metrics
+        target: /run/secrets/hub-metrics
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: /var/lib/sovagrid-monitoring/tsdb
+        target: /prometheus
+        bind: {create_host_path: false}

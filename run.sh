@@ -729,6 +729,7 @@ web_restore_preflight() {
 web_restore_preflight
 
 hub_only=0
+with_prometheus=0
 with_wireguard=0
 with_terminal=0
 with_journal=0
@@ -743,6 +744,7 @@ journal_units=()
 while (( $# )); do
   case $1 in
     --hub-only) (( ! hub_only )) || die 'duplicate --hub-only'; hub_only=1 ;;
+    --with-prometheus) (( ! with_prometheus )) || die 'duplicate --with-prometheus'; with_prometheus=1 ;;
     --with-wireguard) (( ! with_wireguard )) || die 'duplicate --with-wireguard'; with_wireguard=1 ;;
     --with-terminal) (( ! terminal_requested )) || die 'duplicate --with-terminal'; with_terminal=1; terminal_requested=1 ;;
     --with-files) (( ! files_requested )) || die 'duplicate --with-files'; files_requested=1 ;;
@@ -758,7 +760,7 @@ while (( $# )); do
       (( ${#journal_units[@]} <= 16 )) || die 'no more than 16 journal units are allowed'
       shift
       ;;
-    *) die 'usage: sudo ./run.sh [--hub-only] [--with-wireguard] [--with-terminal] [--with-files] [--with-journal --journal-unit NAME.service ... | --disable-journal] [--with-containers | --disable-containers]' ;;
+    *) die 'usage: sudo ./run.sh [--hub-only] [--with-prometheus] [--with-wireguard] [--with-terminal] [--with-files] [--with-journal --journal-unit NAME.service ... | --disable-journal] [--with-containers | --disable-containers]' ;;
   esac
   shift
 done
@@ -1519,6 +1521,24 @@ PY
 ) || die 'source cannot safely use the existing Hub security state'
 export SOVAGRID_TERMINAL_GUARD_MANIFEST_SHA256
 
+# SOVAGRID_MANAGED_PROMETHEUS_V1
+monitoring_runtime="$blueprint_dir/deploy/managed_monitoring.py"
+monitoring_state=/var/lib/sovagrid-monitoring
+if (( with_prometheus )) || [[ -e $monitoring_state || -L $monitoring_state ]]; then
+  [[ $source_root == /opt/sovagrid-src && -n $SOVAGRID_BUNDLE_MANIFEST_SHA256 &&
+     -f $monitoring_runtime && ! -L $monitoring_runtime &&
+     -f $source_root/sovagrid-hub/sovagrid_hub/managed_monitoring.py ]] ||
+    die 'managed Prometheus requires a verified compatible SovaGrid bundle'
+fi
+managed_monitoring_finish() {
+  if (( with_prometheus )); then
+    python3 -B -I "$monitoring_runtime" install || die 'managed Prometheus installation needs attention after Hub setup'
+    say 'managed Prometheus is active and collecting Hub metrics'
+  elif [[ -e $monitoring_state || -L $monitoring_state ]]; then
+    python3 -B -I "$monitoring_runtime" reconcile || die 'managed Prometheus could not be reconnected to the Hub'
+  fi
+}
+
 public_overlay=''
 if [[ -e /etc/sovagrid/public-web || -L /etc/sovagrid/public-web ]]; then
   [[ $source_root == /opt/sovagrid-src ]] || die 'public Web updates require the managed /opt/sovagrid-src source tree'
@@ -1611,6 +1631,10 @@ chmod 0600 /var/lib/sovagrid/.managed-by-run-sh
 install_web_agent_service
 [[ -f $blueprint_dir/deploy/refresh_build_contexts.py && ! -L $blueprint_dir/deploy/refresh_build_contexts.py ]] || die 'build context metadata helper is missing or a symlink'
 python3 "$blueprint_dir/deploy/refresh_build_contexts.py" "$source_root" || die 'build context metadata could not be refreshed'
+if [[ -e $monitoring_state || -L $monitoring_state ]]; then
+  python3 -B -I "$monitoring_runtime" stop-before-recreate ||
+    die 'managed Prometheus could not release the current Hub network'
+fi
 if (( ssh_gateway_deferred )); then
   say 'building Hub and Web; SSH gateway waits for an updater with three-image rollback'
 else
@@ -1893,6 +1917,7 @@ if (( hub_only )); then
     systemctl daemon-reload
   fi
   install_release_feed_units
+  managed_monitoring_finish
   say 'Agent was skipped by --hub-only. Re-run without it to enroll the host.'
   exit 0
 fi
@@ -2155,5 +2180,6 @@ systemctl daemon-reload
 systemctl enable --now sovagrid-auto-update.timer
 systemctl is-active --quiet sovagrid-auto-update.timer || die 'auto-update timer failed to start'
 install_release_feed_units
+managed_monitoring_finish
 say 'host Agent is active under the unprivileged sovagrid user'
 say 'open the web panel through: ssh -L 8766:127.0.0.1:8766 root@HOST ; then http://127.0.0.1:8766'

@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+
+storage:
+  tsdb:
+    retention:
+      time: 15d
+      size: 512MB
+
+scrape_configs:
+  - job_name: sovagrid-hub
+    metrics_path: /internal/metrics/prometheus
+    authorization:
+      credentials_file: /run/secrets/hub-metrics
+    follow_redirects: false
+    sample_limit: 3072
+    label_limit: 10
+    body_size_limit: 512KB
+    static_configs:
+      - targets: ["127.0.0.1:8765"]
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: sovagrid_(cpu|memory|disk)_percent
+        action: keep
