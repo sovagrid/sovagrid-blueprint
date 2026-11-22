@@ -64,7 +64,10 @@ class AgentRemovalTest(unittest.TestCase):
             os.chown(self.worker.path(token_path), -1, agent_gid)
             file_modes[token_path]["gid"] = agent_gid
         for path in owners:
-            self.worker.path(path).mkdir(parents=True, exist_ok=True)
+            directory = self.worker.path(path)
+            directory.mkdir(parents=True, exist_ok=True)
+            # Installer-created modes must not depend on the test runner's umask.
+            directory.chmod(0o755)
         state = {"protocol": 1, "kind": "target", "identity": self.identity, "phase": "active",
                  "source_manifest_sha256": removal.digest(manifest),
                  "source_files": {path: removal.digest(raw) for path, raw in source_paths.items()},
