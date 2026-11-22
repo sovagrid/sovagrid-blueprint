@@ -22,6 +22,9 @@ import uuid
 
 
 JOURNAL = "/var/lib/sovagrid-agent-enrollment"
+FEATURES = JOURNAL + "/features.json"
+FEATURE_DATA = {"/var/lib/sovagrid-agent/files": "workspace", "/var/lib/sovagrid-shell": "terminal-home"}
+FEATURE_UNITS = ("sovagrid-terminal-control.socket", "sovagrid-terminal-control.service")
 STATE = JOURNAL + "/state.json"
 INSTALLER = "/opt/sovagrid-agent-installer"
 HELPER = INSTALLER + "/remote_agent.py"
@@ -37,16 +40,16 @@ CORE_FILES = {*UNIT_PATHS.values(), "/etc/systemd/system/sovagrid-agent.service.
 CORE_DIRECTORIES = {INSTALLER, "/opt/sovagrid-agent", "/etc/sovagrid", "/etc/sovagrid-agent-tunnel",
                     "/etc/sovagrid-agent-tunnel-public", "/var/lib/sovagrid-agent",
                     "/var/empty/sovagrid-tunnel", "/etc/systemd/system/sovagrid-agent.service.d"}
-UNSUPPORTED = (JOURNAL + "/features.json", "/opt/sovagrid-src", "/opt/sovagrid-agent-local",
+UNSUPPORTED = ("/opt/sovagrid-src", "/opt/sovagrid-agent-local",
                "/etc/sovagrid-hub", "/etc/sovagrid-local", "/var/lib/sovagrid-promotion",
                "/var/lib/sovagrid-hub-tunnels", "/var/lib/.sovagrid-host-restore-in-progress",
-               "/var/lib/sovagrid-shell", "/var/lib/sovagrid-agent/files",
                "/etc/systemd/system/sovagrid-agent-local.service")
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 REQUEST_FIELDS = {"enrollment_id", "server_id", "ssh_key_fingerprint"}
 MAX_REQUEST = 1024
 MAX_STATE = 4 * 1024**2
+MAX_FEATURES = 128 * 1024
 
 
 class Refused(Exception):
@@ -89,6 +92,168 @@ def validate_request(action, value):
     require(isinstance(value["ssh_key_fingerprint"], str) and FINGERPRINT.fullmatch(value["ssh_key_fingerprint"]))
     if action == "apply":
         require(isinstance(value["expected_revision"], str) and SHA.fullmatch(value["expected_revision"]))
+
+
+def ssh_program():
+    """Carry the trusted sibling module over the existing single stdin stream."""
+    uninstall = Path(__file__)
+    features = uninstall.with_name("agent_features.py").read_bytes()
+    return (b"exec(compile(" + repr(uninstall.read_bytes()).encode() + b", '<agent-uninstall>', 'exec'), "
+            b"{'__name__': '__main__', '_FEATURES_SOURCE': " + repr(features).encode() + b"})\n")
+
+
+class FeatureRemoval:
+    """Clean up the separately owned pieces of an enrolled Agent's opt-ins."""
+
+    def __init__(self, removal, enrollment, state, feature_bytes):
+        self.removal = removal
+        self.enrollment = enrollment
+        self.core = state
+        self.raw = feature_bytes
+        self.state = read_json(feature_bytes)
+        require(type(self.state.get("protocol")) is int and self.state["protocol"] in (1, 2)
+                and self.state.get("kind") == "target-features" and self.state.get("phase") == "ready"
+                and self.state.get("pending_features") is None and self.state.get("pending_writes") == {}
+                and self.state.get("identity") == {**state["identity"], "agent_token_sha256": state["agent_token_sha256"]},
+                "FEATURES_NOT_READY")
+        self.directories = self.state.get("data_directories")
+        self.files = self.state.get("owned_files")
+        require(isinstance(self.directories, dict) and set(self.directories) <= set(FEATURE_DATA)
+                and isinstance(self.files, dict) and set(self.files) <= {self.unit_path(unit) for unit in FEATURE_UNITS}
+                and all(isinstance(item, str) and SHA.fullmatch(item) for item in self.files.values()), "STATE_CONFLICT")
+        self.retained = JOURNAL + "/retained-" + state["identity"]["enrollment_id"]
+        source = globals().get("_FEATURES_SOURCE")
+        if source is None:
+            source = Path(__file__).with_name("agent_features.py").read_bytes()
+        namespace = {"__name__": "sovagrid_removal_feature_helper"}
+        exec(compile(source, "<agent-features>", "exec"), namespace)
+        self.publish_directory = namespace["publish_directory"]
+        self.feature_error = namespace["FeatureError"]
+        self.shell_name = namespace["SHELL_NAME"]
+        manifest = read_json(removal.read(MANIFEST, mode=0o644, limit=512 * 1024))
+        self.manager = namespace["FeatureManager"](enrollment, state["source_manifest_sha256"], manifest, INSTALLER)
+        self.manager.core = state
+        self.manager.state = self.state
+        self.manager.terminal_only = self.state["protocol"] == 2
+
+    @staticmethod
+    def unit_path(unit):
+        return "/etc/systemd/system/" + unit
+
+    @contextlib.contextmanager
+    def checked(self):
+        try:
+            yield
+        except self.feature_error as error:
+            raise Refused(error.code) from None
+
+    def preview(self):
+        with self.checked():
+            self.manager.load()
+            require(self.manager.state == self.state and self.manager.core == self.core, "STATE_CONFLICT")
+            self.manager.socket_snapshot()
+            self.verify_units(complete=True)
+            require(self.removal.inspect(self.retained, directory=True, mode=0o700, missing=True) is None,
+                    "OWNERSHIP_CONFLICT")
+            require(all(record["ready"] for record in self.directories.values()), "FEATURES_NOT_READY")
+
+    def active(self, unit):
+        code, _ = self.enrollment.commands.run(["/usr/bin/systemctl", "is-active", "--quiet", unit], check=False)
+        require(code in (0, 3, 4), "SERVICE_FAILED")
+        return code == 0
+
+    def verify_units(self, *, complete):
+        present = []
+        for unit in FEATURE_UNITS:
+            path = self.unit_path(unit)
+            raw = self.removal.read(path, mode=0o644, limit=32768, missing=True)
+            if raw is None:
+                require(not complete or path not in self.files, "OWNERSHIP_CONFLICT")
+                require(not self.active(unit), "OWNERSHIP_CONFLICT")
+                if complete:
+                    require(self.manager.unit_policy(unit, optional=True)["LoadState"] == "not-found", "OWNERSHIP_CONFLICT")
+                continue
+            require(digest(raw) == self.files.get(path) and self.removal.inspect(path).st_gid == os.getegid(),
+                    "OWNERSHIP_CONFLICT")
+            self.manager.unit_policy(unit)
+            present.append(unit)
+        return present
+
+    def stop(self):
+        with self.checked():
+            self.manager.account_snapshot()
+            for unit in self.verify_units(complete=True):
+                self.enrollment.commands.run(["/usr/bin/systemctl", "disable", "--now", unit])
+
+    def data_locations(self):
+        """Validate both sides before moving anything, including lost rename replies."""
+        parent = self.removal.inspect(self.retained, directory=True, mode=0o700, missing=True)
+        allowed = {FEATURE_DATA[name] for name in self.directories}
+        if parent is not None:
+            require({item.name for item in self.removal.path(self.retained).iterdir()} <= allowed, "UNOWNED_DATA")
+        moves = []
+        for name, record in self.directories.items():
+            destination = self.removal.path(self.retained + "/" + FEATURE_DATA[name])
+            source = self.removal.path(name)
+            matches = []
+            for item in (source, destination):
+                try:
+                    info = item.lstat()
+                except FileNotFoundError:
+                    continue
+                publication = record["publication"]
+                require(stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == record["mode"] == 0o700
+                        and (info.st_dev, info.st_ino, info.st_uid, info.st_gid) ==
+                        (publication["dev"], publication["ino"], record["uid"], record["gid"]), "OWNERSHIP_CONFLICT")
+                matches.append(item)
+            require(len(matches) == 1, "OWNERSHIP_CONFLICT")
+            if matches[0] == source:
+                staging = self.removal.path(record["publication"]["staging"])
+                require(not os.path.lexists(staging), "OWNERSHIP_CONFLICT")
+                moves.append((source, destination))
+        return moves
+
+    def preserve_data(self, moves):
+        if not moves:
+            return
+        parent = self.removal.path(self.retained)
+        parent.mkdir(mode=0o700, exist_ok=True)
+        self.removal.inspect(self.retained, directory=True, mode=0o700)
+        for source, destination in moves:
+            self.publish_directory(source, destination)
+            for directory in (source.parent, destination.parent, destination.parent.parent):
+                fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        require(not self.data_locations(), "CLEANUP_REQUIRED")
+
+    def remove_shell(self, snapshot):
+        if snapshot is None:
+            return
+        require(not self.enrollment.process_snapshot(self.state["shell_account"]["uid"]), "CLEANUP_REQUIRED")
+        if snapshot["user"] is not None:
+            self.enrollment.commands.run(["/usr/sbin/userdel", self.shell_name], capture=False)
+        current = self.manager.account_snapshot(allow_removed=True)
+        require(current["user"] is None, "CLEANUP_REQUIRED")
+        if current["group"] is not None:
+            self.enrollment.commands.run(["/usr/sbin/groupdel", self.shell_name], capture=False)
+        current = self.manager.account_snapshot(allow_removed=True)
+        require(current["user"] is None and current["group"] is None, "CLEANUP_REQUIRED")
+
+    def remove(self):
+        with self.checked():
+            units = self.verify_units(complete=False)
+            require(not any(self.active(unit) for unit in FEATURE_UNITS), "CLEANUP_REQUIRED")
+            require(not os.path.lexists(self.removal.path("/run/sovagrid-terminal/control.sock")), "CLEANUP_REQUIRED")
+            account = self.manager.account_snapshot(allow_removed=True)
+            moves = self.data_locations()
+            self.preserve_data(moves)
+            self.remove_shell(account)
+            for unit in units:
+                self.removal.path(self.unit_path(unit)).unlink()
+            self.enrollment.commands.run(["/usr/bin/systemctl", "daemon-reload"])
 
 
 class AgentRemoval:
@@ -165,7 +330,7 @@ class AgentRemoval:
             item = self.path(path)
             require(not item.exists() and not item.is_symlink(), "UNSUPPORTED_INSTALLATION")
 
-    def known_resources(self, enrollment, state, *, complete):
+    def known_resources(self, enrollment, state, *, complete, feature_directories=()):
         source_files = state["source_files"]
         allowed_files = set(source_files) | CORE_FILES
         allowed_dirs = set(CORE_DIRECTORIES)
@@ -187,7 +352,7 @@ class AgentRemoval:
             if info is not None:
                 require(stat.S_IMODE(info.st_mode) == mode, "OWNERSHIP_CONFLICT")
                 children = {path + "/" + child.name for child in self.path(path).iterdir()}
-                require(children <= files | directories, "UNOWNED_DATA")
+                require(children <= files | directories | set(feature_directories), "UNOWNED_DATA")
         for name, account in state["accounts"].items():
             for key in ("uid", "gid"):
                 require(type(account.get(key)) is int and account[key] > 0, "OWNERSHIP_CONFLICT")
@@ -199,22 +364,61 @@ class AgentRemoval:
         require(enrollment.target_state(request_id, required=True) == state, "STATE_CONFLICT")
         enrollment.verify_installed_files(state)
         enrollment.verify_credentials(state)
-        self.known_resources(enrollment, state, complete=True)
+        raw = self.read(FEATURES, mode=0o600, limit=MAX_FEATURES, missing=True)
+        reviewed = {"kind": "sovagrid-agent-removal-v1", "identity": state["identity"],
+                    "pin": state["ssh_key_fingerprint"], "cas": enrollment.cas("target")}
+        feature_directories = ()
+        if raw is not None:
+            features = FeatureRemoval(self, enrollment, state, raw)
+            features.preview()
+            feature_directories = features.directories
+            reviewed["features"] = digest(raw)
+        else:
+            self.require_no_feature_data()
+        self.known_resources(enrollment, state, complete=True, feature_directories=feature_directories)
         for unit in UNITS:
             enrollment.check_loaded_unit(unit, state)
-        return digest(encode({"kind": "sovagrid-agent-removal-v1", "identity": state["identity"],
-                              "pin": state["ssh_key_fingerprint"], "cas": enrollment.cas("target")}))
+        return digest(encode(reviewed)), reviewed.get("features")
+
+    def require_no_feature_data(self):
+        # Without the feature ownership ledger, no runtime piece can be adopted.
+        paths = (*FEATURE_DATA, *(FeatureRemoval.unit_path(unit) for unit in FEATURE_UNITS))
+        require(not any(os.path.lexists(self.path(path)) for path in paths), "UNOWNED_DATA")
 
     def remove_runtime(self, enrollment, state):
-        self.known_resources(enrollment, state, complete=False)
         operation = state["uninstallation"]
-        if operation["step"] == "stop":
-            for unit in UNITS:
-                enrollment.check_loaded_unit(unit, state)
-                enrollment.commands.run(["/usr/bin/systemctl", "disable", "--now", unit])
-            operation["step"] = "runtime"
-            enrollment.save_state("target", state)
+        feature_pin = operation.get("features")
+        raw = self.read(FEATURES, mode=0o600, limit=MAX_FEATURES, missing=True)
+        if raw is not None:
+            require(feature_pin == digest(raw), "OWNERSHIP_CONFLICT")
+        if operation["step"] in ("stop", "features"):
+            require((raw is None) == (feature_pin is None), "STATE_CONFLICT")
+            features = FeatureRemoval(self, enrollment, state, raw) if raw is not None else None
+            self.known_resources(enrollment, state, complete=False,
+                                 feature_directories=features.directories if features else ())
+            if operation["step"] == "stop":
+                if features is not None:
+                    # A loss of the stop response leaves owned files and accounts intact.
+                    features.data_locations()
+                    features.stop()
+                else:
+                    self.require_no_feature_data()
+                for unit in UNITS:
+                    enrollment.check_loaded_unit(unit, state)
+                    enrollment.commands.run(["/usr/bin/systemctl", "disable", "--now", unit])
+                operation["step"] = "features" if features is not None else "runtime"
+                enrollment.save_state("target", state)
+            require(not any(enrollment.services().values()), "CLEANUP_REQUIRED")
+            if operation["step"] == "features":
+                require(features is not None, "STATE_CONFLICT")
+                features.remove()
+                operation["step"] = "runtime"
+                enrollment.save_state("target", state)
         require(not any(enrollment.services().values()), "CLEANUP_REQUIRED")
+        self.require_no_feature_data()
+        if raw is not None:
+            require(self.read(FEATURES, mode=0o600, limit=MAX_FEATURES) == raw, "OWNERSHIP_CONFLICT")
+            self.path(FEATURES).unlink()
         self.known_resources(enrollment, state, complete=False)
         for name, account in list(state["accounts"].items()):
             require(not enrollment.process_snapshot(account["uid"]), "CLEANUP_REQUIRED")
@@ -284,7 +488,7 @@ class AgentRemoval:
             if operation is not None:
                 require(operation["fingerprint"] == request["ssh_key_fingerprint"]
                         and SHA.fullmatch(operation["revision"])
-                        and operation["step"] in ("stop", "runtime", "installer", "removed"), "WRONG_AGENT")
+                        and operation["step"] in ("stop", "features", "runtime", "installer", "removed"), "WRONG_AGENT")
                 revision = operation["revision"]
                 if operation["step"] == "removed":
                     require(state.get("removed") is True, "STATE_CONFLICT")
@@ -297,18 +501,20 @@ class AgentRemoval:
                         and not state.get("cleanup_started"), "NOT_ACTIVE")
                 require(state.get("ssh_key_fingerprint") == request["ssh_key_fingerprint"], "WRONG_AGENT")
             self.assert_supported()
-            if operation is None or operation["step"] in ("stop", "runtime"):
+            if operation is None or operation["step"] in ("stop", "features", "runtime"):
                 helper = self.load_helper(state)
                 enrollment = helper.Enrollment(root=self.root, owner=self.owner, executable=HELPER)
                 try:
                     if operation is None:
-                        revision = self.expected_revision(enrollment, state)
+                        revision, feature_pin = self.expected_revision(enrollment, state)
                     if action == "apply":
                         require(hmac.compare_digest(revision, request["expected_revision"]), "STALE_PREVIEW")
                         if operation is None:
                             state["phase"] = "uninstalling"
                             state["uninstallation"] = {"step": "stop", "revision": revision,
                                                        "fingerprint": request["ssh_key_fingerprint"]}
+                            if feature_pin is not None:
+                                state["uninstallation"]["features"] = feature_pin
                             enrollment.save_state("target", state)
                         self.remove_runtime(enrollment, state)
                 except helper.Refuse as error:

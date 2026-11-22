@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Jigokuraku01
 import base64
+import grp
 import hashlib
 import json
 import os
+import pwd
 from pathlib import Path
+from types import SimpleNamespace
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
 import uuid
 
+from deploy import agent_features
 from deploy import uninstall_agent as removal
 
 
@@ -27,6 +32,7 @@ class AgentRemovalTest(unittest.TestCase):
         self.request["ssh_key_fingerprint"] = fingerprint
         source_paths = {
             "/opt/sovagrid-agent/sovagrid_agent/__main__.py": b"# agent fixture\n",
+            "/opt/sovagrid-agent/sovagrid_agent/terminal_policy.py": b"# terminal policy fixture\n",
             "/opt/sovagrid-agent/LICENSE": b"license\n",
             "/opt/sovagrid-agent/NOTICE": b"notice\n",
             "/opt/sovagrid-agent/ATTRIBUTION.md": b"attribution\n",
@@ -95,12 +101,21 @@ class AgentRemovalTest(unittest.TestCase):
             self.calls.append(args)
             if args[0] == "/usr/bin/ssh-keygen":
                 return 0, self.key + b"\n"
+            if args[0] == "/usr/bin/getent":
+                return 0, b"sovagrid-shell:*NP*:20000:0:99999:7::1:\n"
+            if args[0] == "/usr/sbin/userdel" and args[-1] == "sovagrid-shell":
+                self.shell_account = False
+            if args[0] == "/usr/sbin/groupdel" and args[-1] == "sovagrid-shell":
+                self.shell_group = False
             if args[1] == "show":
                 unit = args[2]
+                path = "/etc/systemd/system/" + unit
+                if not self.worker.path(path).exists():
+                    return 1, b"LoadState=not-found\n"
                 agent = unit == removal.UNITS[0]
-                user = "sovagrid" if agent else "sovagrid-tunnel"
+                user = "sovagrid" if agent else "sovagrid-shell" if unit in removal.FEATURE_UNITS else "sovagrid-tunnel"
                 dropin = "/etc/systemd/system/sovagrid-agent.service.d/10-tunnel.conf" if agent else ""
-                return 0, (f"FragmentPath={removal.UNIT_PATHS[unit]}\nDropInPaths={dropin}\n"
+                return 0, (f"FragmentPath={path}\nDropInPaths={dropin}\n"
                            f"User={user}\nGroup={user}\nLoadState=loaded\n").encode()
             if args[1] == "disable":
                 self.running.discard(args[-1])
@@ -158,9 +173,143 @@ class AgentRemovalTest(unittest.TestCase):
         self.assertEqual(other.read_bytes(), b"keep")
         other.unlink()
         self.write(removal.JOURNAL + "/features.json", b"{}", 0o600)
-        with self.assertRaisesRegex(removal.Refused, "UNSUPPORTED_INSTALLATION"):
+        with self.assertRaisesRegex(removal.Refused, "FEATURES_NOT_READY"):
             self.preview()
         self.assertEqual(self.running, set(removal.UNITS))
+
+    def enable_features(self, *, terminal=True, files=True, explicit=False):
+        state = self.state()
+        state["local_port"] = 18767
+        state["accounts"]["sovagrid"].update(uid=os.getuid() or 10001, home=agent_features.AGENT_HOME,
+                                            comment="fixture-agent")
+        account = state["accounts"]["sovagrid"]
+        self.shell_account = self.shell_group = terminal
+        shell_comment = "sovagrid-features-" + self.identity["enrollment_id"]
+
+        def getpwnam(name):
+            if name == "sovagrid":
+                return SimpleNamespace(pw_uid=account["uid"], pw_gid=account["gid"], pw_gecos=account["comment"],
+                                       pw_dir=account["home"], pw_shell="/usr/sbin/nologin")
+            if name == agent_features.SHELL_NAME and self.shell_account:
+                return SimpleNamespace(pw_uid=agent_features.SHELL_UID, pw_gid=agent_features.SHELL_UID,
+                                       pw_gecos=shell_comment, pw_dir=agent_features.SHELL_LOGIN_HOME,
+                                       pw_shell="/usr/sbin/nologin")
+            raise KeyError(name)
+
+        def getgrnam(name):
+            if name == agent_features.SHELL_NAME and self.shell_group:
+                return SimpleNamespace(gr_gid=agent_features.SHELL_UID, gr_mem=[])
+            raise KeyError(name)
+
+        for patcher in (patch.object(pwd, "getpwnam", side_effect=getpwnam),
+                        patch.object(grp, "getgrnam", side_effect=getgrnam),
+                        patch.object(os, "getgrouplist", side_effect=lambda _name, group: [group])):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        config_raw = {"hub_url": "https://localhost:18767", "server_id": self.identity["server_id"],
+                      "token_file": "/etc/sovagrid/agent.token", "ca_file": "/etc/sovagrid/hub-ca.pem",
+                      "interval_seconds": 30, "allow_remote_commands": files or not explicit,
+                      "allow_interactive_terminal": terminal, "allow_file_manager": files,
+                      "allow_systemd_journal": False, "journal_units": [],
+                      "file_roots": {"workspace": agent_features.WORKSPACE} if files else {}}
+        if explicit:
+            config_raw["terminal_permission_mode"] = "explicit"
+        raw = removal.encode(config_raw) + b"\n"
+        config = self.write(agent_features.CONFIG, raw, 0o640)
+        if os.getuid() == 0:
+            os.chown(config, -1, account["gid"])
+        state["owned_files"][agent_features.CONFIG] = removal.digest(raw)
+        state["file_metadata"][agent_features.CONFIG] = {"mode": 0o640, "gid": account["gid"]}
+        self.write(removal.STATE, removal.encode(state), 0o600)
+        sidecar = {"protocol": 2 if explicit else 1, "kind": "target-features", "phase": "ready",
+                   "identity": {**self.identity, "agent_token_sha256": state["agent_token_sha256"]},
+                   "pending_features": None, "pending_writes": {}, "owned_files": {}, "data_directories": {},
+                   "shell_account": None}
+        if terminal:
+            sidecar["shell_account"] = {"uid": agent_features.SHELL_UID, "gid": agent_features.SHELL_UID,
+                                         "comment": shell_comment, "group_started": True, "user_started": True}
+            for unit in removal.FEATURE_UNITS:
+                path = "/etc/systemd/system/" + unit
+                data = b"# terminal test unit\n"
+                self.write(path, data, 0o644)
+                sidecar["owned_files"][path] = removal.digest(data)
+            self.running.update(removal.FEATURE_UNITS)
+
+        saved_inode_owners = {}
+        for name, wanted, enabled in ((agent_features.WORKSPACE, (account["uid"], account["gid"]), files),
+                                      (agent_features.SHELL_HOME, (agent_features.SHELL_UID, agent_features.SHELL_UID), terminal)):
+            if not enabled:
+                continue
+            item = self.worker.path(name)
+            item.mkdir(mode=0o700)
+            (item / "note").write_text("keep " + removal.FEATURE_DATA[name])
+            info = item.lstat()
+            device = (info.st_dev, info.st_ino)
+            saved_inode_owners[device] = wanted
+            sidecar["data_directories"][name] = {"uid": wanted[0], "gid": wanted[1], "mode": 0o700, "ready": True,
+                                                 "publication": {"staging": str(Path(name).parent / ".sovagrid-feature-data.test0001"),
+                                                                 "dev": device[0], "ino": device[1]}}
+
+        native_lstat = Path.lstat
+
+        def lstat(item):
+            info = native_lstat(item)
+            pair = (info.st_dev, info.st_ino)
+            if pair not in saved_inode_owners:
+                return info
+            uid, gid = saved_inode_owners[pair]
+            return SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_mode=info.st_mode,
+                                   st_uid=uid, st_gid=gid)
+
+        patcher = patch.object(Path, "lstat", lstat)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.write(removal.FEATURES, removal.encode(sidecar), 0o600)
+        return self.worker.path(removal.JOURNAL + "/retained-" + self.identity["enrollment_id"])
+
+    def test_featured_agent_preserves_data_and_removes_terminal_resources(self):
+        retained = self.enable_features()
+        request = {**self.request, "expected_revision": self.preview()["revision"]}
+        self.assertFalse(retained.exists())
+        self.assertEqual(self.worker.run("apply", request)["state"], "removed")
+        for name in ("workspace", "terminal-home"):
+            self.assertEqual((retained / name / "note").read_text(), "keep " + name)
+        self.assertEqual(stat.S_IMODE(retained.stat().st_mode), 0o700)
+        self.assertFalse(self.worker.path(removal.FEATURES).exists())
+        self.assertFalse(self.running)
+        self.assertFalse(self.shell_account)
+        self.assertFalse(self.shell_group)
+        self.assertTrue(all(not self.worker.path("/etc/systemd/system/" + unit).exists() for unit in removal.FEATURE_UNITS))
+        self.assertEqual(self.worker.run("apply", request)["state"], "removed")
+
+    def test_featured_agent_resumes_after_data_was_already_retained(self):
+        retained = self.enable_features()
+        request = {**self.request, "expected_revision": self.preview()["revision"]}
+        preserve = removal.FeatureRemoval.preserve_data
+
+        def interrupted(features, moves):
+            preserve(features, moves)
+            raise OSError("fixture interruption")
+
+        with patch.object(removal.FeatureRemoval, "preserve_data", interrupted):
+            with self.assertRaisesRegex(OSError, "fixture interruption"):
+                self.worker.run("apply", request)
+        self.assertEqual(self.state()["uninstallation"]["step"], "features")
+        self.assertEqual(self.worker.run("apply", request)["state"], "removed")
+        self.assertEqual((retained / "workspace/note").read_text(), "keep workspace")
+
+    def test_feature_unit_changed_after_review_prevents_a_stop(self):
+        self.enable_features(files=False, explicit=True)
+        request = {**self.request, "expected_revision": self.preview()["revision"]}
+        unit = "/etc/systemd/system/" + removal.FEATURE_UNITS[0]
+        self.write(unit, b"foreign terminal socket", 0o644)
+        original = set(self.running)
+        with self.assertRaisesRegex(removal.Refused, "OWNERSHIP_CONFLICT"):
+            self.worker.run("apply", request)
+        self.assertEqual(self.running, original)
+        self.assertTrue(self.shell_account)
+        self.assertEqual(self.state()["phase"], "active")
 
     def test_retry_after_crash_deleting_helper_does_not_need_helper_source(self):
         preview = self.preview()

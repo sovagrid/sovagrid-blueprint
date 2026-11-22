@@ -351,7 +351,6 @@ require_local_docker_target() {
   unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
   export DOCKER_HOST=unix:///var/run/docker.sock
 }
-require_local_docker_target
 [[ -d /opt && ! -L /opt && $(stat -c %u /opt) == 0 &&
    -z $(find /opt -maxdepth 0 -perm /022 -print -quit) ]] ||
   die 'каталог /opt должен принадлежать root и быть недоступным для записи другим'
@@ -382,11 +381,12 @@ if [[ $setup_mode == uninstall ]]; then
   trap 'exit 130' INT
   trap 'exit 143' TERM
   download_verified_bundle "$stage"
-  [[ -f $stage/source/sovagrid-blueprint/deploy/uninstall_hub.py ]] ||
-    die 'этот выпуск не содержит удаления управляемого Hub'
+  [[ -f $stage/source/sovagrid-blueprint/deploy/uninstall.py ]] ||
+    die 'этот выпуск не содержит удаления управляемого Hub или Agent'
   bash "$stage/source/sovagrid-blueprint/run.sh" --uninstall "$@"
   exit
 fi
+require_local_docker_target
 if [[ $setup_mode == configure ]]; then
   [[ -n $public_address ]] || die 'укажите --public-address ДОМЕН_ИЛИ_IP'
   command -v python3 >/dev/null || die 'в установленной системе нет python3'
@@ -398,6 +398,9 @@ if [[ $setup_mode == configure ]]; then
   say 'Публичный HTTPS настроен. Используйте прежние логин и пароль Hub.'
   exit 0
 fi
+[[ ! -e /var/lib/.sovagrid-uninstall-recovery.json &&
+   ! -L /var/lib/.sovagrid-uninstall-recovery.json ]] ||
+  die 'завершите прерванное удаление с помощью run.sh --uninstall'
 [[ ! -e $source_root && ! -L $source_root ]] ||
   die 'SovaGrid уже установлен; для адреса используйте --configure-web --public-address ДОМЕН_ИЛИ_IP'
 [[ ! -e /var/lib/sovagrid/.managed-by-run-sh && ! -L /var/lib/sovagrid/.managed-by-run-sh ]] ||

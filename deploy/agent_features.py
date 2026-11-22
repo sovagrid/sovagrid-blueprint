@@ -247,7 +247,7 @@ class FeatureManager:
             need(metadata == {"mode": stat.S_IMODE(info.st_mode), "gid": info.st_gid}, "OWNERSHIP_CONFLICT")
         need(set(self.core.get("pending_writes", {})) <= {CONFIG}, "STATE_CONFLICT")
 
-    def account_snapshot(self):
+    def account_snapshot(self, *, allow_removed=False):
         record = self.state.get("shell_account") if self.state else None
         try:
             entry = pwd.getpwnam(SHELL_NAME)
@@ -271,7 +271,8 @@ class FeatureManager:
                  and set(os.getgrouplist(SHELL_NAME, entry.pw_gid)) == {entry.pw_gid}, "OWNERSHIP_CONFLICT")
             self.nonlogin_home()
             login_policy = self.shell_login_policy()
-        need(self.state["phase"] == "applying" or entry is not None and group is not None, "OWNERSHIP_CONFLICT")
+        need(allow_removed or self.state["phase"] == "applying" or entry is not None and group is not None,
+             "OWNERSHIP_CONFLICT")
         return {"group": None if group is None else {"gid": group.gr_gid, "members": sorted(group.gr_mem)},
                 "user": None if entry is None else {"uid": entry.pw_uid, "gid": entry.pw_gid, "home": entry.pw_dir,
                                                     "comment": entry.pw_gecos, "groups": sorted(os.getgrouplist(SHELL_NAME, entry.pw_gid)),

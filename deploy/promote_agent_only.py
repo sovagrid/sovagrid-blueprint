@@ -182,7 +182,7 @@ def runtime_supported():
     except (OSError, subprocess.TimeoutExpired):
         return False
 
-def capture_external() -> dict:
+def capture_external(*, check_runtime: bool = True) -> dict:
     """Snapshot public hashes/metadata only; never serialize a token."""
     need(os.geteuid() == 0, "Root authority is required")
     need(runtime_supported(), 'Linux, Python and active systemd are required')
@@ -201,10 +201,12 @@ def capture_external() -> dict:
          not info.st_mode & 0o022, "External Agent data directory is unsafe")
     additional = _additional_reverse_tunnels()
     units = {name: _unit_active(name) for name in (*UNITS, *additional)}
-    need(units["sovagrid-agent.service"] and units["sovagrid-agent-tunnel.service"],
-         "External Agent and its transport must be active")
+    if check_runtime:
+        need(units["sovagrid-agent.service"] and units["sovagrid-agent-tunnel.service"],
+             "External Agent and its transport must be active")
     for name, raw in additional.items():
-        need(units[name], "Existing reverse SSH tunnel must be active")
+        if check_runtime:
+            need(units[name], "Existing reverse SSH tunnel must be active")
         path = Path("/etc/systemd/system") / name
         extra = path.lstat()
         files[str(path)] = {"sha256": hashlib.sha256(raw).hexdigest(), "uid": extra.st_uid,
@@ -386,7 +388,7 @@ def _local_hub_ready() -> bool:
         return response.status == 200
 
 
-def _local_record() -> str:
+def _local_record(*, check_runtime: bool = True) -> str:
     saved = _private_json(LOCAL)
     operations = _operations_record()
     server_id = saved.get("server_id")
@@ -427,7 +429,7 @@ def _local_record() -> str:
         need(stat.S_ISDIR(workspace.st_mode) and
              (workspace.st_uid, workspace.st_gid, stat.S_IMODE(workspace.st_mode)) ==
              (user.pw_uid, group.gr_gid, 0o700), "Local file workspace is unsafe")
-    if operations["terminal"]:
+    if operations["terminal"] or (not check_runtime and os.path.lexists(LOCAL_SHELL_HOME)):
         shell = pwd.getpwnam(LOCAL_SHELL)
         shell_group = grp.getgrnam(LOCAL_SHELL)
         need(shell.pw_uid != 0 and shell.pw_uid not in (user.pw_uid, external.pw_uid) and
@@ -439,6 +441,7 @@ def _local_record() -> str:
         need(stat.S_ISDIR(shell_home.st_mode) and
              (shell_home.st_uid, shell_home.st_gid, stat.S_IMODE(shell_home.st_mode)) ==
              (shell.pw_uid, shell_group.gr_gid, 0o700), "Local PTY shell home is unsafe")
+    if operations["terminal"]:
         for name in LOCAL_TERMINAL_UNITS:
             unit = Path("/etc/systemd/system") / name
             source_unit = SOURCE / "sovagrid-agent/deploy" / name
@@ -446,11 +449,12 @@ def _local_record() -> str:
             need(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_gid == 0 and
                  stat.S_IMODE(info.st_mode) == 0o644 and
                  _read_regular(unit, 8192) == _read_regular(source_unit, 8192) and
-                 _unit_active(name) and _unit_enabled(name),
+                 (not check_runtime or (_unit_active(name) and _unit_enabled(name))),
                  "Local PTY broker unit is unsafe or inactive")
-    elif any(_unit_active(name) or _unit_enabled(name) for name in LOCAL_TERMINAL_UNITS):
+    elif check_runtime and any(_unit_active(name) or _unit_enabled(name) for name in LOCAL_TERMINAL_UNITS):
         raise PromotionError("Local PTY broker is active without permission")
-    need(_unit_active(LOCAL_UNIT.name), "Local Agent service is inactive")
+    if check_runtime:
+        need(_unit_active(LOCAL_UNIT.name), "Local Agent service is inactive")
     return server_id
 
 

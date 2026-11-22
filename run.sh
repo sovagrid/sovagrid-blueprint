@@ -51,13 +51,16 @@ installation_lock() {
   [[ ! -e /var/lib/.sovagrid-host-restore-in-progress &&
      ! -L /var/lib/.sovagrid-host-restore-in-progress ]] ||
     die 'an interrupted host restore must be recovered before installing or updating SovaGrid'
+  [[ ! -e /var/lib/.sovagrid-uninstall-recovery.json &&
+     ! -L /var/lib/.sovagrid-uninstall-recovery.json ]] ||
+    die 'finish interrupted SovaGrid removal with run.sh --uninstall'
 }
 
 [[ ${EUID} -eq 0 ]] || die 'run as root (sudo ./run.sh)'
 if [[ ${1:-} == --uninstall ]]; then
   shift
   script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-  exec /usr/bin/python3 -B -I "$script_dir/deploy/uninstall_hub.py" "$@"
+  exec /usr/bin/python3 -B -I "$script_dir/deploy/uninstall.py" "$@"
 fi
 SOVAGRID_MIN_SYSTEMD='247'
 SOVAGRID_MIN_PYTHON='3.10'
