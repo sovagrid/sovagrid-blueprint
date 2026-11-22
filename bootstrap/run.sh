@@ -6,9 +6,9 @@
 set -Eeuo pipefail
 umask 077
 
-release='server-v1.1.0'
-archive_sha256='773496d1aa72549853d202a1404c21ac77de1e9bfd406ba61844cd4c7c8ca8e6'
-manifest_sha256='8608c5556d1adf8682188af948d13a372b3caf48d47bf086125bc32d5f989752'
+release='server-v1.2.1'
+archive_sha256='3bb7c48b2072dc363db8c22153d10b5bf0289bd86ca9948ecae261032f7b0be5'
+manifest_sha256='7c47f04f5ef62da8888fa55192a7e45b6fcf21a8b44fbb368e23ae64d985e24d'
 archive_url="https://github.com/sovagrid/sovagrid-blueprint/releases/download/${release}/SovaGrid-server-source.tar.gz"
 source_root='/opt/sovagrid-src'
 default_path='/sovagrid/monitoring/'
@@ -26,6 +26,7 @@ root_behavior=${SOVAGRID_ROOT_BEHAVIOR:-}
 while (( $# )); do
   case $1 in
     --configure-web) setup_mode=configure; shift ;;
+    --uninstall) setup_mode=uninstall; shift; break ;;
     --public-address|--panel-path|--root-behavior)
       (( $# >= 2 )) || die "для $1 нужно значение"
       case $1 in
@@ -354,6 +355,38 @@ require_local_docker_target
 [[ -d /opt && ! -L /opt && $(stat -c %u /opt) == 0 &&
    -z $(find /opt -maxdepth 0 -perm /022 -print -quit) ]] ||
   die 'каталог /opt должен принадлежать root и быть недоступным для записи другим'
+download_verified_bundle() {
+  local stage=$1 actual_manifest
+  say "Скачиваю проверенный выпуск ${release}…"
+  curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
+    --connect-timeout 15 --max-time 240 --max-filesize 67108864 \
+    --output "$stage/source.tar.gz" "$archive_url" || die 'не удалось скачать выпуск по HTTPS'
+  [[ -s $stage/source.tar.gz && $(stat -c %s "$stage/source.tar.gz") -le 67108864 ]] ||
+    die 'архив пуст или превышает допустимый размер'
+  printf '%s  %s\n' "$archive_sha256" "$stage/source.tar.gz" | sha256sum --check --status ||
+    die 'SHA-256 архива не совпадает с проверенным выпуском'
+  actual_manifest=$(tar -xOzf "$stage/source.tar.gz" sovagrid-bundle.json | sha256sum | cut -d' ' -f1) ||
+    die 'манифест пакета повреждён'
+  [[ $actual_manifest == "$manifest_sha256" ]] || die 'SHA-256 манифеста не совпадает'
+
+  install -d -o root -g root -m 0755 "$stage/source"
+  tar --no-same-owner --same-permissions -xzf "$stage/source.tar.gz" -C "$stage/source" ||
+    die 'не удалось распаковать проверенный пакет'
+  [[ -f $stage/source/sovagrid-blueprint/run.sh && ! -L $stage/source/sovagrid-blueprint/run.sh ]] ||
+    die 'в проверенном пакете нет установщика'
+}
+
+if [[ $setup_mode == uninstall ]]; then
+  stage=$(mktemp -d /opt/.sovagrid-uninstall.XXXXXXXX) || die 'не удалось создать закрытый временный каталог'
+  trap 'rm -rf -- "$stage"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  download_verified_bundle "$stage"
+  [[ -f $stage/source/sovagrid-blueprint/deploy/uninstall_hub.py ]] ||
+    die 'этот выпуск не содержит удаления управляемого Hub'
+  bash "$stage/source/sovagrid-blueprint/run.sh" --uninstall "$@"
+  exit
+fi
 if [[ $setup_mode == configure ]]; then
   [[ -n $public_address ]] || die 'укажите --public-address ДОМЕН_ИЛИ_IP'
   command -v python3 >/dev/null || die 'в установленной системе нет python3'
@@ -424,23 +457,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-say "Скачиваю проверенный выпуск ${release}…"
-curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' \
-  --connect-timeout 15 --max-time 240 --max-filesize 67108864 \
-  --output "$stage/source.tar.gz" "$archive_url" || die 'не удалось скачать выпуск по HTTPS'
-[[ -s $stage/source.tar.gz && $(stat -c %s "$stage/source.tar.gz") -le 67108864 ]] ||
-  die 'архив пуст или превышает допустимый размер'
-printf '%s  %s\n' "$archive_sha256" "$stage/source.tar.gz" | sha256sum --check --status ||
-  die 'SHA-256 архива не совпадает с проверенным выпуском'
-actual_manifest=$(tar -xOzf "$stage/source.tar.gz" sovagrid-bundle.json | sha256sum | cut -d' ' -f1) ||
-  die 'манифест пакета повреждён'
-[[ $actual_manifest == "$manifest_sha256" ]] || die 'SHA-256 манифеста не совпадает'
-
-install -d -o root -g root -m 0755 "$stage/source"
-tar --no-same-owner --same-permissions -xzf "$stage/source.tar.gz" -C "$stage/source" ||
-  die 'не удалось распаковать проверенный пакет'
-[[ -f $stage/source/sovagrid-blueprint/run.sh && ! -L $stage/source/sovagrid-blueprint/run.sh ]] ||
-  die 'в проверенном пакете нет установщика'
+download_verified_bundle "$stage"
 [[ ! -e $source_root && ! -L $source_root ]] || die 'исходники появились во время загрузки'
 mv -Tn -- "$stage/source" "$source_root"
 [[ ! -e $stage/source && ! -L $stage/source && -f $source_root/sovagrid-bundle.json ]] ||

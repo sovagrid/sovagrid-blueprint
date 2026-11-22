@@ -54,6 +54,11 @@ installation_lock() {
 }
 
 [[ ${EUID} -eq 0 ]] || die 'run as root (sudo ./run.sh)'
+if [[ ${1:-} == --uninstall ]]; then
+  shift
+  script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+  exec /usr/bin/python3 -B -I "$script_dir/deploy/uninstall_hub.py" "$@"
+fi
 SOVAGRID_MIN_SYSTEMD='247'
 SOVAGRID_MIN_PYTHON='3.10'
 
