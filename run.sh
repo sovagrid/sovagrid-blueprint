@@ -13,6 +13,7 @@
 # SOVAGRID_WEB_AGENT_INSTALL_V1
 # SOVAGRID_WEB_RESTORE_V1
 # SOVAGRID_WEB_ASSET_LAYOUT_V1
+# SOVAGRID_INDEPENDENT_TERMINAL_V1
 set -euo pipefail
 umask 077
 # Keep the verified source tree free of generated Python bytecode on fresh installs.
@@ -1055,7 +1056,7 @@ fi
    ! -L $source_root/sovagrid-vpn/deploy/install-wireguard-control.py &&
    ! -L $source_root/sovagrid-vpn/sovagrid_vpn/wireguard_install.py ]] ||
   die 'managed WireGuard installer source is missing or a symlink'
-for auto_file in auto_update.py remote_update_worker.py runtime_locks.py sovagrid-auto-update.service sovagrid-auto-update.timer \
+for auto_file in auto_update.py remote_update_worker.py managed_security_state.py runtime_locks.py sovagrid-auto-update.service sovagrid-auto-update.timer \
                  release_feed.py sovagrid-release-feed.service sovagrid-release-feed.timer \
                  sovagrid-hub-backup-control.socket sovagrid-hub-backup-control.service compose.backup.yaml \
                  external_agent_operation.py sovagrid-external-agent-apply@.service; do

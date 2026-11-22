@@ -31,7 +31,8 @@ ERRORS = frozenset({"INVALID_REQUEST", "AUTH_REQUIRED", "ADMIN_FORBIDDEN", "HUB_
     "AGENT_NOT_ENROLLED", "ROOT_REQUIRED", "SOURCE_UNTRUSTED", "SOURCE_CHANGED",
     "OWNERSHIP_CONFLICT", "STATE_CONFLICT", "SERVICE_FAILED", "AGENT_UPDATE_REQUIRED",
     "STALE_PREVIEW", "RECOVERY_REQUIRED", "FEATURES_UNAVAILABLE", "HOST_KEY_CHANGED",
-    "SSH_UNAVAILABLE", "APPLY_UNCERTAIN", "METRIC_UNCONFIRMED", "STAGE_CLEANUP_REQUIRED", "BUSY"})
+    "SSH_UNAVAILABLE", "APPLY_UNCERTAIN", "METRIC_UNCONFIRMED", "STAGE_CLEANUP_REQUIRED", "BUSY",
+    "TERMINAL_PERMISSION_UNAVAILABLE"})
 
 
 class AgentFeatureError(RuntimeError):
@@ -76,8 +77,9 @@ class AgentFeatureJobs:
         return hashlib.sha256(_canonical({"route": identity, "target": status,
             "hub": policy, "registration": registration, "desired": desired})).hexdigest()
 
-    def execute(self, action, *, server_id, features, options, fingerprint, credential,
-                session_token, expected_review_sha256=None, confirm=None, authorize=lambda: None):
+    def execute(self, action, *, server_id, options, fingerprint, credential, session_token,
+                features=None, permission=None, terminal_enabled=None,
+                expected_review_sha256=None, confirm=None, authorize=lambda: None):
         try:
             if str(uuid.UUID(server_id)) != server_id:
                 raise ValueError
@@ -85,7 +87,16 @@ class AgentFeatureJobs:
             raise AgentFeatureError("INVALID_REQUEST") from None
         if action not in ("preview", "apply"):
             raise AgentFeatureError("INVALID_REQUEST")
-        desired = None if features is None and action == "preview" else _flags(features)
+        terminal_only = permission == "terminal"
+        if terminal_only:
+            if features is not None or not (type(terminal_enabled) is bool or
+                                             terminal_enabled is None and action == "preview"):
+                raise AgentFeatureError("INVALID_REQUEST")
+            desired = None  # The local command and files flags come from the verified target.
+        else:
+            if permission is not None or terminal_enabled is not None:
+                raise AgentFeatureError("INVALID_REQUEST")
+            desired = None if features is None and action == "preview" else _flags(features)
         if (action == "apply" and (confirm is not True or not isinstance(expected_review_sha256, str) or
                 SHA.fullmatch(expected_review_sha256) is None) or
                 action == "preview" and (expected_review_sha256 is not None or confirm is not None)):
@@ -109,10 +120,18 @@ class AgentFeatureJobs:
             raise AgentFeatureError("INVALID_REQUEST")
         api = self.api_factory(LocalHubFacade())
         mutation_started = False
+        command_gate = "commands_enabled" if terminal_only else "enabled"
         try:
             api.adopt_bearer(session_token)
             api.verify()
-            policy = api.management(server_id)
+            read_policy = api.permissions if terminal_only else api.management
+            try:
+                policy = read_policy(server_id)
+            except EnrollmentAPIError as error:
+                if terminal_only and error.status == 404:
+                    api.management(server_id)  # Distinguish an old Hub from an unregistered target.
+                    raise AgentFeatureError("TERMINAL_PERMISSION_UNAVAILABLE") from None
+                raise
             with self.jobs._exclusive():
                 bundle = self.jobs._bundle()
                 with self.transport_factory(host=options.host, port=options.port, username=options.user,
@@ -126,12 +145,17 @@ class AgentFeatureJobs:
                             checkpoint=lambda descriptor: self.stages._save_stage(identity, descriptor))
 
                         def target(operation, **payload):
+                            if terminal_only:
+                                payload["permission"] = "terminal"
                             result = rpc.call("target-features-" + operation,
                                 {"protocol": 1, "server_id": server_id, **payload}, stage=stage)
                             if result["source_manifest_sha256"] != stage.source_manifest_sha256:
                                 raise AgentFeatureError("SOURCE_CHANGED")
                             return result
 
+                        if terminal_only and terminal_enabled is not None:
+                            current = target("status")["current"]
+                            desired = {**current, "terminal": terminal_enabled}
                         status = target("status") if desired is None else target("preview", features=desired)
                         registration = api.get(status["identity"]["enrollment_id"])
                         self._bind(status, policy, registration, server_id)
@@ -139,10 +163,15 @@ class AgentFeatureJobs:
                         can_apply = desired is not None and status["pending_features"] in (None, desired)
                         review = None if desired is None else self._review(identity, status, policy, registration, desired)
                         public = {**route, "current": status["current"], "desired": selected,
-                            "hub_enabled": policy["enabled"], "hub_revision": policy["revision"],
+                            "hub_enabled": policy[command_gate], "hub_revision": policy["revision"],
                             "source_manifest_sha256": stage.source_manifest_sha256}
-                        changed = (status["current"] != selected or policy["enabled"] != selected["commands"] or
-                                   status["recovery_required"])
+                        if terminal_only:
+                            public.update(permission="terminal", terminal_access=policy["terminal_access"])
+                            changed = (status.get("changed", False) or status["recovery_required"] or
+                                       policy["terminal_access"] != {"enabled": selected["terminal"], "mode": "explicit"})
+                        else:
+                            changed = (status["current"] != selected or policy["enabled"] != selected["commands"] or
+                                       status["recovery_required"])
                         if action == "preview":
                             return {**public, "action": "preview", "can_apply": can_apply,
                                 "change_required": bool(changed), "recovery_required": status["recovery_required"],
@@ -153,7 +182,18 @@ class AgentFeatureJobs:
                         if review != expected_review_sha256:
                             raise AgentFeatureError("STALE_PREVIEW")
                         authorize()
-                        closed = api.set_management(policy, False)
+                        if terminal_only:
+                            mutation_started = True  # A lost CAS response does not prove that the gate stayed open.
+                            try:
+                                closed = api.set_terminal_permission(policy, False)
+                            except EnrollmentAPIError as error:
+                                if error.status == 409:
+                                    raise AgentFeatureError("STALE_PREVIEW") from None
+                                if error.status == 503:
+                                    raise AgentFeatureError("TERMINAL_PERMISSION_UNAVAILABLE") from None
+                                raise
+                        else:
+                            closed = api.set_management(policy, False)
                         mutation_started = True
                         authorize()
                         applied = target("apply", features=desired, expected=status["expected"],
@@ -171,10 +211,11 @@ class AgentFeatureJobs:
                             if self.clock() >= deadline:
                                 raise AgentFeatureError("METRIC_UNCONFIRMED")
                             self.pause(1)
-                        final = target("status")
-                        final_policy = api.management(server_id)
+                        final = target("preview", features=desired) if terminal_only else target("status")
+                        final_policy = read_policy(server_id)
                         self._bind(final, final_policy, row, server_id)
                         if (final_policy != closed or final["current"] != desired or final["recovery_required"] or
+                                terminal_only and (final["changed"] or final["terminal_mode"] != "explicit") or
                                 any(final[key] != applied[key] for key in
                                     ("identity", "current", "expected", "source_manifest_sha256", "pending_features", "services"))):
                             raise AgentFeatureError("APPLY_UNCERTAIN")
@@ -188,9 +229,13 @@ class AgentFeatureJobs:
                         if not stage_cleaned and self.stages._read_stage() is not None:
                             self.stages._cleanup_orphan(rpc, identity)
                 authorize()
-                opened = api.set_management(closed, desired["commands"])
+                if terminal_only:
+                    opened = api.set_terminal_permission(closed, desired["terminal"])
+                    public["terminal_access"] = opened["terminal_access"]
+                else:
+                    opened = api.set_management(closed, desired["commands"])
                 return {**public, "action": "applied", "current": final["current"], "desired": desired,
-                    "hub_enabled": opened["enabled"], "hub_revision": opened["revision"],
+                    "hub_enabled": opened[command_gate], "hub_revision": opened["revision"],
                     "applied": True, "changed": bool(changed), "fresh_metric_verified": True,
                     "cleanup_required": False}
         except AgentFeatureError:

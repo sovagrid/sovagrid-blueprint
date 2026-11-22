@@ -13,6 +13,7 @@ import socket
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -224,6 +225,30 @@ class ServiceTests(unittest.TestCase):
             service.dispatch(self.jobs, request('agent-features-apply', {**login_payload(),
                 'server_id': payload['server_id'], 'features': None}),
                 authorize=lambda token: None, agent_features=Features())
+
+    def test_terminal_only_socket_request_is_disjoint_from_general_permissions(self):
+        calls = []
+        def execute(action, **kwargs):
+            calls.append((action, kwargs))
+            return {}
+        features = SimpleNamespace(execute=execute)
+        common = {'server_id': '11111111-1111-4111-8111-111111111111',
+                  'permission': 'terminal', 'terminal_enabled': None}
+        payload = {**login_payload(), **common}
+        service.dispatch(self.jobs, request('agent-features-preview', payload),
+            authorize=lambda token: None, agent_features=features)
+        self.assertEqual(calls[0][1]['permission'], 'terminal')
+        self.assertIsNone(calls[0][1]['terminal_enabled'])
+        self.assertNotIn('features', calls[0][1])
+        self.assertEqual(payload['password'], '')
+        for fields in ({**common, 'features': None}, {**common, 'terminal_enabled': 1}):
+            rejected = {**login_payload(), **fields}
+            with self.assertRaises(service.RequestError):
+                service.dispatch(self.jobs, request('agent-features-preview', rejected),
+                    authorize=lambda token: None, agent_features=features)
+            self.assertEqual(rejected['password'], '')
+        self.assertEqual(len(calls), 1)
+
     def test_vpn_source_maintenance_requires_exact_boolean_and_admin_before_dispatch(self):
         expected = {key: "a" * 64 for key in ("source_manifest_sha256", "candidate_sha256",
                                              "installed_sha256", "state_sha256")}

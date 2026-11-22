@@ -460,6 +460,7 @@ def _candidate(archive_sha: str, old_commits: dict[str, str]):
     need(b"--hub-only" in script and b"local-hub-ca.pem" in script,
          "CANDIDATE_INCOMPATIBLE")
     need(common.candidate_web_asset_helper_present(source, script), "CANDIDATE_INCOMPATIBLE")
+    need(common.candidate_security_compatible(source), "CANDIDATE_INCOMPATIBLE")
     if Path("/var/lib/sovagrid/.release-feed-units-managed-by-run-sh").is_file():
         need(b"# SOVAGRID_RELEASE_FEED_UNITS_V1" in script,
              "CANDIDATE_INCOMPATIBLE")
@@ -972,6 +973,7 @@ def apply(archive_sha: str, current_manifest: str, *, automatic: bool = False) -
                          "--filter", "label=com.docker.compose.service=" + service],
                         capture_output=True, text=True, timeout=10, check=True).stdout.strip()
                     need(not running, "CONTAINER_STOP")
+            need(common.candidate_security_compatible(staged), "CANDIDATE_INCOMPATIBLE")
             admission.close()
             (folder / "snapshot").mkdir(mode=0o700)
             for index, name in enumerate(SNAPSHOT):

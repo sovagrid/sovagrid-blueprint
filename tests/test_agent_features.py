@@ -61,6 +61,7 @@ class FeatureFixture:
             self.core["owned_directories"][path] = mode
         old = {"format": 1, "components": {}, "sha256": {}}
         runtime = {"sovagrid_agent/__main__.py": b"# fixture unchanged runtime\n", "sovagrid_agent/terminal.py": b"# fixture PTY code\n",
+                   "sovagrid_agent/terminal_policy.py": b"# fixture separate PTY policy\n",
                    "LICENSE": b"license\n", "NOTICE": b"notice\n", "ATTRIBUTION.md": b"author\n",
                    "deploy/sovagrid-agent.service": b"# fixture Agent unit\n"}
         for relative, data in runtime.items():
@@ -184,6 +185,46 @@ class RemoteAgentFeatures(unittest.TestCase):
         for requested in ({"commands": False, "terminal": True, "files": False}, {"commands": 1, "terminal": False, "files": False}):
             with self.assertRaises(helper.Refuse):
                 helper.validate_request("target-features-preview", dict(good, features=requested))
+
+    def test_terminal_only_configuration_survives_an_interrupted_restart(self):
+        f = self.fixture
+        request = {"protocol": 1, "server_id": f.core["identity"]["server_id"], "permission": "terminal"}
+        desired = {"commands": False, "files": False, "terminal": True}
+        status = f.manager().dispatch("target-features-status", request)
+        self.assertEqual(status["terminal_mode"], "legacy")
+        preview = f.manager().dispatch("target-features-preview", dict(request, features=desired))
+        self.assertTrue(preview["changed"])
+
+        original = f.command
+        def simulated_systemd(argv, **options):
+            if argv[0] == "/usr/bin/systemd-analyze":
+                return 0, b""
+            if argv[:4] == ["/usr/bin/systemctl", "enable", "--now", "sovagrid-terminal-control.socket"]:
+                f.active[argv[3]] = True
+                return 0, b""
+            return original(argv, **options)
+        f.e.commands.run = simulated_systemd
+        with mock.patch.object(features.FeatureManager, "ensure_shell"), \
+             mock.patch.object(features.FeatureManager, "socket_snapshot",
+                               side_effect=lambda: {} if all(f.active.get(unit) for unit in features.UNITS) else None):
+            featured = f.request(desired, status)
+            f.interrupt_restart = True
+            with self.assertRaisesRegex(helper.Refuse, "SERVICE_FAILED"):
+                f.manager().dispatch("target-features-apply", dict(featured, permission="terminal"))
+            pending = f.manager().dispatch("target-features-status", request)
+            self.assertTrue(pending["recovery_required"])
+            self.assertEqual(pending["pending_features"], desired)
+            result = f.manager().dispatch("target-features-apply", dict(f.request(desired, pending), permission="terminal"))
+            self.assertTrue(result["applied"])
+            self.assertEqual(result["current"], desired)
+            self.assertEqual(result["terminal_mode"], "explicit")
+            self.assertFalse(result["recovery_required"])
+            with self.assertRaisesRegex(features.FeatureError, "STATE_CONFLICT"):
+                f.manager().dispatch("target-features-status", {"protocol": 1, "server_id": request["server_id"]})
+        self.assertEqual(json.loads(f.f.read(features.CONFIG)), {
+            **f.config, "allow_interactive_terminal": True, "terminal_permission_mode": "explicit",
+        })
+        self.assertFalse(f.f.path(features.WORKSPACE).exists())
 
     def test_status_and_preview_are_read_only_and_never_export_secrets(self):
         f = self.fixture

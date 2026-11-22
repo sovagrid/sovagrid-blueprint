@@ -9,6 +9,7 @@ from .enrollment_api import EnrollmentAPI, EnrollmentAPIError, _uuid
 
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 FIELDS = {"server_id", "enrollment_id", "agent_token_sha256", "enabled", "revision"}
+PERMISSION_FIELDS = (FIELDS - {"enabled"}) | {"commands_enabled", "terminal_access"}
 
 
 def management(value, server_id):
@@ -24,6 +25,19 @@ def management(value, server_id):
     except (ValueError, KeyError, TypeError):
         raise EnrollmentAPIError("Hub вернул неподтверждённые разрешения Agent.") from None
     return dict(value)
+
+
+def permissions(value, server_id):
+    if not isinstance(value, dict) or set(value) != PERMISSION_FIELDS:
+        raise EnrollmentAPIError("Hub вернул неподтверждённые разрешения Agent.")
+    common = {key: value[key] for key in FIELDS - {"enabled"}}
+    management({**common, "enabled": value["commands_enabled"]}, server_id)
+    terminal = value["terminal_access"]
+    if (not isinstance(terminal, dict) or set(terminal) != {"enabled", "mode"}
+            or type(terminal["enabled"]) is not bool or terminal["mode"] not in ("legacy", "explicit")
+            or terminal["mode"] == "legacy" and terminal["enabled"] != value["commands_enabled"]):
+        raise EnrollmentAPIError("Hub вернул неподтверждённый допуск терминала.")
+    return {**value, "terminal_access": dict(terminal)}
 
 
 class RemoteFeatureAPI(EnrollmentAPI):
@@ -75,4 +89,30 @@ class RemoteFeatureAPI(EnrollmentAPI):
                 or result["revision"] != clean["revision"] + int(reply["changed"])
                 or reply["changed"] != (clean["enabled"] != enabled)):
             raise EnrollmentAPIError("Hub подтвердил другую версию разрешений Agent.")
+        return result
+
+    def permissions(self, server_id):
+        _uuid(server_id)
+        path = "/api/v1/servers/" + server_id + "/agent-management/permissions"
+        return permissions(self._operation("GET", path), server_id)
+
+    def set_terminal_permission(self, expected, enabled):
+        if not isinstance(expected, dict) or type(enabled) is not bool:
+            raise ValueError("Сначала проверьте текущий допуск терминала.")
+        clean = permissions(expected, expected.get("server_id"))
+        pinned = ("enrollment_id", "agent_token_sha256", "commands_enabled")
+        body = {key: clean[key] for key in pinned}
+        body.update(expected_revision=clean["revision"], terminal_enabled=enabled)
+        path = "/api/v1/servers/" + clean["server_id"] + "/agent-management/permissions"
+        reply = self._operation("POST", path, body)
+        if (not isinstance(reply, dict) or set(reply) != PERMISSION_FIELDS | {"changed"}
+                or type(reply["changed"]) is not bool):
+            raise EnrollmentAPIError("Hub не подтвердил изменение допуска терминала.")
+        result = permissions({key: reply[key] for key in PERMISSION_FIELDS}, clean["server_id"])
+        terminal = {"enabled": enabled, "mode": "explicit"}
+        changed = clean["terminal_access"] != terminal
+        if (any(result[key] != clean[key] for key in pinned)
+                or result["terminal_access"] != terminal
+                or reply["changed"] != changed or result["revision"] != clean["revision"] + int(changed)):
+            raise EnrollmentAPIError("Hub подтвердил другую версию допуска терминала.")
         return result

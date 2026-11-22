@@ -162,17 +162,23 @@ def validate_request(action, value):
     require(action in ACTIONS)
     if action in FEATURE_ACTIONS:
         fields = {"protocol", "server_id"}
+        terminal_only = isinstance(value, dict) and "permission" in value
+        if terminal_only:
+            fields.add("permission")
         if action != "target-features-status":
             fields.add("features")
         if action == "target-features-apply":
             fields |= {"expected", "enrollment_id", "agent_token_sha256"}
         exact(value, fields)
         require(type(value["protocol"]) is int and value["protocol"] == 1)
+        if terminal_only:
+            require(value["permission"] == "terminal")
         canonical_uuid(value["server_id"])
         if "features" in value:
             exact(value["features"], {"commands", "terminal", "files"})
             require(all(type(item) is bool for item in value["features"].values()))
-            require(value["features"]["commands"] or not (value["features"]["terminal"] or value["features"]["files"]))
+            flags = value["features"]
+            require(flags["commands"] or (not flags["files"] and (terminal_only or not flags["terminal"])))
         if "expected" in value:
             exact(value["expected"], CAS_FIELDS)
             require(all(isinstance(item, str) and SHA.fullmatch(item) for item in value["expected"].values()))

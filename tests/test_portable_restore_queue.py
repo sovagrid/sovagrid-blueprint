@@ -228,8 +228,8 @@ class QueueTest(unittest.TestCase):
         proof = self.driver.prepare(self.step)
         before, inode = self.db.read_bytes(), self.db.stat().st_ino
         quarantine = self.driver._quarantine
-        def crash(derived, at):
-            quarantine(derived, at)
+        def crash(derived, at, security):
+            quarantine(derived, at, security)
             raise PowerLoss()
         with patch.object(self.driver, '_quarantine', side_effect=crash):
             with self.assertRaises(PowerLoss):
@@ -244,6 +244,19 @@ class QueueTest(unittest.TestCase):
             self.driver.undo(self.step, proof)
         self.assertEqual(unknown.read_bytes(), derived_bytes)
         self.assertFalse((self.work(proof) / 'result.json').exists())
+
+    def test_older_archived_runtime_cannot_restore_explicit_terminal_state_and_rolls_back(self):
+        with self.connection() as db:
+            db.executescript("CREATE TABLE servers(terminal_enabled INTEGER); INSERT INTO servers VALUES(0);")
+        before, inode = self.db.read_bytes(), self.db.stat().st_ino
+        proof = self.driver.prepare(self.step)
+        with self.assertRaisesRegex(core.Refused, 'RESTORE_SECURITY_STATE_UNSUPPORTED'):
+            self.driver.execute(self.step, proof)
+        self.assertTrue((self.work(proof) / 'result.json').is_file())
+        self.driver.undo(self.step, proof)
+        self.assertFalse(self.work(proof).exists())
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertEqual(self.db.stat().st_ino, inode)
 
     def test_every_original_publication_prefix_is_reversible(self):
         for crash_after in (1, 2):

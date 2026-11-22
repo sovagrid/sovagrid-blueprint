@@ -42,7 +42,8 @@ REQUIRED = frozenset(("sovagrid-blueprint/run.sh", "sovagrid-blueprint/deploy/co
 REQUIRED |= frozenset("sovagrid-blueprint/deploy/" + name for name in (
     "portable_restore_bootstrap.sh", "portable_restore_receiver.py", "portable_restore_target.py",
     "portable_restore_retry.py", "portable_restore_apply.py", "portable_restore_runtime.py",
-    "portable_restore_shadow.py", "portable_restore_compose.py", "portable_restore_queue.py", "host_restore.py"))
+    "portable_restore_shadow.py", "portable_restore_compose.py", "portable_restore_queue.py",
+    "managed_security_state.py", "host_restore.py"))
 _NAME = re.compile(r"[A-Za-z0-9_.@-]+\Z")
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")

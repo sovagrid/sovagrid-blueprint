@@ -526,9 +526,24 @@ def candidate_web_assets_present(source, *, restore=False):
     return True
 
 
+def candidate_security_compatible(source):
+    """Compare the live Hub's persisted security state with a verified candidate."""
+    try:
+        security = runpy.run_path(str(Path(__file__).with_name('managed_security_state.py')))
+        database = path(security['DATABASE'])
+        if not os.path.lexists(database):
+            return True  # Installation layout checks separately require a database on an existing Hub.
+        if database.is_symlink():
+            return False
+        required = security['inspect_database'](database, uid=HUB_UID, gid=HUB_GID)
+        return required <= security['bundle_supports'](source)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
 def candidate_features_compatible(source, flags):
     script = (source / 'sovagrid-blueprint/run.sh').read_bytes()
-    if not candidate_web_asset_helper_present(source, script):
+    if not candidate_web_asset_helper_present(source, script) or not candidate_security_compatible(source):
         fail('COMPAT')
     for flag in ('--with-wireguard', '--with-terminal', '--with-files', '--with-journal', '--with-containers'):
         if flag in flags and flag.encode() not in script:
@@ -2135,6 +2150,10 @@ def _apply_locked(candidate_digest, expected_manifest, *, automatic=False, insta
                 ).stdout.strip()
                 if running:
                     raise UpdateFailure('container did not stop: ' + service)
+            # Manual updates can race a policy write between their initial
+            # check and shutdown. Check again before changing the source.
+            if not candidate_security_compatible(staged):
+                fail('COMPAT')
             admission.close()
             agent_admission.close()
             emit('SG_APPLY_STAGE:STOPPED')

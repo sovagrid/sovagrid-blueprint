@@ -79,6 +79,7 @@ try:
            for kind, name, sql in schema):
         raise ValueError()
     tables = {name for kind, name, sql in schema if kind == 'table'}
+    protected = protected_security_state(db)
     if not {'jobs', 'pending_commands', 'audit_events'} <= tables:
         raise ValueError()
     required = {'jobs': {'state', 'command', 'completed_at'},
@@ -109,7 +110,7 @@ try:
     if db.execute('PRAGMA journal_mode').fetchall()[0][0].lower() != journal_mode:
         raise ValueError()
     db.close()
-    print(json.dumps({'counts': counts, 'journal_mode': journal_mode},
+    print(json.dumps({'counts': counts, 'journal_mode': journal_mode, 'protected': protected},
                      sort_keys=True, separators=(',', ':')))
 except BaseException:
     # Do not expose malformed database contents, SQL errors, commands or secrets.
@@ -325,21 +326,22 @@ class Queue:
             os.close(source)
         os.fsync(target_parent)
 
-    def _quarantine(self, derived, at):
+    def _quarantine(self, derived, at, security):
         try:
-            result = subprocess.run([sys.executable, "-I", "-S", "-c", _HELPER,
+            result = subprocess.run([sys.executable, "-I", "-S", "-c", security.SQL_PROBE + _HELPER,
                 str(derived), str(HUB_UID), str(HUB_GID), str(at), str(MAX_DATABASE)],
                 pass_fds=(derived,), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, timeout=TIME_LIMIT, check=False, env={"PATH": "/usr/bin:/bin"})
             outcome = json.loads(result.stdout)
             if (result.returncode != 0 or not isinstance(outcome, dict) or
-                    set(outcome) != {"counts", "journal_mode"} or
+                    set(outcome) != {"counts", "journal_mode", "protected"} or
                     outcome["journal_mode"] not in ("delete", "wal") or
                     not isinstance(outcome["counts"], dict) or set(outcome["counts"]) != {
                         "queued_jobs_cancelled", "pending_commands_removed"} or
                     any(type(value) is not int or value < 0 for value in outcome["counts"].values())):
                 raise self.core.Refused("RESTORE_QUEUE_QUARANTINE_FAILED")
-            return outcome
+            protected = security.parse_features(outcome.pop("protected"))
+            return outcome, protected
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             raise self.core.Refused("RESTORE_QUEUE_QUARANTINE_FAILED") from exc
 
@@ -350,6 +352,8 @@ class Queue:
             self._parents(hub, parent, proof)
             if self._files(hub) != proof["original"]:
                 raise self.core.Refused("RESTORE_QUEUE_CHANGED")
+            security = self.restore._sibling("managed_security_state.py", "_sovagrid_restore_security_state")
+            compatible = security.bundle_supports(self.restore.backup.ROOT / "opt/sovagrid-src")
             # Bound clone + potential full rollback journal + WAL consolidation.
             needed = 2 * sum(item["size"] for item in proof["original"].values()) + 64 * 1024**2
             space = os.fstatvfs(parent)
@@ -362,7 +366,7 @@ class Queue:
             for name in (FILES[0], FILES[1]):
                 if name in proof["original"] and (name == FILES[0] or proof["original"][name]["size"]):
                     self._copy(hub, derived, name, proof["original"][name])
-            outcome = self._quarantine(derived, proof["at"])
+            outcome, protected = self._quarantine(derived, proof["at"], security)
             if sorted(os.listdir(derived)) != [FILES[0]]:
                 raise self.core.Refused("RESTORE_QUEUE_SIDECAR_REMAINS")
             # Fsync both data and directory before the receipt can authorize publication.
@@ -377,6 +381,10 @@ class Queue:
             self._write(work, "result.tmp", self.core._canonical(receipt) + b"\n")
             self.core._rename_noreplace(work, "result.tmp", "result.json")
             os.fsync(work)
+            if not protected <= compatible:
+                # Keep an ordinary rollback receipt for the verified clone.
+                # Recovery can remove it without touching the original DB.
+                raise self.core.Refused("RESTORE_SECURITY_STATE_UNSUPPORTED")
             if self._files(hub) != proof["original"]:
                 raise self.core.Refused("RESTORE_QUEUE_CHANGED")
             # Move sidecars before replacing the database. Every prefix is recoverable.

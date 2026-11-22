@@ -279,12 +279,18 @@ def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: o
             if agent_features is None:
                 raise RequestError("RUNTIME_UNAVAILABLE")
             operation = action.removeprefix("agent-features-")
-            extra = {"server_id", "features"} | ({"expected_review_sha256", "confirm"}
+            terminal_only = type(payload) is dict and "permission" in payload
+            selection = {"permission", "terminal_enabled"} if terminal_only else {"features"}
+            extra = {"server_id"} | selection | ({"expected_review_sha256", "confirm"}
                 if operation == "apply" else set())
             credential = _vpn_route_credential(payload, _LOGIN | extra)
             try:
+                if terminal_only and (payload["permission"] != "terminal" or
+                        not (type(payload["terminal_enabled"]) is bool or
+                             payload["terminal_enabled"] is None and operation == "preview")):
+                    raise RequestError("INVALID_INPUT")
                 return agent_features.execute(operation, server_id=payload["server_id"],
-                    features=payload["features"], options=_options(payload),
+                    **{key: payload[key] for key in selection}, options=_options(payload),
                     fingerprint=payload["fingerprint"], credential=credential,
                     session_token=token, expected_review_sha256=payload.get("expected_review_sha256"),
                     confirm=payload.get("confirm"), authorize=recheck_admin)

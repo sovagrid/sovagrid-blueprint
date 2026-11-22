@@ -28,6 +28,8 @@ class RPC:
         self._owner, self._stages, self.applies = object(), {}, 0
         self.current = dict(CURRENT)
         self.fail_apply = False
+        self.terminal_mode = 'legacy'
+        self.terminal_ready = True
 
     def stage_target(self, _bundle, _sha, *, checkpoint):
         stage = Stage('/var/tmp/sovagrid-agent-enroll.' + 'a' * 32,
@@ -41,11 +43,14 @@ class RPC:
 
     def call(self, action, payload, *, stage):
         operation = action.removeprefix('target-features-')
+        terminal_only = payload.get('permission') == 'terminal'
         if operation == 'apply':
             if self.fail_apply:
                 raise module.RPCError('SSH_FAILED')
             self.applies += 1
             self.current = dict(payload['features'])
+            if terminal_only:
+                self.terminal_mode = 'explicit'
         result = {'protocol': 1, 'identity': dict(IDENTITY),
             'source_manifest_sha256': stage.source_manifest_sha256,
             'current': dict(self.current), 'pending_features': None, 'recovery_required': False,
@@ -54,6 +59,10 @@ class RPC:
                 for key in ('source_manifest_sha256', 'features_sha256', 'policy_sha256', 'state_sha256')}}
         if operation in ('preview', 'apply'):
             result.update(desired=dict(payload['features']), changed=result['current'] != payload['features'])
+        if terminal_only:
+            result['terminal_mode'] = self.terminal_mode
+            if operation == 'preview':
+                result['changed'] |= self.terminal_mode != 'explicit' or not self.terminal_ready
         if operation == 'apply': result['applied'] = True
         return result
 
@@ -63,6 +72,8 @@ class API:
         self.events = events
         self.policy = {key: IDENTITY[key] for key in ('server_id', 'enrollment_id', 'agent_token_sha256')}
         self.policy.update(enabled=False, revision=0)
+        self.terminal_access = {'enabled': False, 'mode': 'legacy'}
+        self.terminal_available = True
         self.seen = 1
 
     def adopt_bearer(self, _token): pass
@@ -78,6 +89,21 @@ class API:
         self.events.append(('gate', enabled))
         self.policy.update(enabled=enabled, revision=self.policy['revision'] + int(enabled != self.policy['enabled']))
         return dict(self.policy)
+
+    def permissions(self, _server):
+        return {**{k:v for k,v in self.policy.items() if k != 'enabled'},
+                'commands_enabled':self.policy['enabled'], 'terminal_access':dict(self.terminal_access)}
+
+    def set_terminal_permission(self, expected, enabled):
+        if not self.terminal_available:
+            raise module.EnrollmentAPIError('disabled', 503)
+        if expected != self.permissions(SERVER):
+            raise module.EnrollmentAPIError('changed', 409)
+        self.events.append(('terminal-gate', enabled))
+        terminal = {'enabled': enabled, 'mode': 'explicit'}
+        self.policy['revision'] += int(self.terminal_access != terminal)
+        self.terminal_access = terminal
+        return self.permissions(SERVER)
 
     def get(self, _enrollment):
         self.seen += 1
@@ -112,6 +138,62 @@ class FeatureWebTests(unittest.TestCase):
 
     def plan(self):
         return self.jobs.execute('preview', features=DESIRED, **self.arguments)
+
+    def terminal_plan(self, enabled):
+        return self.jobs.execute('preview', permission='terminal', terminal_enabled=enabled, **self.arguments)
+
+    def terminal_apply(self, plan, enabled):
+        return self.jobs.execute('apply', permission='terminal', terminal_enabled=enabled,
+            expected_review_sha256=plan['review_sha256'], confirm=True, **self.arguments)
+
+    def test_terminal_enable_and_disable_preserve_the_commands_and_files_gates(self):
+        for current, hub_commands in ((CURRENT, False), (dict(CURRENT, commands=True, files=True), False),
+                                      (dict(CURRENT, commands=True, files=True), True)):
+            with self.subTest(current=current, hub_commands=hub_commands):
+                self.setUp()
+                self.rpc.current = dict(current)
+                self.api.policy['enabled'] = hub_commands
+                self.api.terminal_access['enabled'] = hub_commands
+                for enabled in (True, False):
+                    plan = self.terminal_plan(enabled)
+                    self.assertEqual(plan['desired'], dict(current, terminal=enabled))
+                    self.assertEqual(plan['hub_enabled'], hub_commands)
+                    result = self.terminal_apply(plan, enabled)
+                    self.assertEqual(result['terminal_access'], {'enabled': enabled, 'mode': 'explicit'})
+                    self.assertEqual(result['current'], dict(current, terminal=enabled))
+                    self.assertTrue(result['fresh_metric_verified'])
+                    self.assertEqual(result['hub_enabled'], hub_commands)
+                self.assertEqual(self.events, [('terminal-gate', False), ('terminal-gate', True),
+                                               ('terminal-gate', False), ('terminal-gate', False)])
+
+    def test_missing_gate_or_unready_terminal_never_enables_access(self):
+        plan = self.terminal_plan(True)
+        self.api.terminal_available = False
+        with self.assertRaisesRegex(module.AgentFeatureError, 'TERMINAL_PERMISSION_UNAVAILABLE'):
+            self.terminal_apply(plan, True)
+        self.assertEqual(self.rpc.applies, 0)
+        self.assertEqual(self.events, [])
+
+        self.api.terminal_available = True
+        original = self.rpc.call
+        def call(action, payload, *, stage):
+            result = original(action, payload, stage=stage)
+            if action == 'target-features-apply':
+                self.rpc.terminal_ready = False
+            return result
+        self.rpc.call = call
+        with self.assertRaisesRegex(module.AgentFeatureError, 'APPLY_UNCERTAIN'):
+            self.terminal_apply(plan, True)
+        self.assertEqual(self.events, [('terminal-gate', False)])
+        self.assertEqual(self.api.terminal_access, {'enabled': False, 'mode': 'explicit'})
+
+    def test_terminal_plan_is_pinned_to_current_permission_revision(self):
+        plan = self.terminal_plan(True)
+        self.api.policy['revision'] += 1
+        with self.assertRaisesRegex(module.AgentFeatureError, 'STALE_PREVIEW'):
+            self.terminal_apply(plan, True)
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.rpc.applies, 0)
 
     def test_current_read_is_not_a_mutation_plan_and_writes_no_credentials(self):
         result = self.jobs.execute('preview', features=None, **self.arguments)

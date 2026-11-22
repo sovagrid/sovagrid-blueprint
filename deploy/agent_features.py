@@ -83,9 +83,9 @@ def current_flags(config):
             "files": config["allow_file_manager"]}
 
 
-def flags(value):
+def flags(value, *, terminal_only=False):
     need(isinstance(value, dict) and set(value) == FLAGS and all(type(item) is bool for item in value.values()), "STATE_CONFLICT")
-    need(value["commands"] or not (value["terminal"] or value["files"]), "STATE_CONFLICT")
+    need(value["commands"] or (not value["files"] and (terminal_only or not value["terminal"])), "STATE_CONFLICT")
     return dict(value)
 
 
@@ -120,6 +120,7 @@ class FeatureManager:
         self.manifest = manifest
         self.source_root = source_root
         self.core = self.state = self.agent = self.config = None
+        self.terminal_only = False
 
     def run(self, argv, **options):
         return self.e.commands.run(argv, timeout=options.pop("timeout", 20), limit=options.pop("limit", 8192), **options)
@@ -139,15 +140,17 @@ class FeatureManager:
         need(isinstance(self.core.get("agent_token_sha256"), str) and SHA.fullmatch(self.core["agent_token_sha256"]), "STATE_CONFLICT")
         self.state = self.e.load_json(STATE, missing=True, limit=131072)
         if self.state is not None:
-            need(self.state.get("protocol") == 1 and type(self.state["protocol"]) is int
+            need(type(self.state.get("protocol")) is int and self.state["protocol"] in (1, 2)
                  and self.state.get("kind") == "target-features" and self.state.get("identity") == self.identity()
                  and self.state.get("phase") in ("applying", "ready")
                  and isinstance(self.state.get("owned_files"), dict) and isinstance(self.state.get("pending_writes"), dict)
                  and isinstance(self.state.get("data_directories"), dict), "STATE_CONFLICT")
             need(self.state.get("pending_features") is None if self.state["phase"] == "ready"
                  else isinstance(self.state.get("pending_features"), dict), "STATE_CONFLICT")
+            need(self.state["protocol"] == 1 or self.terminal_only, "STATE_CONFLICT")
             if self.state.get("pending_features") is not None:
-                flags(self.state["pending_features"])
+                need(self.state["protocol"] == (2 if self.terminal_only else 1), "STATE_CONFLICT")
+                flags(self.state["pending_features"], terminal_only=self.terminal_only)
                 need(isinstance(self.state.get("config_base"), dict)
                      and isinstance(self.state.get("config_old_sha256"), str)
                      and SHA.fullmatch(self.state["config_old_sha256"]), "STATE_CONFLICT")
@@ -197,22 +200,30 @@ class FeatureManager:
                      if name.startswith(SOURCE_PREFIX + "sovagrid_agent/") and name.endswith(".py")}
         need(wanted and wanted == installed and old["sha256"].get(SOURCE_PREFIX + "deploy/sovagrid-agent.service")
              == self.manifest["sha256"].get(SOURCE_PREFIX + "deploy/sovagrid-agent.service"), "AGENT_UPDATE_REQUIRED")
+        if self.terminal_only:
+            need(SOURCE_PREFIX + "sovagrid_agent/terminal_policy.py" in wanted, "AGENT_UPDATE_REQUIRED")
 
     def validate_config(self, config):
         fields = {"hub_url", "server_id", "token_file", "ca_file", "interval_seconds", "allow_remote_commands",
                   "allow_interactive_terminal", "allow_file_manager", "allow_systemd_journal", "journal_units", "file_roots"}
-        need(isinstance(config, dict) and set(config) == fields and config["server_id"] == self.core["identity"]["server_id"]
+        valid_fields = (fields, fields | {"terminal_permission_mode"}) if self.terminal_only else (fields,)
+        need(isinstance(config, dict) and set(config) in valid_fields and config["server_id"] == self.core["identity"]["server_id"]
              and config["hub_url"] == "https://localhost:" + str(self.core.get("local_port"))
              and config["token_file"] == "/etc/sovagrid/agent.token" and config["ca_file"] == "/etc/sovagrid/hub-ca.pem"
              and not isinstance(config["interval_seconds"], bool) and isinstance(config["interval_seconds"], (int, float))
              and 5 <= config["interval_seconds"] <= 3600 and config["allow_systemd_journal"] is False
              and config["journal_units"] == [] and config["file_roots"] in ({}, {"workspace": WORKSPACE}), "STATE_CONFLICT")
-        flags(current_flags(config))
+        mode = config.get("terminal_permission_mode", "legacy")
+        need(mode in ("legacy", "explicit"), "STATE_CONFLICT")
+        flags(current_flags(config), terminal_only=mode == "explicit")
         need(not config["allow_file_manager"] or config["file_roots"] == {"workspace": WORKSPACE}, "STATE_CONFLICT")
 
     def desired_config(self, desired):
         base = self.state["config_base"] if self.state and self.state["phase"] == "applying" else self.config
         result = dict(base)
+        if self.terminal_only:
+            result.update(allow_interactive_terminal=desired["terminal"], terminal_permission_mode="explicit")
+            return result
         result.update(allow_remote_commands=desired["commands"], allow_interactive_terminal=desired["terminal"],
                       allow_file_manager=desired["files"])
         if desired["files"]:
@@ -226,7 +237,7 @@ class FeatureManager:
             pending = self.core.get("pending_writes", {}).get(path)
             if pending is not None:
                 need(path == CONFIG and self.state is not None and self.state["phase"] == "applying", "STATE_CONFLICT")
-                desired = flags(self.state["pending_features"])
+                desired = flags(self.state["pending_features"], terminal_only=self.terminal_only)
                 need(pending.get("new") == sha(encode(self.desired_config(desired)) + b"\n")
                      and pending.get("old") == self.state["config_old_sha256"], "STATE_CONFLICT")
                 allowed |= {pending["old"], pending["new"]}
@@ -411,7 +422,8 @@ class FeatureManager:
                     "policy_sha256": sha(encode({"base": base["policy_sha256"], "units": policies})),
                     "state_sha256": sha(encode({"base": base, "features": self.state, "units": unit_files,
                                                 "data": data, "account": self.account_snapshot(), "socket": self.socket_snapshot()}))}
-        return {"identity": self.identity(), "current": current_flags(self.config), "expected": expected,
+        mode = {"terminal_mode": self.config.get("terminal_permission_mode", "legacy")} if self.terminal_only else {}
+        return {**mode, "identity": self.identity(), "current": current_flags(self.config), "expected": expected,
                 "source_manifest_sha256": self.source_sha, "recovery_required": self.state is not None and self.state["phase"] == "applying",
                 "pending_features": self.state.get("pending_features") if self.state else None, "services": self.services()}
 
@@ -530,6 +542,18 @@ class FeatureManager:
     def socket_boundary(self):
         need(self.socket_snapshot() is not None, "SERVICE_FAILED")
 
+    def reviewed_desired(self, before, features):
+        desired = flags(features, terminal_only=self.terminal_only)
+        if self.terminal_only:
+            need(all(desired[key] == before["current"][key] for key in ("commands", "files")), "STATE_CONFLICT")
+        return desired
+
+    def change_required(self, before, desired):
+        return (before["current"] != desired or before["recovery_required"] or not before["services"]["agent"]
+                or not self.terminal_ready(desired["terminal"])
+                or self.terminal_only and (before["terminal_mode"] != "explicit" or
+                                           (self.socket_snapshot() is not None) != desired["terminal"]))
+
     def apply(self, value):
         with self.e.locked("target"):
             before = self.snapshot()
@@ -537,17 +561,18 @@ class FeatureManager:
             need(value["server_id"] == before["identity"]["server_id"]
                  and value["enrollment_id"] == before["identity"]["enrollment_id"]
                  and value["agent_token_sha256"] == before["identity"]["agent_token_sha256"], "STATE_CONFLICT")
-            desired = flags(value["features"])
+            desired = self.reviewed_desired(before, value["features"])
             need(before["services"]["tunnel"], "SERVICE_FAILED")
             if self.state is not None and self.state["phase"] == "applying":
                 need(self.state["pending_features"] == desired, "STATE_CONFLICT")
-            elif before["current"] == desired and before["services"]["agent"] and self.terminal_ready(desired["terminal"]):
+            elif not self.change_required(before, desired):
                 return {**before, "desired": desired, "changed": False, "applied": True}
             else:
                 if self.state is None:
                     self.state = {"protocol": 1, "kind": "target-features", "identity": self.identity(),
                                   "owned_files": {}, "pending_writes": {}, "data_directories": {}, "shell_account": None}
-                self.state.update(phase="applying", pending_features=desired, config_base=dict(self.config),
+                self.state.update(protocol=2 if self.terminal_only else 1,
+                                  phase="applying", pending_features=desired, config_base=dict(self.config),
                                   config_old_sha256=sha(self.f.read(CONFIG, limit=32768)))
                 self.save()
             if desired["terminal"]:
@@ -555,7 +580,7 @@ class FeatureManager:
                 for unit in UNITS:
                     self.write_unit(unit)
                 self.run(["/usr/bin/systemd-analyze", "verify", *["/etc/systemd/system/" + unit for unit in UNITS]])
-            if desired["files"]:
+            if desired["files"] and not self.terminal_only:
                 self.ensure_data(WORKSPACE, self.agent.pw_uid, self.agent.pw_gid)
             config = self.desired_config(desired)
             self.validate_config(config)
@@ -580,6 +605,7 @@ class FeatureManager:
             return {**after, "desired": desired, "changed": True, "applied": True}
 
     def dispatch(self, action, value):
+        self.terminal_only = value.get("permission") == "terminal"
         if action == "target-features-apply":
             return self.apply(value)
         # The active enrollment already owns this lock. Shared, noncreating
@@ -588,9 +614,8 @@ class FeatureManager:
             result = self.snapshot()
             need(result["identity"]["server_id"] == value["server_id"], "STATE_CONFLICT")
             if action == "target-features-preview":
-                desired = flags(value["features"])
+                desired = self.reviewed_desired(result, value["features"])
                 if desired["terminal"] and (self.state is None or self.state.get("shell_account") is None):
                     self.shell_available()
-                return {**result, "desired": desired, "changed": result["current"] != desired or result["recovery_required"]
-                        or not result["services"]["agent"] or not self.terminal_ready(desired["terminal"])}
+                return {**result, "desired": desired, "changed": self.change_required(result, desired)}
             return result

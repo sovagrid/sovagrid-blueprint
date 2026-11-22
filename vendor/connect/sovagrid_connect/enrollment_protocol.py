@@ -226,16 +226,21 @@ def validate_request(action, value):
     _require(isinstance(action, str) and action in ACTIONS)
     if action in FEATURE_ACTIONS:
         fields = {"protocol", "server_id"}
+        terminal_only = isinstance(value, dict) and "permission" in value
+        if terminal_only:
+            fields.add("permission")
         if action != "target-features-status":
             fields.add("features")
         if action == "target-features-apply":
             fields |= {"expected", "enrollment_id", "agent_token_sha256"}
         exact(value, fields)
         _require(type(value["protocol"]) is int and value["protocol"] == 1)
+        if terminal_only:
+            _require(value["permission"] == "terminal")
         canonical_uuid(value["server_id"])
         result = dict(value)
         if "features" in value:
-            result["features"] = validate_features(value["features"])
+            result["features"] = validate_features(value["features"], terminal_only=terminal_only)
         if "expected" in value:
             result["expected"] = validate_cas(value["expected"])
             canonical_uuid(value["enrollment_id"]); _sha(value["agent_token_sha256"])
@@ -357,10 +362,10 @@ def validate_reply(action, value, *, request=None):
     return result
 
 
-def validate_features(value):
+def validate_features(value, *, terminal_only=False):
     exact(value, {"commands", "terminal", "files"})
     _require(all(type(item) is bool for item in value.values()))
-    _require(value["commands"] or not (value["terminal"] or value["files"]))
+    _require(value["commands"] or (not value["files"] and (terminal_only or not value["terminal"])))
     return dict(value)
 
 
@@ -379,16 +384,21 @@ def validate_feature_reply(action, value, *, request=None):
         fields |= {"desired", "changed"}
     if action == "target-features-apply":
         fields.add("applied")
+    terminal_only = request is not None and request.get("permission") == "terminal"
+    if terminal_only:
+        fields.add("terminal_mode")
     exact(value, fields)
+    if terminal_only:
+        _require(value["terminal_mode"] in ("legacy", "explicit"))
     identity = validate_feature_identity(value["identity"])
-    current = validate_features(value["current"])
+    current = validate_features(value["current"], terminal_only=terminal_only and value["terminal_mode"] == "explicit")
     expected = validate_cas(value["expected"])
     _sha(value["source_manifest_sha256"])
     _require(expected["source_manifest_sha256"] == value["source_manifest_sha256"]
              and type(value["recovery_required"]) is bool)
     pending = value["pending_features"]
     if pending is not None:
-        validate_features(pending)
+        validate_features(pending, terminal_only=terminal_only)
     _require(value["recovery_required"] == (pending is not None))
     exact(value["services"], {"agent", "tunnel", "terminal"})
     _require(all(type(item) is bool for item in value["services"].values()))
@@ -398,12 +408,13 @@ def validate_feature_reply(action, value, *, request=None):
             if key in request:
                 _require(identity[key] == request[key])
     if "desired" in value:
-        desired = validate_features(value["desired"])
+        desired = validate_features(value["desired"], terminal_only=terminal_only)
         _require(type(value["changed"]) is bool)
         if request is not None:
             _require(desired == request["features"])
     if action == "target-features-apply":
         _require(value["applied"] is True and current == desired
+                 and (not terminal_only or value["terminal_mode"] == "explicit")
                  and value["recovery_required"] is False and pending is None
                  and value["services"]["agent"] is True and value["services"]["tunnel"] is True
                  and value["services"]["terminal"] == desired["terminal"])
