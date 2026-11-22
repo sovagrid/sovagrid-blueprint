@@ -45,9 +45,10 @@ PUBLIC_KEY, FINGERPRINT = ssh_key()
 
 
 class Credential:
-    def __init__(self, secret="test-only-ssh-secret"):
+    def __init__(self, secret="test-only-ssh-secret", *, hops=()):
         self.secret = bytearray(secret.encode())
         self.wiped = False
+        self.hops = tuple(hops)
 
     def wipe(self):
         self.secret[:] = b"\0" * len(self.secret)
@@ -274,6 +275,56 @@ class JobsTests(unittest.TestCase):
                 reviewed_fingerprint=FINGERPRINT, credential=Credential(),
                 session_token=BEARER)
         self.assertEqual(raised.exception.code, "TARGET_CHANGED")
+        self.assertEqual(len(self.created), 1)
+        self.assert_secretless(second)
+
+    def test_chain_resume_checks_all_reviewed_endpoints_before_opening_ssh(self):
+        first = self.jobs()
+        hops = (
+            {"host": "entry.example", "username": "relay", "port": 22, "fingerprint": FINGERPRINT},
+            {"host": "relay.internal", "username": "other", "port": 2200, "fingerprint": FINGERPRINT},
+        )
+        initial = self.prepare(first, credential=Credential(hops=hops))
+        request_id = initial["request_id"]
+        self.assertEqual(initial["hop_count"], 2)
+        saved = first.journal.load(request_id)["target_connection"]
+        self.assertRegex(saved["host_key_alias"], r"^sg-r2-[a-z2-7]{52}$")
+        self.assertIsNone(saved["identity"])
+        self.assertIsNone(saved["jump_identity"])
+        raw = (self.root / "journal" / f"{request_id}.json").read_text()
+        for hidden in ("entry.example", "relay.internal", FINGERPRINT):
+            self.assertNotIn(hidden, raw)
+        first.close()
+
+        second = self.jobs()
+        self.assertEqual(second.status(request_id)["hop_count"], 2)
+        self.assertEqual(second.list()[0]["hop_count"], 2)
+        different_routes = (
+            (),
+            tuple(reversed(hops)),
+            (hops[0], {**hops[1], "port": 2201}),
+            (hops[0], {**hops[1], "username": "another"}),
+            ({**hops[0], "fingerprint": "SHA256:" + "A" * 43}, hops[1]),
+        )
+        for different in different_routes:
+            wrong = Credential(hops=different)
+            with self.subTest(route=different), self.assertRaises(JobError) as raised:
+                second.resume(request_id, target_options=self.options(),
+                              reviewed_fingerprint=FINGERPRINT, credential=wrong,
+                              session_token=BEARER)
+            self.assertEqual(raised.exception.code, "HOST_KEY_MISMATCH")
+            self.assertTrue(wrong.wiped)
+            self.assertEqual(len(self.created), 1)
+
+        fresh = Credential("new-ssh-secret", hops=hops)
+        review = second.resume(request_id, target_options=self.options(),
+                               reviewed_fingerprint=FINGERPRINT, credential=fresh,
+                               session_token=BEARER)
+        self.assertEqual(review["hop_count"], 2)
+        active = second.apply(request_id, review["revision"])
+        self.assertEqual(active["phase"], "active")
+        self.assertEqual(active["hop_count"], 2)
+        self.assertTrue(fresh.wiped)
         self.assert_secretless(second)
 
     def test_failed_apply_is_recoverable_and_cleanup_is_explicit(self):

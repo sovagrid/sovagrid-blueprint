@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import fcntl
 import hashlib
 import hmac
@@ -45,6 +45,11 @@ _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _BUNDLE_NAME = re.compile(r"source-([0-9a-f]{64})\.tar\.gz\Z")
 _BEARER = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
+_CHAIN_ALIAS = re.compile(r"sg-r([2-9]|1[0-6])-[a-z2-7]{52}\Z")
+MIN_CHAIN_HOPS = 2
+MAX_CHAIN_HOPS = 16
+_ROUTE_FIELDS = ("host", "user", "port", "jump_host", "jump_user", "jump_port",
+                 "host_key_alias", "jump_host_key_alias")
 _PHASES = frozenset({"prepared", "transport_ready", "registered", "active"})
 _MAX_BUNDLE = 64 * 1024 * 1024
 _LEASE_SECONDS = 600
@@ -132,6 +137,8 @@ def _public_record(record: dict) -> dict:
     phase = record.get("phase")
     if phase not in _PHASES:
         raise JobError("INVALID_JOURNAL")
+    alias = record["target_connection"]["host_key_alias"]
+    chain = _CHAIN_ALIAS.fullmatch(alias or "")
     return {"protocol": 1, "request_id": _uuid(record.get("request_id")),
             "name": record.get("name"), "phase": phase,
             "revision": record.get("revision"),
@@ -139,7 +146,8 @@ def _public_record(record: dict) -> dict:
             "cleanup_required": record.get("cleanup_required") is True,
             "server_id": target.get("server_id"),
             "registration_state": registration.get("state"),
-            "recoverable": phase != "active" or record.get("cleanup_required") is True}
+            "recoverable": phase != "active" or record.get("cleanup_required") is True,
+            **({"hop_count": int(chain[1])} if chain else {})}
 
 
 def _unique_json_object(pairs):
@@ -338,17 +346,35 @@ class WebAgentJobs:
         finally:
             self._operation_lock.release()
 
-    def _binding(self, target_options, fingerprint, credential) -> ControllerBinding:
+    def _binding_options(self, target_options, fingerprint, credential):
         alias = _alias(fingerprint)
         if not isinstance(target_options, self._options_class):
             raise JobError("INVALID_TARGET")
         try:
             options = target_options.validated()
+            hops = getattr(credential, "hops", ())
+            if hops:
+                if (not MIN_CHAIN_HOPS <= len(hops) <= MAX_CHAIN_HOPS or options.ssh_hops or
+                        options.identity is not None or options.jump_identity is not None):
+                    raise ValueError("invalid logical chain")
+                endpoint = [options.host, options.port, options.user, fingerprint]
+                ordered = []
+                for hop in hops:
+                    pin = hop["fingerprint"]
+                    _alias(pin)
+                    node = self._options_class(host=hop["host"], port=hop["port"],
+                                               user=hop["username"]).validated()
+                    ordered.append([node.host, node.port, node.user, pin])
+                identity = json.dumps([1, endpoint, ordered], separators=(",", ":")).encode("ascii")
+                digest = base64.b32encode(hashlib.sha256(identity).digest()).decode("ascii").rstrip("=").lower()
+                alias = f"sg-r{len(ordered)}-{digest}"
         except (ValueError, TypeError, OSError):
             raise JobError("INVALID_TARGET") from None
         if options.host_key_alias not in (None, alias):
             raise JobError("HOST_KEY_MISMATCH")
-        options = self._options_class(**{**asdict(options), "host_key_alias": alias}).validated()
+        return replace(options, host_key_alias=alias)
+
+    def _binding(self, options, fingerprint, credential) -> ControllerBinding:
         binding = None
         try:
             binding = self._factory(target_options=options, fingerprint=fingerprint,
@@ -358,6 +384,9 @@ class WebAgentJobs:
             effective = binding.target_options.validated()
             stable = set(asdict(options)) - {"identity", "jump_identity"}
             if any(getattr(effective, key) != getattr(options, key) for key in stable):
+                raise JobError("INVALID_FACTORY")
+            if _CHAIN_ALIAS.fullmatch(options.host_key_alias) and (
+                    effective.identity is not None or effective.jump_identity is not None):
                 raise JobError("INVALID_FACTORY")
             return binding
         except JobError:
@@ -574,11 +603,12 @@ class WebAgentJobs:
             pending = [row for row in rows if row["phase"] != "active" or row["cleanup_required"]]
             if pending:
                 raise JobError("RECOVERY_REQUIRED", pending[0]["request_id"])
+            options = self._binding_options(target_options, reviewed_fingerprint, credential)
             self._release()
             bundle_path = self._bundle()
             self._retire_completed(rows)
             try:
-                binding = self._binding(target_options, reviewed_fingerprint, credential)
+                binding = self._binding(options, reviewed_fingerprint, credential)
             except Exception:
                 self._wipe(credential)
                 raise
@@ -629,25 +659,21 @@ class WebAgentJobs:
                 raise JobError("NOT_FOUND")
             if record["phase"] == "active" and not record["cleanup_required"]:
                 raise JobError("ALREADY_ACTIVE", request_id)
-            if not hmac.compare_digest(record["target_connection"]["host_key_alias"] or "", _alias(reviewed_fingerprint)):
+            saved = record["target_connection"]
+            options = self._binding_options(target_options, reviewed_fingerprint, credential)
+            if not hmac.compare_digest(saved["host_key_alias"] or "", options.host_key_alias):
                 raise JobError("HOST_KEY_MISMATCH", request_id)
+            if any(getattr(options, key) != saved[key] for key in _ROUTE_FIELDS):
+                raise JobError("TARGET_CHANGED", request_id)
             self._release()
             saved_bundle = record["bundle"]
             bundle_path = self._bundle(Path(saved_bundle["path"]), saved_bundle["sha256"])
             try:
-                binding = self._binding(target_options, reviewed_fingerprint, credential)
+                binding = self._binding(options, reviewed_fingerprint, credential)
             except Exception:
                 self._wipe(credential)
                 raise
-            saved = record["target_connection"]
             options = binding.target_options
-            if any(getattr(options, key) != saved[key] for key in
-                   ("host", "user", "port", "jump_host", "jump_user", "jump_port", "host_key_alias", "jump_host_key_alias")):
-                try:
-                    self._close(binding)
-                finally:
-                    self._wipe(credential)
-                raise JobError("TARGET_CHANGED", request_id)
             live = _Live(binding, credential, request_id, self._monotonic() + _LEASE_SECONDS)
             with self._state_lock:
                 self._live = live

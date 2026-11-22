@@ -23,8 +23,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "vendor/connect"))
 sys.path.insert(0, str(ROOT / "deploy"))
 
-from web_agent_target_ssh import (AskpassBroker, HostKeyChanged, PinnedTargetSSH, TargetSSHError,
-                                  MAX_SCAN, _jump_proxy_client, _probe_jumped_target_host_key,
+from sovagrid_connect.core import ConnectionOptions
+from web_agent_target_ssh import (AskpassBroker, HostKeyChanged, PinnedChainSSH, PinnedTargetSSH, TargetSSHError,
+                                  MAX_SCAN, _askpass_client, _chain_proxy_client, _jump_proxy_client,
+                                  _probe_jumped_target_host_key,
                                   _read_bounded_probe_diagnostic,
                                   host_key_alias, reviewed_key_blob,
                                   reviewed_public_key)
@@ -102,6 +104,17 @@ class ReviewedKeyTests(unittest.TestCase):
 
 
 class AskpassTests(unittest.TestCase):
+    def test_askpass_accepts_a_fragmented_local_response(self):
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = connection
+        connection.recv.side_effect = [b"OK\n", b"only-th", b"is-node\n"]
+        with mock.patch.dict(os.environ, {"SOVAGRID_WEB_AGENT_ASKPASS_SOCKET": "/run/fixture/socket",
+                                         "SOVAGRID_WEB_AGENT_ASKPASS_NONCE": "a" * 32}), \
+             mock.patch("web_agent_target_ssh.socket.socket", return_value=connection), \
+             mock.patch("web_agent_target_ssh.os.write") as write:
+            self.assertEqual(_askpass_client("fixture's password: "), 0)
+        write.assert_called_once_with(1, b"only-this-node\n")
+
     def test_one_password_answer_per_ssh_child_and_no_otp_answer(self):
         with tempfile.TemporaryDirectory() as directory:
             broker = AskpassBroker(Path(directory) / "broker.sock", "password", "private-test-password",
@@ -372,6 +385,118 @@ class TransportTests(unittest.TestCase):
                     "Enter passphrase for key '/run/id':"), b"OK\nrelay-phrase\n")
                 probe.assert_called_once_with(transport.config_path, transport.jump_broker,
                                               target_fp)
+
+
+class ChainTransportTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.login = [
+            self.node("entry.example", 2241, "entry", 8),
+            self.node("relay.example", 2252, "relay", 9, key=True),
+            self.node("127.0.0.1", 2263, "root", 10),
+        ]
+        self.options = ConnectionOptions(host="127.0.0.1", port=2263, user="root",
+                                         host_key_alias="sg-r2-" + "a" * 52).validated()
+
+    @staticmethod
+    def node(host, port, user, seed, *, key=False):
+        blob, fingerprint = fixture_key(seed)
+        return {"host": host, "port": port, "username": user, "fingerprint": fingerprint,
+                "method": "private_key" if key else "password",
+                "password": "" if key else f"{user}-password",
+                "private_key": "fake encrypted test key" if key else "",
+                "passphrase": "relay-passphrase" if key else "", "host_key_blob": blob}
+
+    def transport(self, *, scanner=None):
+        first = self.login[0]
+        if scanner is None:
+            scanner = mock.Mock(return_value=f"entry.example ssh-ed25519 {first['host_key_blob']}\n".encode())
+        args = self.login[-1].copy()
+        args["target_host_key_blob"] = args.pop("host_key_blob")
+        return PinnedChainSSH(logical_options=self.options, hops=self.login[:-1], **args,
+                              scanner=scanner, runtime_root=self.root, require_root=False,
+                              peer_uid=lambda _s: os.geteuid())
+
+    def test_rejects_a_later_blob_before_the_first_scan(self):
+        scanner = mock.Mock()
+        self.login[1]["host_key_blob"] = self.login[0]["host_key_blob"]
+        with self.assertRaises(TargetSSHError):
+            self.transport(scanner=scanner)
+        scanner.assert_not_called()
+
+    def test_changed_first_key_refuses_before_creating_askpass(self):
+        scanner = mock.Mock(return_value=f"entry.example ssh-ed25519 {self.login[1]['host_key_blob']}\n".encode())
+        with mock.patch("web_agent_target_ssh.AskpassBroker") as broker:
+            with self.assertRaises(HostKeyChanged), self.transport(scanner=scanner):
+                self.fail("changed key must not open")
+        broker.assert_not_called()
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_mixed_credentials_are_bound_to_one_node_and_private_file(self):
+        with mock.patch("web_agent_target_ssh._probe_target_host_key") as probe, self.transport() as transport:
+            folder = transport.config_path.parent
+            _config_path, probe_env, target_fp = probe.call_args.args
+            nonce_key = "SOVAGRID_WEB_AGENT_HOP_ASKPASS_NONCES"
+            nonce_label = "SOVAGRID_WEB_AGENT_ASKPASS_NONCE"
+            socket_label = "SOVAGRID_WEB_AGENT_ASKPASS_SOCKET"
+            self.assertEqual(target_fp, self.login[-1]["fingerprint"])
+            self.assertEqual(len(probe_env[nonce_key].split(":")), 2)
+            self.assertNotIn(nonce_label, probe_env)
+            self.assertNotIn(socket_label, probe_env)
+            self.assertEqual(transport.options, self.options)
+            for index, node in enumerate(self.login):
+                known_hosts = folder / f"k{index}"
+                self.assertEqual(known_hosts.read_text(),
+                                 f"{host_key_alias(node['fingerprint'])} ssh-ed25519 {node['host_key_blob']}\n")
+                self.assertEqual(stat.S_IMODE(known_hosts.stat().st_mode), 0o600)
+                config = subprocess.run(["/usr/bin/ssh", "-G", "-F", str(folder / f"c{index}"), "sovagrid-target"],
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, text=True).stdout
+                self.assertIn("stricthostkeychecking true", config)
+                if index:
+                    self.assertIn(f"proxycommand {folder / 'proxy'} {index - 1}", config.replace("'", ""))
+            self.assertEqual(stat.S_IMODE((folder / "i1").stat().st_mode), 0o600)
+            self.assertEqual((folder / "i1").read_text(), self.login[1]["private_key"])
+            self.assertFalse((folder / "i0").exists())
+            self.assertFalse((folder / "i2").exists())
+
+            environment = transport._ssh_environment(str(transport.launcher_path))
+            target_nonce = environment[nonce_label]
+            first, second = environment[nonce_key].split(":")
+
+            class Replaced(BaseException): pass
+
+            def capture(index, environment):
+                observed = {}
+
+                def fake_exec(_path, arguments, child):
+                    observed.update(env=child, argv=arguments)
+                    raise Replaced
+
+                with mock.patch.dict(os.environ, environment, clear=True), \
+                     mock.patch("web_agent_target_ssh.os.dup2"), \
+                     mock.patch("web_agent_target_ssh.os.execve", side_effect=fake_exec):
+                    with self.assertRaises(Replaced):
+                        _chain_proxy_client(str(folder), str(index))
+                return observed["argv"], observed["env"]
+
+            argv, second_env = capture(1, environment)
+            self.assertEqual(argv[argv.index("-W") + 1], "127.0.0.1:2263")
+            self.assertEqual(second_env[nonce_key], first)
+            self.assertEqual(second_env[nonce_label], second)
+            self.assertNotIn(target_nonce, second_env.values())
+            self.assertEqual(challenge(Path(second_env[socket_label]), second, "Enter passphrase for key"),
+                             b"OK\nrelay-passphrase\n")
+            argv, first_env = capture(0, second_env)
+            self.assertEqual(argv[argv.index("-W") + 1], "relay.example:2252")
+            self.assertNotIn(nonce_key, first_env)
+            self.assertEqual(first_env[nonce_label], first)
+            self.assertEqual(challenge(Path(first_env[socket_label]), first, "entry's password:"),
+                             b"OK\nentry-password\n")
+            self.assertEqual(challenge(Path(environment[socket_label]), target_nonce, "root's password:"),
+                             b"OK\nroot-password\n")
+        self.assertFalse(folder.exists())
 
 
 class JumpedTargetProbeTests(unittest.TestCase):

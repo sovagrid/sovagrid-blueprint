@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+import base64
 from contextlib import nullcontext
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -104,6 +107,20 @@ def jump_login_payload():
                      "passphrase": "", "host_key_blob": "public-jump-blob"}}
 
 
+def chain_login_payload():
+    def node(host, port, secret_number):
+        algorithm = b"ssh-ed25519"
+        wire = (struct.pack(">I", len(algorithm)) + algorithm +
+                struct.pack(">I", 32) + bytes([secret_number]) * 32)
+        return {**login_payload(), "host": host, "port": port,
+                "host_key_blob": base64.b64encode(wire).decode("ascii"),
+                "fingerprint": "SHA256:" + base64.b64encode(hashlib.sha256(wire).digest())
+                .decode("ascii").rstrip("=")}
+
+    return {**node("target.example", 2222, 1),
+            "hops": [node("entry.example", 22, 2), node("relay.internal", 2200, 3)]}
+
+
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.jobs = FakeJobs()
@@ -167,6 +184,72 @@ class ServiceTests(unittest.TestCase):
             service.dispatch(self.jobs, request("prepare", payload), authorize=lambda token: None)
         self.assertEqual(payload["password"], "")
         self.assertEqual(jump["password"], "")
+
+    def test_chain_capability_checks_admin_and_installed_transport(self):
+        authorized = []
+        with patch.object(service.web_agent_target_ssh, "PinnedChainSSH", None, create=True):
+            with self.assertRaises(service.JobError) as error:
+                service.dispatch(self.jobs, request("capabilities", {}), authorize=authorized.append)
+            self.assertEqual(error.exception.code, "RUNTIME_UNAVAILABLE")
+        with patch.object(service.web_agent_target_ssh, "PinnedChainSSH", object, create=True):
+            result = service.dispatch(self.jobs, request("capabilities", {}), authorize=authorized.append)
+            self.assertEqual(result, {"protocol": 1, "max_hops": 16, "max_body_bytes": 1228800})
+            with self.assertRaises(service.RequestError):
+                service.dispatch(self.jobs, request("capabilities", {"host": "target.example"}),
+                                 authorize=authorized.append)
+        self.assertEqual(authorized, [TOKEN] * 3)
+        self.assertEqual(self.jobs.calls, [])
+
+    def test_chain_prepare_resume_accept_ordered_credentials_and_scrub_them(self):
+        for action, fields in (("prepare", {"name": "Remote", "hub_host": "192.0.2.1",
+                                          "hub_port": 22, "local_port": 18767}),
+                               ("resume", {"request_id": "recovery"})):
+            with self.subTest(action=action):
+                payload = chain_login_payload() | fields
+                service.dispatch(self.jobs, request(action, payload), authorize=lambda _token: None)
+                options = self.jobs.calls[-1][-1]["target_options"]
+                self.assertEqual(options.host, "target.example")
+                self.assertIsNone(options.jump_host)
+                credential = self.jobs.calls[-1][-1]["credential"]
+                self.assertEqual(tuple(hop["host"] for hop in credential.hops),
+                                 ("entry.example", "relay.internal"))
+                self.assertEqual(credential.password, "")
+                for hop in (*payload["hops"], *credential.hops):
+                    self.assertEqual(hop["password"], "")
+                self.assertEqual(payload["password"], "")
+
+    def test_chain_rejects_mixed_routes_unpinned_hops_and_invalid_fields(self):
+        mutations = (
+            lambda payload: payload.update(jump=jump_login_payload()["jump"]),
+            lambda payload: payload["hops"].pop(),
+            lambda payload: payload["hops"].extend(payload["hops"] * 8),
+            lambda payload: payload["hops"][1].update(unsafe="extra"),
+            lambda payload: payload["hops"][1].update(port=True),
+            lambda payload: payload["hops"][1].update(host_key_blob=payload["host_key_blob"]),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                payload = chain_login_payload() | {"request_id": "recovery"}
+                mutate(payload)
+                with self.assertRaises(service.RequestError) as error:
+                    service.dispatch(self.jobs, request("resume", payload), authorize=lambda _token: None)
+                self.assertEqual(error.exception.code, "INVALID_INPUT")
+                self.assertEqual(payload["password"], "")
+                for hop in payload["hops"]:
+                    self.assertEqual(hop["password"], "")
+        self.assertEqual(self.jobs.calls, [])
+
+    def test_chain_auth_rejection_scrubs_all_credentials(self):
+        payload = chain_login_payload() | {"request_id": "recovery"}
+
+        def deny(_token):
+            raise service.RequestError("ADMIN_FORBIDDEN")
+
+        with self.assertRaises(service.RequestError):
+            service.dispatch(self.jobs, request("resume", payload), authorize=deny)
+        self.assertEqual(payload["password"], "")
+        self.assertEqual([hop["password"] for hop in payload["hops"]], ["", ""])
+        self.assertEqual(self.jobs.calls, [])
 
     def test_auth_runs_before_any_job(self):
         with self.assertRaises(service.RequestError) as error:
@@ -409,6 +492,24 @@ class ServiceTests(unittest.TestCase):
                          {"ok": True, "result": []})
         self.assertEqual(self._socket_reply(b"{" + b"x" * (service._MAX_REQUEST + 1) + b"\n")["error"],
                          "INVALID_INPUT")
+
+    def test_broker_allows_larger_lines_only_for_chain_requests(self):
+        def encoded(action, payload):
+            return (json.dumps(request(action, payload)) + "\n").encode()
+
+        payload = chain_login_payload() | {"request_id": "recovery"}
+        for node in (payload, *payload["hops"]):
+            node.update(method="private_key", password="", private_key="x" * 65536)
+        chain = encoded("resume", payload)
+        self.assertGreater(len(chain), service._MAX_REQUEST)
+        self.assertLessEqual(len(chain), service._MAX_CHAIN_REQUEST)
+        self.assertEqual(self._socket_reply(chain)["ok"], True)
+        self.assertEqual(self._socket_reply(encoded("list", {"hops": ["x" * service._MAX_REQUEST]})),
+                         {"ok": False, "error": "INVALID_INPUT"})
+        self.assertEqual(self._socket_reply(chain.rstrip(b"\n") +
+                                            b" " * service._MAX_CHAIN_REQUEST + b"\n"),
+                         {"ok": False, "error": "INVALID_INPUT"})
+        self.assertEqual(len(self.jobs.calls), 1)
 
     def test_socket_preserves_host_key_changed_error_code(self):
         def changed(**_kwargs):

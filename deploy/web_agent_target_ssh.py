@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -48,6 +49,11 @@ MAX_ASKPASS_REQUEST = 2048
 HOST_KEY_DIAGNOSTIC = re.compile(
     rb"^debug1: Server host key: (ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)) "
     rb"(SHA256:[A-Za-z0-9+/]{43})\r?$", re.MULTILINE)
+_HOP_NONCES = "SOVAGRID_WEB_AGENT_HOP_ASKPASS_NONCES"
+_ASKPASS_SOCKET = "SOVAGRID_WEB_AGENT_ASKPASS_SOCKET"
+_ASKPASS_NONCE = "SOVAGRID_WEB_AGENT_ASKPASS_NONCE"
+_CHAIN_LOGIN = frozenset({"host", "port", "username", "fingerprint", "method",
+                         "password", "private_key", "passphrase", "host_key_blob"})
 
 
 class TargetSSHError(RuntimeError):
@@ -222,6 +228,13 @@ def _probe_jumped_target_host_key(config: Path, jump_broker: "AskpassBroker",
     environment["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_SOCKET"] = str(jump_broker.path)
     environment["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_NONCE"] = nonce
     environment["SOVAGRID_WEB_AGENT_TARGET_PROBE"] = "1"
+    try:
+        _probe_target_host_key(config, environment, fingerprint)
+    finally:
+        jump_broker.disarm()
+
+
+def _probe_target_host_key(config: Path, environment: dict, fingerprint: str) -> None:
     argv = ["/usr/bin/ssh", "-F", str(config), "-v", "-N", "-T",
             "-o", "BatchMode=yes", "-o", "PreferredAuthentications=none",
             "-o", "ClearAllForwardings=yes",
@@ -236,8 +249,6 @@ def _probe_jumped_target_host_key(config: Path, jump_broker: "AskpassBroker",
         diagnostic = _read_bounded_probe_diagnostic(process)
     except OSError:
         raise TargetSSHError("SSH-ключ сервера не удалось получить.") from None
-    finally:
-        jump_broker.disarm()
     if not isinstance(diagnostic, bytes) or len(diagnostic) > MAX_SCAN:
         raise TargetSSHError("SSH-ключ сервера не удалось подтвердить.")
     matches = HOST_KEY_DIAGNOSTIC.findall(diagnostic)
@@ -387,18 +398,13 @@ def _askpass_client(prompt: str) -> int:
                 return 1
             connection.sendall(request + b"\n")
             response = bytearray()
-            while len(response) <= MAX_SECRET + 7 and b"\n" not in response:
-                part = connection.recv(MAX_SECRET + 8 - len(response))
+            while len(response) <= MAX_SECRET + 4 and response.count(b"\n") < 2:
+                part = connection.recv(MAX_SECRET + 5 - len(response))
                 if not part:
                     break
                 response.extend(part)
-            if not response.startswith(b"OK\n"):
+            if not response.startswith(b"OK\n") or response.count(b"\n") != 2:
                 return 1
-            while not response.endswith(b"\n") and len(response) <= MAX_SECRET + 5:
-                part = connection.recv(MAX_SECRET + 6 - len(response))
-                if not part:
-                    break
-                response.extend(part)
             secret = response[3:]
             if not secret.endswith(b"\n") or not 2 <= len(secret) <= MAX_SECRET + 1:
                 return 1
@@ -700,6 +706,30 @@ class PinnedTargetSSH:
         rpc._installer = _HeadlessInstaller(options, self, popen=rpc._spawn)
         return rpc
 
+    def _ssh_environment(self, helper: str) -> dict:
+        nonce = self.broker.arm()
+        try:
+            jump_nonce = self.jump_broker.arm() if self._jump is not None else None
+        except Exception:
+            self.broker.disarm()
+            raise
+        environment = os.environ.copy()
+        environment.pop("SSH_AUTH_SOCK", None)
+        environment["SSH_ASKPASS"] = helper
+        environment["SSH_ASKPASS_REQUIRE"] = "force"
+        environment[_ASKPASS_SOCKET] = str(self.broker.path)
+        environment[_ASKPASS_NONCE] = nonce
+        if jump_nonce is not None:
+            environment["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_SOCKET"] = str(self.jump_broker.path)
+            environment["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_NONCE"] = jump_nonce
+        return environment
+
+    def _disarm(self) -> None:
+        if self._broker is not None:
+            self._broker.disarm()
+        if self._jump_broker is not None:
+            self._jump_broker.disarm()
+
     def restore_controller(self, **kwargs):
         """Use the shared restore protocol with this exact pinned SSH route."""
         from sovagrid_connect.portable_restore import PortableRestoreController
@@ -710,10 +740,237 @@ class PinnedTargetSSH:
         return controller
 
 
+def _chain_proxy_client(directory: str, node_index: str) -> int:
+    """Use the capability for this proxy and keep only its preceding route."""
+    if re.fullmatch(r"[0-9]{1,2}", node_index) is None:
+        return 1
+    index = int(node_index)
+    try:
+        folder = Path(directory)
+        info = folder.lstat()
+        if (not folder.is_absolute() or not stat.S_ISDIR(info.st_mode) or
+                info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700):
+            return 1
+        config, route, helper = folder / f"c{index}", folder / f"r{index}", folder / "askpass"
+        for path, mode in ((config, 0o600), (route, 0o600), (helper, 0o700)):
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+                    stat.S_IMODE(info.st_mode) != mode or info.st_nlink != 1):
+                return 1
+        if route.stat().st_size > 1024:
+            return 1
+        endpoint = json.loads(route.read_bytes())
+        if (type(endpoint) is not list or len(endpoint) != 2 or
+                not isinstance(endpoint[0], str) or re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", endpoint[0]) is None or
+                type(endpoint[1]) is not int or not 1 <= endpoint[1] <= 65535):
+            return 1
+        environment = os.environ.copy()
+        nonces = environment.pop(_HOP_NONCES, "").split(":")
+        if (not 0 <= index < 16 or len(nonces) != index + 1 or
+                any(re.fullmatch(r"[0-9a-f]{32}", nonce) is None for nonce in nonces)):
+            return 1
+        environment.update({
+            _ASKPASS_SOCKET: str(folder / f"a{index}"),
+            _ASKPASS_NONCE: nonces[-1],
+            "SSH_ASKPASS": str(helper),
+            "SSH_ASKPASS_REQUIRE": "force",
+        })
+        environment.pop("SSH_AUTH_SOCK", None)
+        if index:
+            environment[_HOP_NONCES] = ":".join(nonces[:-1])
+        host, port = endpoint
+        destination = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        argv = ["/usr/bin/ssh", "-F", str(config), "-T", "-o", "BatchMode=no",
+                "-o", "ClearAllForwardings=yes", "-W", destination, "sovagrid-target"]
+        # Only the final OpenSSH client can report the key-exchange proof.
+        with open(os.devnull, "wb") as sink:
+            os.dup2(sink.fileno(), 2)
+            os.execve(argv[0], argv, environment)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return 1
+    return 1
+
+
+@dataclass(repr=False)
+class _ChainNode:
+    options: object
+    fingerprint: str
+    kind: str
+    blob: str
+    method: str
+    secret: str
+    private_key: str
+
+    @classmethod
+    def from_login(cls, data: dict) -> "_ChainNode":
+        from sovagrid_connect.core import ConnectionOptions
+
+        if type(data) is not dict or set(data) != _CHAIN_LOGIN:
+            raise TargetSSHError("Неверный промежуточный SSH-маршрут.")
+        blob, fingerprint = data["host_key_blob"], data["fingerprint"]
+        kind, blob = reviewed_key_blob(blob, fingerprint)
+        method, password, key, phrase = (data[name] for name in
+                                          ("method", "password", "private_key", "passphrase"))
+        if method not in ("password", "private_key") or not all(
+                isinstance(value, str) for value in (password, key, phrase)):
+            raise TargetSSHError("Неверный способ SSH-входа.")
+        secret = password if method == "password" else phrase
+        if ((method == "password" and (not password or key or phrase)) or
+                (method == "private_key" and (password or not key or len(key.encode("utf-8")) > 65536 or "\x00" in key)) or
+                len(secret.encode("utf-8")) > MAX_SECRET or any(char in secret for char in "\r\n\x00")):
+            raise TargetSSHError("Неверные данные SSH-входа.")
+        try:
+            options = ConnectionOptions(host=data["host"], user=data["username"], port=data["port"],
+                                        host_key_alias=host_key_alias(fingerprint)).validated()
+        except (ValueError, TypeError, AttributeError, OSError):
+            raise TargetSSHError("Неверный адрес, порт или пользователь SSH.") from None
+        return cls(options, fingerprint, kind, blob, method, secret, key)
+
+
+class PinnedChainSSH:
+    """Physical pins and credentials stay in the live transport, separate from journal options."""
+
+    def __init__(self, *, logical_options, hops, host, port, username, fingerprint,
+                 method, password="", private_key="", passphrase="", target_host_key_blob,
+                 runtime_root: Path = Path("/run"), require_root: bool = True,
+                 scanner=_scan, peer_uid=_peer_uid, python: str = "/usr/bin/python3"):
+        from sovagrid_connect.core import ConnectionOptions
+        from sovagrid_connect.ssh_route import MAX_SSH_HOPS
+
+        if require_root and (os.geteuid() != 0 or runtime_root != Path("/run")):
+            raise TargetSSHError("Установщик Agent должен работать на хосте Hub от root.")
+        if not isinstance(hops, (list, tuple)) or not 2 <= len(hops) <= MAX_SSH_HOPS:
+            raise TargetSSHError("Неверный промежуточный SSH-маршрут.")
+        target = _ChainNode.from_login(dict(host=host, port=port, username=username,
+            fingerprint=fingerprint, method=method, password=password, private_key=private_key,
+            passphrase=passphrase, host_key_blob=target_host_key_blob))
+        if (type(logical_options) is not ConnectionOptions or logical_options.ssh_hops or
+                logical_options.identity is not None or (logical_options.host, logical_options.port,
+                logical_options.user) != (target.options.host, target.options.port, target.options.user) or
+                re.fullmatch(rf"sg-r{len(hops)}-[a-z2-7]{{52}}", logical_options.host_key_alias or "") is None):
+            raise TargetSSHError("SSH-маршрут установки изменился.")
+        self.options = logical_options
+        self._nodes = tuple(_ChainNode.from_login(hop) for hop in hops) + (target,)
+        self._root, self._scanner, self._peer_uid, self._python = runtime_root, scanner, peer_uid, python
+        self._temporary = None
+        self._brokers: list[AskpassBroker] = []
+        self.config_path: Path | None = None
+        self.launcher_path: Path | None = None
+
+    def __enter__(self) -> "PinnedChainSSH":
+        if not self._nodes or self._temporary is not None:
+            raise TargetSSHError("Нельзя повторно открыть этот SSH-транспорт.")
+        try:
+            info = self._root.stat()
+            if not stat.S_ISDIR(info.st_mode) or (os.geteuid() == 0 and
+                    (info.st_uid != 0 or info.st_mode & 0o022)):
+                raise TargetSSHError("Небезопасный временный каталог SSH.")
+            first = self._nodes[0]
+            scanned = self._scanner(first.options.host, first.options.port)
+            if reviewed_public_key(scanned, first.fingerprint) != (first.kind, first.blob):
+                raise HostKeyChanged("SSH-ключ промежуточного хоста изменился.")
+            self._temporary = tempfile.TemporaryDirectory(prefix="sg-ssh-", dir=self._root)
+            folder = Path(self._temporary.name)
+            os.chmod(folder, 0o700)
+            command = f"exec {shlex.quote(self._python)} -I {shlex.quote(str(Path(__file__).resolve()))}"
+            self.launcher_path = folder / "askpass"
+            _write_private(self.launcher_path, f'#!/bin/sh\n{command} --askpass "$@"\n'.encode(), 0o700)
+            proxy = folder / "proxy"
+            _write_private(proxy,
+                           f'#!/bin/sh\n{command} --chain-proxy {shlex.quote(str(folder))} "$1"\n'.encode(), 0o700)
+            for index, node in enumerate(self._nodes):
+                self._write_config(folder, node, index, proxy)
+                self._brokers.append(AskpassBroker(folder / f"a{index}", node.method, node.secret,
+                                                   peer_uid=self._peer_uid))
+                if index < len(self._nodes) - 1:
+                    following = self._nodes[index + 1].options
+                    _write_private(folder / f"r{index}", json.dumps([following.host, following.port]).encode())
+            self.config_path = folder / f"c{len(self._nodes) - 1}"
+            _probe_target_host_key(self.config_path, self._environment(include_target=False),
+                                   self._nodes[-1].fingerprint)
+            self._disarm()
+            self._nodes = ()
+            return self
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _write_config(folder, node, index, proxy) -> None:
+        from sovagrid_connect.core import _ssh_config
+
+        known_hosts = folder / f"k{index}"
+        _write_private(known_hosts, f"{node.options.host_key_alias} {node.kind} {node.blob}\n".encode("ascii"))
+        options = node.options
+        if node.method == "private_key":
+            identity = folder / f"i{index}"
+            _write_private(identity, node.private_key.encode("utf-8"))
+            options = replace(options, identity=str(identity))
+        authentication = ("    PubkeyAuthentication no\n" if node.method == "password" else
+                          "    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n")
+        config = ("Host *\n"
+                  f"    UserKnownHostsFile {shlex.quote(str(known_hosts))}\n"
+                  "    GlobalKnownHostsFile /dev/null\n"
+                  "    VerifyHostKeyDNS no\n"
+                  "    CanonicalizeHostname no\n"
+                  "    IdentityAgent none\n"
+                  "    NumberOfPasswordPrompts 1\n"
+                  "    ConnectionAttempts 1\n" + authentication + _ssh_config(options))
+        if index:
+            config += f"    ProxyCommand {shlex.quote(str(proxy))} {index - 1}\n"
+        _write_private(folder / f"c{index}", config.encode("utf-8"))
+
+    def _environment(self, *, include_target: bool) -> dict:
+        environment = os.environ.copy()
+        for name in ("SSH_AUTH_SOCK", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", _ASKPASS_SOCKET, _ASKPASS_NONCE,
+                     _HOP_NONCES, "SOVAGRID_WEB_AGENT_JUMP_ASKPASS_SOCKET",
+                     "SOVAGRID_WEB_AGENT_JUMP_ASKPASS_NONCE", "SOVAGRID_WEB_AGENT_TARGET_PROBE"):
+            environment.pop(name, None)
+        try:
+            environment[_HOP_NONCES] = ":".join(broker.arm() for broker in self._brokers[:-1])
+            if include_target:
+                broker = self._brokers[-1]
+                environment.update({"SSH_ASKPASS": str(self.launcher_path), "SSH_ASKPASS_REQUIRE": "force",
+                                    _ASKPASS_SOCKET: str(broker.path), _ASKPASS_NONCE: broker.arm()})
+            return environment
+        except BaseException:
+            self._disarm()
+            raise
+
+    def _ssh_environment(self, _helper: str) -> dict:
+        return self._environment(include_target=True)
+
+    def _disarm(self) -> None:
+        for broker in self._brokers:
+            broker.disarm()
+
+    def close(self) -> None:
+        self._nodes = ()
+        self.config_path = self.launcher_path = None
+        for broker in self._brokers:
+            broker.close()
+        self._brokers.clear()
+        if self._temporary is not None:
+            self._temporary.cleanup()
+            self._temporary = None
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def target_rpc(self, options, *, progress=None):
+        from sovagrid_connect.agent_rpc import AgentRPC
+
+        if self.config_path is None or self.launcher_path is None or options != self.options:
+            raise TargetSSHError("SSH-маршрут установки изменился.")
+        rpc = AgentRPC(options, role="target", progress=progress)
+        rpc._installer = _HeadlessInstaller(options, self, popen=rpc._spawn)
+        return rpc
+
+
 class _HeadlessInstaller:
     """Only the two methods AgentRPC uses from ServerInstaller."""
 
-    def __init__(self, options, transport: PinnedTargetSSH, *, popen):
+    def __init__(self, options, transport: PinnedTargetSSH | PinnedChainSSH, *, popen):
         self.options = options
         self.transport = transport
         self._popen = popen
@@ -724,28 +981,17 @@ class _HeadlessInstaller:
     def _session(self):
         if self.transport.config_path is None or self.transport.launcher_path is None:
             raise TargetSSHError("SSH-транспорт закрыт.")
-        yield str(self.transport.config_path), str(self.transport.launcher_path)
+        try:
+            yield str(self.transport.config_path), str(self.transport.launcher_path)
+        finally:
+            if isinstance(self.transport, PinnedChainSSH):
+                self.transport._disarm()
 
     def _ssh(self, config: str, helper: str, command: str, *, input_file=None, privileged=True):
         from sovagrid_connect.installer import InstallError, _privileged_command
         if config != str(self.transport.config_path) or helper != str(self.transport.launcher_path):
             raise InstallError("Неверная конфигурация SSH.")
-        nonce = self.transport.broker.arm()
-        try:
-            jump_nonce = self.transport.jump_broker.arm() if self.transport._jump is not None else None
-        except Exception:
-            self.transport.broker.disarm()
-            raise
-        environment = os.environ.copy()
-        environment.pop("SSH_AUTH_SOCK", None)
-        environment["SSH_ASKPASS"] = helper
-        environment["SSH_ASKPASS_REQUIRE"] = "force"
-        environment["SOVAGRID_WEB_AGENT_ASKPASS_SOCKET"] = str(self.transport.broker.path)
-        environment["SOVAGRID_WEB_AGENT_ASKPASS_NONCE"] = nonce
-        if jump_nonce is not None:
-            environment["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_SOCKET"] = str(
-                self.transport.jump_broker.path)
-            environment["SOVAGRID_WEB_AGENT_JUMP_ASKPASS_NONCE"] = jump_nonce
+        environment = self.transport._ssh_environment(helper)
         if privileged and self.options.user != "root":
             command = _privileged_command(command)
         argv = ["/usr/bin/ssh", "-F", config, "-T", "-o", "BatchMode=no",
@@ -757,9 +1003,7 @@ class _HeadlessInstaller:
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
             )
         except Exception:
-            self.transport.broker.disarm()
-            if jump_nonce is not None:
-                self.transport.jump_broker.disarm()
+            self.transport._disarm()
             raise InstallError("OpenSSH не удалось запустить.") from None
         with self._lock:
             self._process = process
@@ -781,4 +1025,6 @@ if __name__ == "__main__":
         raise SystemExit(_askpass_client(sys.argv[2]))
     if len(sys.argv) == 3 and sys.argv[1] == "--jump-proxy":
         raise SystemExit(_jump_proxy_client(sys.argv[2]))
+    if len(sys.argv) == 4 and sys.argv[1] == "--chain-proxy":
+        raise SystemExit(_chain_proxy_client(sys.argv[2], sys.argv[3]))
     raise SystemExit(1)

@@ -25,7 +25,7 @@ import threading
 
 _DEPLOY = Path(__file__).resolve().parent
 _BEARER = re.compile(r"[A-Za-z0-9_-]{43}\Z")
-_ACTIONS = frozenset({"prepare", "apply", "resume", "cleanup", "interrupt", "status", "list",
+_ACTIONS = frozenset({"prepare", "apply", "resume", "cleanup", "interrupt", "status", "list", "capabilities",
                       "managed-monitoring-preview", "managed-monitoring-apply",
                       "agent-features-preview", "agent-features-apply",
                       "vpn-source-preview", "vpn-source-apply", "vpn-source-recover",
@@ -35,7 +35,9 @@ _ACTIONS = frozenset({"prepare", "apply", "resume", "cleanup", "interrupt", "sta
                       "restore-import-init", "restore-import-status", "restore-import-chunk", "restore-import-delete",
                       "restore-prepare", "restore-status", "restore-list", "restore-inspect", "restore-preview",
                       "restore-start", "restore-recover", "restore-retry"})
-_MAX_REQUEST = 160 * 1024  # Two bounded private keys on a reviewed jump route.
+_MAX_REQUEST = 160 * 1024  # Legacy non-chain framing, including the newline.
+_MAX_CHAIN_REQUEST = 1280 * 1024  # Includes the gateway envelope and newline.
+_MAX_CHAIN_BODY = 1200 * 1024  # Public HTTP bytes, excluding the broker envelope.
 _MAX_REPLY = 32 * 1024 - 1  # Gateway's 32 KiB limit includes the newline.
 _GATEWAY_UID = 10003
 _PUBLIC_WEB_LOCK = Path("/var/lib/sovagrid/.public-web.lock")
@@ -58,8 +60,9 @@ def _trusted_imports() -> None:
 
 _trusted_imports()
 from web_agent_local_rpc import LocalHubFacade, LocalHubRPC  # noqa: E402
-from web_agent_target_ssh import PinnedTargetSSH, TargetSSHError, host_key_alias  # noqa: E402
-from web_agent_jobs import ControllerBinding, JobError, WebAgentJobs  # noqa: E402
+import web_agent_target_ssh  # noqa: E402
+from web_agent_target_ssh import PinnedTargetSSH, TargetSSHError, host_key_alias, reviewed_key_blob  # noqa: E402
+from web_agent_jobs import ControllerBinding, JobError, MAX_CHAIN_HOPS, MIN_CHAIN_HOPS, WebAgentJobs  # noqa: E402
 from web_vpn_source import VpnSourceError, VpnSourceJobs  # noqa: E402
 from web_wireguard_control import WireguardControlError, WireguardControlJobs  # noqa: E402
 from web_amnezia_provision import AmneziaProvisionError, AmneziaProvisionJobs  # noqa: E402
@@ -102,12 +105,13 @@ class Credential:
 
 
 class RouteCredential(Credential):
-    """An installer route owns two independent, short-lived SSH secrets."""
+    """An installer route owns a short-lived, independent credential per endpoint."""
 
     def __init__(self, payload: dict):
         super().__init__(payload)
         self.target_host_key_blob = ""
         self.jump: dict | None = None
+        self.hops: tuple[dict, ...] = ()
         if "jump" in payload:
             target_blob = payload.get("host_key_blob")
             jump = payload["jump"]
@@ -122,6 +126,21 @@ class RouteCredential(Credential):
                          "host_key_blob": jump["host_key_blob"], "method": second.method,
                          "password": second.password, "private_key": second.private_key,
                          "passphrase": second.passphrase}
+        elif "hops" in payload:
+            self._set_chain(payload)
+
+    def _set_chain(self, payload: dict) -> None:
+        try:
+            for node in (payload, *payload["hops"]):
+                if (not isinstance(node["host"], str) or not isinstance(node["username"], str) or
+                        type(node["port"]) is not int):
+                    raise RequestError("INVALID_INPUT")
+                Credential(node)
+                reviewed_key_blob(node["host_key_blob"], node["fingerprint"])
+        except TargetSSHError:
+            raise RequestError("INVALID_INPUT") from None
+        self.target_host_key_blob = payload["host_key_blob"]
+        self.hops = tuple(dict(hop) for hop in payload["hops"])
 
     def wipe(self) -> None:
         super().wipe()
@@ -129,14 +148,28 @@ class RouteCredential(Credential):
         if self.jump is not None:
             for key in ("password", "private_key", "passphrase"):
                 self.jump[key] = ""
+        for hop in self.hops:
+            _wipe_login(hop)
+
+
+def _chain_transport():
+    transport = getattr(web_agent_target_ssh, "PinnedChainSSH", None)
+    if not callable(transport):
+        raise JobError("RUNTIME_UNAVAILABLE")
+    return transport
 
 
 def _target_factory(*, target_options, fingerprint, credential, journal, progress):
-    transport = PinnedTargetSSH(host=target_options.host, port=target_options.port,
+    target = dict(host=target_options.host, port=target_options.port,
         username=target_options.user, fingerprint=fingerprint, method=credential.method,
         password=credential.password, private_key=credential.private_key,
-        passphrase=credential.passphrase, jump=getattr(credential, "jump", None),
+        passphrase=credential.passphrase,
         target_host_key_blob=getattr(credential, "target_host_key_blob", ""))
+    hops = getattr(credential, "hops", ())
+    if hops:
+        transport = _chain_transport()(logical_options=target_options, hops=hops, **target)
+    else:
+        transport = PinnedTargetSSH(jump=getattr(credential, "jump", None), **target)
     transport.__enter__()
     try:
         tunnel = LocalHubFacade()
@@ -207,16 +240,33 @@ def _vpn_route_credential(payload: object, fields: frozenset[str]) -> RouteCrede
     return RouteCredential(payload)
 
 
+def _enrollment_credential(payload: object, fields: frozenset[str]) -> RouteCredential:
+    if type(payload) is dict and "hops" in payload:
+        _fields(payload, fields | {"host_key_blob", "hops"})
+        hops = payload["hops"]
+        if type(hops) is not list or not MIN_CHAIN_HOPS <= len(hops) <= MAX_CHAIN_HOPS:
+            raise RequestError("INVALID_INPUT")
+        for hop in hops:
+            _fields(hop, _JUMP_LOGIN)
+        return RouteCredential(payload)
+    return _vpn_route_credential(payload, fields)
+
+
+def _wipe_login(payload: object) -> None:
+    if type(payload) is dict:
+        for key in ("password", "private_key", "passphrase"):
+            if key in payload:
+                payload[key] = ""
+
+
 def _wipe_route_payload(payload: object) -> None:
     if type(payload) is not dict:
         return
-    for key in ("password", "private_key", "passphrase"):
-        if key in payload:
-            payload[key] = ""
-    if type(payload.get("jump")) is dict:
-        for key in ("password", "private_key", "passphrase"):
-            if key in payload["jump"]:
-                payload["jump"][key] = ""
+    _wipe_login(payload)
+    _wipe_login(payload.get("jump"))
+    if type(payload.get("hops")) is list:
+        for hop in payload["hops"]:
+            _wipe_login(hop)
 
 
 @contextmanager
@@ -259,19 +309,23 @@ def dispatch(jobs: WebAgentJobs, request: object, *, authorize=_authorize,
     action, token, payload = request["action"], request["session_token"], request["payload"]
     if not isinstance(action, str) or action not in _ACTIONS:
         raise RequestError("INVALID_INPUT")
-    authorize(token)
-    if action in ("managed-monitoring-preview", "managed-monitoring-apply"):
-        operation = action.removeprefix("managed-monitoring-")
-        with managed_monitoring.operation_lock(), _stable_public_web():
-            authorize(token)
-            return managed_monitoring.execute(operation, payload, authorize=lambda: authorize(token))
-    with _stable_public_web():
-        return _dispatch_authorized(jobs, action, token, payload,
-                                    agent_features=agent_features,
-                                    vpn_source=vpn_source, wg_control=wg_control,
-                                    amnezia_provision=amnezia_provision,
-                                    restore=restore, binary=binary,
-                                    recheck_admin=lambda: authorize(token))
+    try:
+        authorize(token)
+        if action in ("managed-monitoring-preview", "managed-monitoring-apply"):
+            operation = action.removeprefix("managed-monitoring-")
+            with managed_monitoring.operation_lock(), _stable_public_web():
+                authorize(token)
+                return managed_monitoring.execute(operation, payload, authorize=lambda: authorize(token))
+        with _stable_public_web():
+            return _dispatch_authorized(jobs, action, token, payload,
+                                        agent_features=agent_features,
+                                        vpn_source=vpn_source, wg_control=wg_control,
+                                        amnezia_provision=amnezia_provision,
+                                        restore=restore, binary=binary,
+                                        recheck_admin=lambda: authorize(token))
+    finally:
+        if action in ("prepare", "resume"):
+            _wipe_route_payload(payload)
 
 
 def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: object,
@@ -281,6 +335,10 @@ def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: o
                          amnezia_provision: AmneziaProvisionJobs | None = None,
                          restore: WebRestoreJobs | None = None, binary: bytes | None = None,
                          recheck_admin=lambda: None) -> dict:
+    if action == "capabilities":
+        _fields(payload, frozenset())
+        _chain_transport()
+        return {"protocol": 1, "max_hops": MAX_CHAIN_HOPS, "max_body_bytes": _MAX_CHAIN_BODY}
     if action.startswith("agent-features-"):
         try:
             if agent_features is None:
@@ -413,36 +471,19 @@ def _dispatch_authorized(jobs: WebAgentJobs, action: str, token: str, payload: o
         finally:
             _wipe_route_payload(payload)
     if action in ("prepare", "resume"):
+        fields = _PREPARE if action == "prepare" else _RESUME
+        credential = _enrollment_credential(payload, fields)
         try:
-            jumped = type(payload) is dict and "jump" in payload
-            fields = _PREPARE if action == "prepare" else _RESUME
-            _fields(payload, fields | {"host_key_blob", "jump"} if jumped else fields)
-            if jumped:
-                _fields(payload["jump"], _JUMP_LOGIN)
-            credential = RouteCredential(payload)
-            try:
-                options = _options(payload)
-                args = {"target_options": options,
-                        "reviewed_fingerprint": payload["fingerprint"],
-                        "credential": credential, "session_token": token}
-                if action == "prepare":
-                    result = jobs.prepare(**args, name=payload["name"],
-                        hub_host=payload["hub_host"], hub_port=payload["hub_port"],
-                        local_port=payload["local_port"])
-                else:
-                    result = jobs.resume(payload["request_id"], **args)
-            finally:
-                credential.wipe()
+            args = {"target_options": _options(payload),
+                    "reviewed_fingerprint": payload["fingerprint"],
+                    "credential": credential, "session_token": token}
+            if action == "prepare":
+                return jobs.prepare(**args, name=payload["name"],
+                    hub_host=payload["hub_host"], hub_port=payload["hub_port"],
+                    local_port=payload["local_port"])
+            return jobs.resume(payload["request_id"], **args)
         finally:
-            if type(payload) is dict:
-                for key in ("password", "private_key", "passphrase"):
-                    if key in payload:
-                        payload[key] = ""
-                if type(payload.get("jump")) is dict:
-                    for key in ("password", "private_key", "passphrase"):
-                        if key in payload["jump"]:
-                            payload["jump"][key] = ""
-        return result
+            credential.wipe()
     if action in ("apply", "cleanup"):
         _fields(payload, frozenset({"request_id", "expected_revision"}))
         return getattr(jobs, action)(payload["request_id"], payload["expected_revision"])
@@ -477,6 +518,7 @@ def _handle(connection: socket.socket, jobs: WebAgentJobs,
     with connection:
         connection.settimeout(30)
         raw = bytearray()
+        request = None
         try:
             if peer_uid is None:
                 if not hasattr(socket, "SO_PEERCRED"):
@@ -488,8 +530,8 @@ def _handle(connection: socket.socket, jobs: WebAgentJobs,
             elif peer_uid != _GATEWAY_UID:
                 raise RequestError("FORBIDDEN")
             incoming = connection.makefile("rb")
-            raw.extend(incoming.readline(_MAX_REQUEST + 1))
-            if not raw.endswith(b"\n") or len(raw) > _MAX_REQUEST:
+            raw.extend(incoming.readline(_MAX_CHAIN_REQUEST + 1))
+            if not raw.endswith(b"\n") or len(raw) > _MAX_CHAIN_REQUEST:
                 raise RequestError("INVALID_INPUT")
 
             def unique(pairs):
@@ -501,6 +543,11 @@ def _handle(connection: socket.socket, jobs: WebAgentJobs,
                 return value
 
             request = json.loads(raw, object_pairs_hook=unique)
+            if len(raw) > _MAX_REQUEST:
+                payload = request.get("payload") if type(request) is dict else None
+                if (type(payload) is not dict or request.get("action") not in ("prepare", "resume") or
+                        type(payload.get("hops")) is not list):
+                    raise RequestError("INVALID_INPUT")
             binary = None
             if type(request) is dict and request.get("action") == "restore-import-chunk":
                 authorize(request.get("session_token"))
@@ -526,6 +573,8 @@ def _handle(connection: socket.socket, jobs: WebAgentJobs,
         except Exception:
             response = {"ok": False, "error": "OPERATION_FAILED"}
         finally:
+            if type(request) is dict:
+                _wipe_route_payload(request.get("payload"))
             if "incoming" in locals():
                 incoming.close()
             raw[:] = b"\0" * len(raw)
