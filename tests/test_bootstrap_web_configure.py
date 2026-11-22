@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -92,7 +94,7 @@ class WebConfigureTests(unittest.TestCase):
             root = Path(directory)
             expected = self.fixture(root)
             with patch.object(self.module["importlib"].util, "spec_from_file_location") as load:
-                with self.assertRaisesRegex(ValueError, "нужен проверенный"):
+                with self.assertRaisesRegex(ValueError, "другим выпуском SovaGrid"):
                     self.module["main"]([str(root), "0" * 64, "panel.example", "", ""])
                 load.assert_not_called()
                 (root / "sovagrid-blueprint/source.py").write_bytes(b"raise RuntimeError('untrusted')\n")
@@ -111,6 +113,27 @@ class WebConfigureTests(unittest.TestCase):
             path.symlink_to(root / "sovagrid-hub/source.py")
             with self.assertRaisesRegex(ValueError, "небезопасный путь"):
                 self.module["verify_source"](root, expected)
+
+    def test_retry_command_keeps_selected_path_and_root_behavior(self):
+        prefix = TEXT.split("configure_web() {\n", 1)[0]
+        result = subprocess.run(["bash", "-c", prefix + "\npublic_setup_retry_hint\n", "run.sh",
+                                 "--public-address", "panel.example.org", "--panel-path", "/private/ops/",
+                                 "--root-behavior", "redirect"], capture_output=True, text=True, check=True)
+        arguments = shlex.split(result.stdout.splitlines()[-1])
+        self.assertEqual(arguments[:4], ["bash", "-o", "pipefail", "-c"])
+        self.assertIn("--configure-web --public-address panel.example.org", arguments[4])
+        self.assertIn("--panel-path /private/ops/ --root-behavior redirect", arguments[4])
+
+    def test_web_setup_timeout_gives_helper_time_to_roll_back(self):
+        process = Mock(returncode=1)
+        process.communicate.side_effect = [subprocess.TimeoutExpired("fixture", 480), (b"{}", None)]
+        with patch.object(self.module["subprocess"], "Popen") as popen:
+            popen.return_value.__enter__.return_value = process
+            with self.assertRaisesRegex(ValueError, "истекло время настройки Web"):
+                self.module["helper_call"](Path("/fixture"), "public_web.py", "apply", {"config": {}})
+        process.terminate.assert_called_once_with()
+        process.kill.assert_not_called()
+        process.communicate.assert_called_with(timeout=180)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,17 @@ KEY_TYPE = re.compile(r"[A-Za-z0-9@._-]{4,96}\Z")
 FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def direct_opener(context=None):
+    """Keep installer health requests on their explicitly selected local endpoints."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect(),
+                                     urllib.request.HTTPSHandler(context=context))
+
+
 def verify_host_key_response(raw: bytes) -> None:
     """Bind the Gateway's public host-key blob to its reported fingerprint."""
     if not isinstance(raw, bytes) or len(raw) > MAX_KEY_RESPONSE:
@@ -56,15 +67,16 @@ def verify_host_key_response(raw: bytes) -> None:
 
 
 def probe_once() -> None:
+    opener = direct_opener()
     request = urllib.request.Request(
         HOST_KEY_URL, data=b"{}", method="POST",
         headers={"Content-Type": "application/json", "Origin": "http://127.0.0.1:8766"})
-    with urllib.request.urlopen(request, timeout=12) as response:
+    with opener.open(request, timeout=12) as response:
         if response.status != 200:
             raise ValueError("host-key route unavailable")
         raw = response.read(MAX_KEY_RESPONSE + 1)
     verify_host_key_response(raw)
-    with urllib.request.urlopen(PANEL_URL, timeout=5) as response:
+    with opener.open(PANEL_URL, timeout=5) as response:
         if response.status != 200 or not response.headers.get(
                 "Content-Type", "").startswith("text/html"):
             raise ValueError("panel route unavailable")

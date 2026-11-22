@@ -119,6 +119,30 @@ bootstrap_installation_guard() {
   [[ ! -e /var/lib/.sovagrid-host-restore-in-progress && ! -L /var/lib/.sovagrid-host-restore-in-progress ]] || die 'сначала завершите или отмените прерванное восстановление SovaGrid'
 }
 
+check_public_address_syntax() {
+  [[ -z $public_address || ( ${#public_address} -le 253 &&
+     $public_address =~ ^[a-z0-9-]+(\.[a-z0-9-]+)+$ ) ]] ||
+    die 'введите публичный IPv4 или домен строчными буквами, без https://, порта и пути'
+}
+
+public_setup_retry_hint() {
+  [[ -n $public_address ]] || return 0
+  local arguments command quoted
+  printf -v arguments ' --public-address %q' "$public_address"
+  if [[ -n $panel_path ]]; then
+    printf -v quoted ' --panel-path %q' "$panel_path"
+    arguments+=$quoted
+  fi
+  if [[ -n $root_behavior ]]; then
+    printf -v quoted ' --root-behavior %q' "$root_behavior"
+    arguments+=$quoted
+  fi
+  printf -v command 'curl -fsSL %q | sudo bash -s -- --configure-web%s' \
+    "https://github.com/sovagrid/sovagrid-blueprint/releases/download/$release/run.sh" "$arguments"
+  say 'Повторить настройку с тем же адресом и путём панели:'
+  printf '  bash -o pipefail -c %q\n' "$command"
+}
+
 configure_web() {
 python3 -B -I - "$source_root" "$manifest_sha256" "$public_address" "$panel_path" "$root_behavior" <<'PY'
 # SOVAGRID_BOOTSTRAP_WEB_CONFIGURE_PY
@@ -168,7 +192,7 @@ def verify_source(root, expected):
     checked(root, directory=True)
     raw = checked(root / 'sovagrid-bundle.json', limit=512 * 1024)
     if hashlib.sha256(raw).hexdigest() != expected:
-        raise ValueError('нужен проверенный server-v0.14.1; обновите старую установку через Connect')
+        raise ValueError('этот run.sh закреплён за другим выпуском SovaGrid; используйте run.sh установленной версии или обновите Hub')
     value = json.loads(raw, object_pairs_hook=unique)
     if (not isinstance(value, dict) or set(value) != {'format', 'components', 'sha256'} or
             type(value['format']) is not int or value['format'] != 1 or
@@ -203,13 +227,23 @@ class HelperError(ValueError):
 
 def helper_call(root, helper, action, value=None):
     raw = None if value is None else (json.dumps(value, separators=(',', ':')) + '\n').encode()
-    reply = subprocess.run([sys.executable, '-B', '-I', str(root / 'sovagrid-blueprint/deploy' / helper), action],
-                           input=raw, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                           timeout=480, check=False)
-    if len(reply.stdout) > 8192:
+    command = [sys.executable, '-B', '-I', str(root / 'sovagrid-blueprint/deploy' / helper), action]
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        try:
+            output, _ = process.communicate(raw, timeout=480)
+        except subprocess.TimeoutExpired as error:
+            # A verified helper has a SIGTERM handler that stops its current command and rolls back.
+            process.terminate()
+            try:
+                process.communicate(timeout=180)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            raise HelperError('истекло время настройки Web; проверьте состояние панели перед повтором') from error
+    if len(output) > 8192:
         raise HelperError('слишком большой ответ настройки Web')
-    result = json.loads(reply.stdout, object_pairs_hook=unique)
-    if reply.returncode or not isinstance(result, dict) or result.get('ok') is not True:
+    result = json.loads(output, object_pairs_hook=unique)
+    if process.returncode or not isinstance(result, dict) or result.get('ok') is not True:
         error = result.get('error', {}) if isinstance(result, dict) else {}
         raise HelperError(error.get('message', 'настройка Web не завершилась'))
     return result
@@ -389,12 +423,13 @@ fi
 require_local_docker_target
 if [[ $setup_mode == configure ]]; then
   [[ -n $public_address ]] || die 'укажите --public-address ДОМЕН_ИЛИ_IP'
+  check_public_address_syntax
   command -v python3 >/dev/null || die 'в установленной системе нет python3'
   [[ -f /var/lib/sovagrid/.managed-by-run-sh && ! -L /var/lib/sovagrid/.managed-by-run-sh &&
      $(stat -c '%u:%g:%a:%h' /var/lib/sovagrid/.managed-by-run-sh) == 0:0:600:1 ]] ||
     die 'нужна установленная управляемая SovaGrid'
   bootstrap_installation_guard
-  configure_web || die 'публичный доступ не настроен; проверьте адрес и доступность TCP 80/443'
+  configure_web || { public_setup_retry_hint; die 'не удалось подтвердить публичный HTTPS'; }
   say 'Публичный HTTPS настроен. Используйте прежние логин и пароль Hub.'
   exit 0
 fi
@@ -434,8 +469,7 @@ fi
 [[ $root_behavior == untouched || $root_behavior == panel ||
    $root_behavior == redirect || $root_behavior == not_found ]] ||
   die 'неверное поведение корня сайта'
-[[ -z $public_address || ( ${#public_address} -le 253 && $public_address != *[[:space:]]* ) ]] ||
-  die 'неверный публичный адрес'
+check_public_address_syntax
 if [[ -z $public_address ]]; then
   say 'Выбран доступ только через SSH: публичная ссылка на панель после установки не появится.'
 else
@@ -489,7 +523,8 @@ fi
 
 # The verified installed helpers own Caddy/Compose state and rollback.
 if ! configure_web; then
-  die 'Hub установлен, но путь/HTTPS не настроен. Повторите эту команду с --configure-web --public-address ДОМЕН_ИЛИ_IP; доступ через SSH сохранён.'
+  public_setup_retry_hint
+  die 'Hub установлен. Настройка веб-доступа не завершилась.'
 fi
 
 say 'Установка завершена. Дополнительные серверы подключаются из панели или приложения по SSH.'

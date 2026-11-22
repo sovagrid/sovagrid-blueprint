@@ -1146,12 +1146,23 @@ def gateway_prior_state():
         fail('STATE')
     return {'container_ids': ids, 'image': image.stdout.strip() if image.returncode == 0 else None}
 
+class _NoLoopbackRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _loopback_opener(context=None):
+    # Keep the updater's local postchecks independent of candidate code and env proxies.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoLoopbackRedirect(),
+                                     urllib.request.HTTPSHandler(context=context))
+
+
 def browser_ssh_route_health():
     request = urllib.request.Request(
         'http://127.0.0.1:8766/api/v1/browser-ssh/host-key', data=b'{}',
         headers={'Content-Type': 'application/json', 'Origin': 'http://127.0.0.1:8766'},
         method='POST')
-    with urllib.request.urlopen(request, timeout=12) as response:
+    with _loopback_opener().open(request, timeout=12) as response:
         if response.status != 200:
             raise UpdateFailure('browser SSH route failed')
         raw = response.read(16 * 1024 + 1)
@@ -1221,13 +1232,14 @@ def health(source, expected_units):
                                timeout=10, check=True).stdout.strip()
         if stray:
             raise UpdateFailure('unmanaged SSH gateway container')
-    with urllib.request.urlopen('http://127.0.0.1:8766/healthz', timeout=5) as response:
+    context = ssl.create_default_context(cafile=str(path('/etc/sovagrid/hub-ca.pem')))
+    opener = _loopback_opener(context)
+    with opener.open('http://127.0.0.1:8766/healthz', timeout=5) as response:
         if response.status != 200:
             raise UpdateFailure('web health check failed')
     if SSH_GATEWAY_SERVICE in services:
         browser_ssh_route_health()
-    context = ssl.create_default_context(cafile=str(path('/etc/sovagrid/hub-ca.pem')))
-    with urllib.request.urlopen('https://localhost:8767/healthz', context=context, timeout=5) as response:
+    with opener.open('https://localhost:8767/healthz', timeout=5) as response:
         if response.status != 200:
             raise UpdateFailure('hub TLS health check failed')
     if not path('/var/lib/sovagrid/vpn/status.json').is_file():

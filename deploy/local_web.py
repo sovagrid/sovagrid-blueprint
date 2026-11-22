@@ -200,17 +200,9 @@ class LocalWeb:
         require(state is None, "PUBLIC_ACTIVE")
 
     def local_health(self):
-        # A local Hub promoted from an external Agent has its own CA. /etc/sovagrid/hub-ca.pem may
-        # still belong to the independent external Agent and must not be used
-        # to validate the local Hub's TLS listener.
-        ca = ("/var/lib/sovagrid/local-hub-ca.pem" if
-              os.path.lexists(self.path("/var/lib/sovagrid/local-hub-ca.pem")) else
-              "/etc/sovagrid/hub-ca.pem")
         try:
-            self.shared.check(ca, private=ca.startswith("/var/lib/"), limit=16384)
-            self.shared.run([sys.executable, "-I", "-c", public.LOCAL_HEALTH_SCRIPT,
-                             str(self.path(ca))], timeout=35)
-        except (OSError, ValueError, public.PublicWebError) as error:
+            self.shared.local_health()
+        except public.PublicWebError as error:
             raise LocalWebError("LOCAL_UNHEALTHY") from error
 
     def state(self):

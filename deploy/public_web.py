@@ -30,15 +30,19 @@ import uuid
 PUBLIC = "/etc/sovagrid/public-web"
 LOCAL_WEB = "/etc/sovagrid/local-web"
 SOURCE = "/opt/sovagrid-src"
+HUB_CA = "/etc/sovagrid/hub-ca.pem"
+LOCAL_HUB_CA = "/var/lib/sovagrid/local-hub-ca.pem"
 DEFAULT_PANEL_PATH = "/sovagrid/monitoring/"
 ROOT_BEHAVIORS = {"untouched", "panel", "redirect", "not_found"}
 SSH_GATEWAY_MARKER = "/var/lib/sovagrid/.ssh-gateway-managed-by-run-sh"
+SSH_PROBE = "sovagrid-blueprint/deploy/browser_ssh_probe.py"
 COMPONENTS = {"sovagrid-blueprint", "sovagrid-hub", "sovagrid-web", "sovagrid-agent", "sovagrid-vpn"}
 GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 REQUIRED = {
     "sovagrid-blueprint/run.sh", "sovagrid-blueprint/deploy/compose.yaml",
     "sovagrid-blueprint/deploy/public_web.py",
+    SSH_PROBE,
     "sovagrid-blueprint/deploy/public-web.site.template",
     "sovagrid-blueprint/deploy/compose.public-web.template",
     "sovagrid-web/deploy/Caddyfile.container", "sovagrid-web/Dockerfile",
@@ -76,14 +80,18 @@ if sys.argv[2] == 'staging':
     context.verify_mode = ssl.CERT_NONE
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect,
                                     urllib.request.HTTPSHandler(context=context))
-for attempt in range(30):
+deadline = time.monotonic() + 120.0
+while (remaining := deadline - time.monotonic()) > 0:
     try:
-        with opener.open(sys.argv[1] + '/healthz', timeout=3) as response:
-            if response.status == 200 and len(response.read(8193)) <= 8192:
+        with opener.open(sys.argv[1] + '/healthz', timeout=min(3.0, remaining)) as response:
+            if (response.status == 200 and len(response.read(8193)) <= 8192 and
+                    time.monotonic() <= deadline):
                 sys.exit(0)
     except (OSError, ValueError):
         pass
-    time.sleep(1)
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(min(1.0, remaining))
 sys.exit(1)
 '''
 
@@ -133,11 +141,14 @@ sys.exit(1)
 '''
 
 PUBLIC_SSH_HEALTH_SCRIPT = r'''
-import json, re, ssl, sys, time, urllib.request
+import runpy, ssl, sys, time, urllib.request
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
 origin, panel_path = sys.argv[1], sys.argv[3]
+probe = runpy.run_path(sys.argv[4])
+verify_host_key_response = probe['verify_host_key_response']
+max_key_response = probe['MAX_KEY_RESPONSE']
 context = ssl.create_default_context()
 if sys.argv[2] == 'staging':
     context.check_hostname = False
@@ -152,16 +163,8 @@ for attempt in range(5):
         with opener.open(request, timeout=4) as response:
             if response.status != 200:
                 raise ValueError('unexpected status')
-            raw = response.read(513)
-        if len(raw) > 512:
-            raise ValueError('oversized reply')
-        value = json.loads(raw)
-        if (not isinstance(value, dict) or set(value) != {'protocol', 'port', 'key_type', 'fingerprint'} or
-                value['protocol'] != 1 or type(value['port']) is not int or
-                not 1 <= value['port'] <= 65535 or not isinstance(value['key_type'], str) or
-                not value['key_type'] or not isinstance(value['fingerprint'], str) or
-                re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', value['fingerprint']) is None):
-            raise ValueError('invalid host key')
+            raw = response.read(max_key_response + 1)
+        verify_host_key_response(raw)
         with opener.open(origin + panel_path, timeout=4) as response:
             if response.status != 200 or not response.headers.get('Content-Type', '').startswith('text/html'):
                 raise ValueError('panel route unavailable')
@@ -545,14 +548,21 @@ class PublicWeb:
         return args
 
     def local_health(self):
+        # A Hub installed with --hub-only has a separate CA. The usual file
+        # can still be the CA of the external Hub trusted by the original Agent.
         try:
-            self.check("/etc/sovagrid/hub-ca.pem", limit=16384)
+            ca = LOCAL_HUB_CA
+            try:
+                self.path(ca).lstat()
+            except FileNotFoundError:
+                ca = HUB_CA
+            self.check(ca, private=ca == LOCAL_HUB_CA, limit=16384)
             # Compose returns before Caddy/its localhost certificate is ready.
             # Both channels must pass in the same polling round. A separate
             # process bounds NSS/DNS and slow streaming bodies, beyond socket
             # timeouts, while preserving strict private-CA/hostname validation.
             self.run([sys.executable, "-I", "-c", LOCAL_HEALTH_SCRIPT,
-                      str(self.path("/etc/sovagrid/hub-ca.pem"))], timeout=35)
+                      str(self.path(ca))], timeout=35)
         except (OSError, ValueError) as error:
             raise PublicWebError("LOCAL_UNHEALTHY") from error
 
@@ -778,9 +788,11 @@ class PublicWeb:
             raise PublicWebError("PUBLIC_UNHEALTHY") from error
 
     def public_ssh_health(self, config):
+        # The apply and refresh paths have verified this helper in the installed manifest.
+        probe = self.path(SOURCE + "/" + SSH_PROBE)
         try:
-            self.run([sys.executable, "-I", "-c", PUBLIC_SSH_HEALTH_SCRIPT,
-                      self.url(config), config["acme_environment"], config["panel_path"]], timeout=45)
+            self.run([sys.executable, "-B", "-I", "-c", PUBLIC_SSH_HEALTH_SCRIPT,
+                      self.url(config), config["acme_environment"], config["panel_path"], str(probe)], timeout=45)
         except PublicWebError as error:
             raise PublicWebError("PUBLIC_UNHEALTHY") from error
 

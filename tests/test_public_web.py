@@ -8,11 +8,13 @@ import json
 import os
 from pathlib import Path
 import signal
+import ssl
 import stat
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import MagicMock, patch
 
 SPEC = importlib.util.spec_from_file_location("public_web", Path(__file__).parents[1] / "deploy/public_web.py")
 web = importlib.util.module_from_spec(SPEC)
@@ -114,6 +116,64 @@ class PublicWebTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.helper = source_fixture(self.root)
+
+    def test_public_local_health_uses_the_local_hub_ca_after_promotion(self):
+        runner = MagicMock()
+        helper = web.PublicWeb(self.root, uid=os.getuid(), runner=runner)
+        external_ca = self.root / "etc/sovagrid/hub-ca.pem"
+        external_ca.write_text("CA of external Hub")
+        helper.local_health()
+        self.assertEqual(runner.call_args.args[0][-1], str(external_ca))
+
+        local_ca = self.root / "var/lib/sovagrid/local-hub-ca.pem"
+        local_ca.write_text("CA of promoted local Hub")
+        local_ca.chmod(0o600)
+        helper.local_health()
+        self.assertEqual(runner.call_args.args[0][-1], str(local_ca))
+
+        runner.reset_mock()
+        local_ca.unlink()
+        local_ca.symlink_to(external_ca)
+        with self.assertRaises(web.PublicWebError) as refused:
+            helper.local_health()
+        self.assertEqual(refused.exception.code, "LOCAL_UNHEALTHY")
+        runner.assert_not_called()
+
+    def test_public_readiness_waits_for_the_first_acme_retry(self):
+        for ready_at, expected_status in ((61, 0), (None, 1)):
+            with self.subTest(ready_at=ready_at):
+                current = 0.0
+                response = MagicMock(status=200)
+                response.__enter__.return_value = response
+                response.read.return_value = b"ready"
+
+                def sleep(seconds):
+                    nonlocal current
+                    current += seconds
+
+                def poll(url, timeout):
+                    self.assertEqual(url, "https://203.0.113.10/healthz")
+                    self.assertGreater(timeout, 0)
+                    self.assertLessEqual(timeout, 3)
+                    if ready_at is None or current < ready_at:
+                        raise OSError("certificate still pending")
+                    return response
+
+                opener = MagicMock()
+                opener.open.side_effect = poll
+                with (patch.object(sys, "argv", ["-c", "https://203.0.113.10", "production"]),
+                      patch("urllib.request.build_opener", return_value=opener) as build_opener,
+                      patch("time.monotonic", side_effect=lambda: current),
+                      patch("time.sleep", side_effect=sleep),
+                      self.assertRaises(SystemExit) as child_status):
+                    exec(compile(web.PUBLIC_HEALTH_SCRIPT, "public readiness probe", "exec"), {})
+                self.assertEqual(child_status.exception.code, expected_status)
+                self.assertEqual(current, 120 if ready_at is None else ready_at)
+                proxy, redirect, tls = build_opener.call_args.args
+                self.assertEqual(proxy.proxies, {})
+                self.assertIsNone(redirect.redirect_request(None, None, 302, None, None, None))
+                self.assertTrue(tls._context.check_hostname)
+                self.assertEqual(tls._context.verify_mode, ssl.CERT_REQUIRED)
 
     def enable(self, config=None):
         config = config or CONFIG

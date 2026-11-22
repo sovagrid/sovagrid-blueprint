@@ -39,6 +39,7 @@ DOCKER = ('docker', '--host', 'unix:///var/run/docker.sock')
 UNITS = Path('/etc/systemd/system')
 UNIT = re.compile(r'sovagrid-[a-z0-9@.-]+\.(?:service|socket|timer)\Z')
 VPN_CODE = Path('/opt/sovagrid-vpn')
+VPN_CONTROL_MARKER = '/etc/sovagrid/.vpn-control-managed-by-run-sh'
 ROUTING_POLICY = '/etc/sovagrid-vpn-routing/policy.json'
 ROUTING_SYSCTL = '/etc/sysctl.d/70-sovagrid-vpn-routing.conf'
 ROUTING_UNIT = '/etc/systemd/system/' + installed.ROUTING_UNIT
@@ -216,6 +217,16 @@ def reviewed_routing(manifest):
     return policy, unit, sysctl
 
 
+def reviewed_vpn_programs(manifest):
+    programs = tuple(path for path in hub_only.VPN_PROGRAMS if os.path.lexists(path))
+    for path in programs:
+        actual = installed.public_path(str(path), limit=8192)
+        expected = manifest['sha256'].get('sovagrid-vpn/deploy/' + path.name)
+        need(hashlib.sha256(actual).hexdigest() == expected,
+             f'Содержимое {path} отличается от проверенного пакета SovaGrid')
+    return programs
+
+
 def reviewed_containers(roots):
     identifiers = execute(*DOCKER, 'ps', '-aq').decode().splitlines()
     if not identifiers:
@@ -259,14 +270,17 @@ def reviewed_network(containers):
     return network['Id']
 
 
-def runtime_roots(layout=None, *, keep_routing=False):
+def runtime_roots(layout=None, *, keep_routing=False, vpn_programs=()):
     paths = [Path(name) for name in RUNTIME]
+    regular = set(vpn_programs)
+    paths.extend(vpn_programs)
     if layout is not None:
         paths = [path for path in paths if path not in {
             hub_only.SHARED_CONFIG, Path('/opt/sovagrid-agent'), Path('/etc/sovagrid-journal'),
             Path('/var/lib/sovagrid-containers'),
         }]
         paths.extend(layout.extra_paths)
+        regular.update(layout.regular_paths)
     if keep_routing:
         paths.remove(VPN_CODE)
     paths.extend((Path(enrollment.HUB_STATE_DIR), DATA, SOURCE))
@@ -280,9 +294,7 @@ def runtime_roots(layout=None, *, keep_routing=False):
         need(not any(mount.is_relative_to(path) for mount in mounts),
              f'Точка монтирования внутри пути {path}')
         if path in paths:
-            # Shared configuration files are explicitly enumerated by the
-            # layout. Existing full-install roots must still be directories.
-            if layout is not None and path in layout.regular_paths:
+            if path in regular:
                 kind_ok = stat.S_ISREG(info.st_mode) and info.st_nlink == 1
             else:
                 kind_ok = stat.S_ISDIR(info.st_mode)
@@ -414,7 +426,15 @@ def uninstall(plan, routes, *, manifest_digest=None):
     manifest = json.loads((SOURCE / 'sovagrid-bundle.json').read_bytes())
     layout = hub_only.inspect(manifest, manifest_digest) if manifest_digest is not None else None
     routing = reviewed_routing(manifest)
-    roots = runtime_roots(layout, keep_routing=routing is not None)
+
+    def planned_roots():
+        programs = ()
+        if layout is None and os.path.lexists(VPN_CONTROL_MARKER):
+            installed.public_path(VPN_CONTROL_MARKER, private=True)
+            programs = reviewed_vpn_programs(manifest)
+        return runtime_roots(layout, keep_routing=routing is not None, vpn_programs=programs)
+
+    roots = planned_roots()
     retained = layout.retained_paths if layout is not None else ()
     identities = root_identities([*roots, *retained])
     units = reviewed_units(manifest, layout)
@@ -440,7 +460,7 @@ def uninstall(plan, routes, *, manifest_digest=None):
     mode = 'Hub-only' if layout is not None else 'Hub'
     print(f'{mode}: служб {len(units)}, контейнеров {len(containers)}, удалённых Agent {len(agents)}.')
     print('Удаляемые службы: ' + (', '.join(path.name for path in units) or 'нет'))
-    print('Удаляемые каталоги: ' + ', '.join(map(str, roots)))
+    print('Удаляемые пути: ' + ', '.join(map(str, roots)))
     print(f'Копии из {BACKUPS} будут перенесены в отдельный каталог рядом. '
           'Пользовательские файлы, выгрузки и конфигурация WireGuard сохраняются.')
     if routing is not None:
@@ -474,7 +494,7 @@ def uninstall(plan, routes, *, manifest_digest=None):
             layout_matches = local_config == installed.public_path('/etc/sovagrid/agent.json', limit=65536)
         need(layout_matches and reviewed_routing(manifest) == routing and
              agents == installed_agents(database, ledger, local_id=local_id) and
-             identities == root_identities([*runtime_roots(layout, keep_routing=routing is not None), *retained]) and
+             identities == root_identities([*planned_roots(), *retained]) and
              units == reviewed_units(manifest, layout) and
              containers == reviewed_containers([*roots, *retained]) and
              network == reviewed_network(containers),
@@ -491,7 +511,7 @@ def uninstall(plan, routes, *, manifest_digest=None):
         check_local(database)
         stop_local(units, containers, network, ledger, agents)
     need(reviewed_routing(manifest) == routing and
-         identities == root_identities([*runtime_roots(layout, keep_routing=routing is not None), *retained]),
+         identities == root_identities([*planned_roots(), *retained]),
          'Каталоги установки изменились после остановки Hub')
     if layout is not None:
         layout.recheck_external()

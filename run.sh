@@ -1676,14 +1676,14 @@ else
   ca_target=/etc/sovagrid/hub-ca.pem
   install -o root -g root -m 0644 "$ca_source" "$ca_target"
 fi
-python3 - "$ca_target" <<'PY'
-import ssl, sys, time, urllib.request
+python3 -B -I - "$ca_target" "$blueprint_dir/deploy/browser_ssh_probe.py" <<'PY'
+import runpy, ssl, sys, time
 context = ssl.create_default_context(cafile=sys.argv[1])
-for url, tls in (('http://127.0.0.1:8766/healthz', None),
-                 ('https://localhost:8767/healthz', context)):
+opener = runpy.run_path(sys.argv[2])['direct_opener'](context)
+for url in ('http://127.0.0.1:8766/healthz', 'https://localhost:8767/healthz'):
     for attempt in range(30):
         try:
-            with urllib.request.urlopen(url, context=tls, timeout=5) as response:
+            with opener.open(url, timeout=5) as response:
                 if response.status == 200:
                     break
         except (OSError, ssl.SSLError):

@@ -50,9 +50,10 @@ class WebAgentUpdateSnapshotTest(unittest.TestCase):
                          mock.patch.object(worker, "command", side_effect=command), \
                          mock.patch.object(worker.subprocess, "run", side_effect=run), \
                          mock.patch.object(worker, "compose_services", return_value=()), \
-                         mock.patch.object(worker.ssl, "create_default_context"), \
-                         mock.patch.object(worker.urllib.request, "urlopen") as urlopen, \
+                         mock.patch.object(worker.ssl, "create_default_context") as context, \
+                         mock.patch.object(worker, "_loopback_opener") as opener, \
                          mock.patch.object(worker, "source_manifest"):
+                        urlopen = opener.return_value.open
                         urlopen.return_value.__enter__.return_value.status = 200
                         snapshot = root / "var/lib/sovagrid/vpn/status.json"
                         snapshot.parent.mkdir(parents=True, exist_ok=True)
@@ -61,6 +62,12 @@ class WebAgentUpdateSnapshotTest(unittest.TestCase):
                         if healthy:
                             worker.health(root, units)
                             socket_ready.assert_called_once()
+                            context.assert_called_once_with(cafile=str(root / "etc/sovagrid/hub-ca.pem"))
+                            opener.assert_called_once_with(context.return_value)
+                            self.assertEqual(urlopen.call_args_list, [
+                                mock.call("http://127.0.0.1:8766/healthz", timeout=5),
+                                mock.call("https://localhost:8767/healthz", timeout=5),
+                            ])
                         else:
                             with self.assertRaises(worker.UpdateFailure):
                                 worker.health(root, units)
