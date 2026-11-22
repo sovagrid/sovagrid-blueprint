@@ -1491,6 +1491,33 @@ PY
     die 'source bundle manifest digest is invalid'
 fi
 export SOVAGRID_BUNDLE_MANIFEST_SHA256
+# A first upgrade supervised by an older updater could still roll back to a
+# Hub that ignores explicit denies. Keep writes disabled for that build.
+# The proof is embedded in the image, so routine Compose recreates preserve it.
+terminal_guarded_build=1
+if [[ ${SOVAGRID_PUBLIC_WEB_LOCK_HELD:-0} == 1 && ${SOVAGRID_TERMINAL_POLICY_GUARD:-0} != 1 ]]; then
+  terminal_guarded_build=0
+fi
+if (( web_agent_deferred )); then terminal_guarded_build=0; fi
+SOVAGRID_TERMINAL_GUARD_MANIFEST_SHA256=$(python3 -B -I - "$source_root" "$blueprint_dir/deploy/managed_security_state.py" \
+  "$SOVAGRID_BUNDLE_MANIFEST_SHA256" "$terminal_guarded_build" <<'PY'
+import os
+from pathlib import Path
+import runpy
+import sys
+
+source, module, manifest, guarded = sys.argv[1:]
+security = runpy.run_path(module)
+database = Path(security["DATABASE"])
+source = Path(source)
+if os.path.lexists(database):
+    required = security["inspect_database"](database, uid=10001, gid=10001)
+    if required and not required <= security["bundle_supports"](source):
+        raise SystemExit(1)
+print(security["terminal_build_stamp"](source, manifest, guarded_supervisor=guarded == "1"))
+PY
+) || die 'source cannot safely use the existing Hub security state'
+export SOVAGRID_TERMINAL_GUARD_MANIFEST_SHA256
 
 public_overlay=''
 if [[ -e /etc/sovagrid/public-web || -L /etc/sovagrid/public-web ]]; then

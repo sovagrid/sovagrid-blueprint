@@ -6,6 +6,7 @@ services:
       context: ../../sovagrid-hub
       args:
         SOVAGRID_BUNDLE_MANIFEST_SHA256: ${SOVAGRID_BUNDLE_MANIFEST_SHA256:-}
+        SOVAGRID_TERMINAL_GUARD_MANIFEST_SHA256: ${SOVAGRID_TERMINAL_GUARD_MANIFEST_SHA256:-}
     image: sovagrid-hub:local
     command: ["--db", "/data/hub.sqlite", "serve", "--bind", "0.0.0.0", "--port", "8765", "--trusted-proxy", "172.30.253.10", "--telegram-token-file", "/data/telegram-bot-token"]
     user: "10001:10001"

@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -99,6 +100,10 @@ def bundle_supports(source: Path):
     checks = (
         ("sovagrid-blueprint/run.sh", b"# SOVAGRID_INDEPENDENT_TERMINAL_V1\n"),
         ("sovagrid-blueprint/deploy/managed_security_state.py", b"def inspect_database("),
+        ("sovagrid-blueprint/deploy/compose.yaml", b"SOVAGRID_TERMINAL_GUARD_MANIFEST_SHA256:"),
+        ("sovagrid-hub/Dockerfile", b"ARG SOVAGRID_TERMINAL_GUARD_MANIFEST_SHA256"),
+        ("sovagrid-hub/sovagrid_hub/__main__.py", b"def _independent_terminal_writes("),
+        ("sovagrid-hub/sovagrid_hub/backup.py", b"def _require_compatible_terminal_policy("),
         ("sovagrid-hub/sovagrid_hub/agent_management.py", b"def save_agent_management_permissions("),
         ("sovagrid-hub/sovagrid_hub/api/routes/relays.py", b"self.app.store.terminal_access_valid("),
         ("sovagrid-hub/sovagrid_hub/persistence/servers.py", b"terminal_access_policy("),
@@ -109,3 +114,11 @@ def bundle_supports(source: Path):
         if candidate.is_symlink() or not candidate.is_file() or evidence not in candidate.read_bytes():
             return frozenset()
     return frozenset((TERMINAL,))
+
+
+def terminal_build_stamp(source: Path, manifest: str, *, guarded_supervisor: bool):
+    """The installer calls this after its manifest validation under the installation lock."""
+    if (source != Path("/opt/sovagrid-src") or not guarded_supervisor
+            or re.fullmatch(r"[0-9a-f]{64}", manifest) is None):
+        return ""
+    return manifest if TERMINAL in bundle_supports(source) else ""

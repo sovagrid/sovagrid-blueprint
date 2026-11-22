@@ -1000,7 +1000,7 @@ def apply(archive_sha: str, current_manifest: str, *, automatic: bool = False) -
                                    SOVAGRID_HUB_BACKUP_BROKER_SNAPSHOT="1",
                                    SOVAGRID_EXTERNAL_APPLY_UNIT_SNAPSHOT="1",
                                    SOVAGRID_SSH_GATEWAY_SNAPSHOT="1",
-                                   SOVAGRID_WEB_AGENT_SNAPSHOT="1")
+                                   SOVAGRID_WEB_AGENT_SNAPSHOT="1", SOVAGRID_TERMINAL_POLICY_GUARD="1")
                 common.command(["bash", str(SOURCE / "sovagrid-blueprint/run.sh"), "--hub-only"],
                                timeout=2700, stdout=output, env=install_env,
                                pass_fds=(installation_descriptor,))

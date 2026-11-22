@@ -51,6 +51,10 @@ class ManagedSecurityStateTests(unittest.TestCase):
         for relative, evidence in (
             ("sovagrid-blueprint/run.sh", "# SOVAGRID_INDEPENDENT_TERMINAL_V1\n"),
             ("sovagrid-blueprint/deploy/managed_security_state.py", "def inspect_database("),
+            ("sovagrid-blueprint/deploy/compose.yaml", "SOVAGRID_TERMINAL_GUARD_MANIFEST_SHA256:"),
+            ("sovagrid-hub/Dockerfile", "ARG SOVAGRID_TERMINAL_GUARD_MANIFEST_SHA256"),
+            ("sovagrid-hub/sovagrid_hub/__main__.py", "def _independent_terminal_writes("),
+            ("sovagrid-hub/sovagrid_hub/backup.py", "def _require_compatible_terminal_policy("),
             ("sovagrid-hub/sovagrid_hub/agent_management.py", "def save_agent_management_permissions("),
             ("sovagrid-hub/sovagrid_hub/api/routes/relays.py", "self.app.store.terminal_access_valid("),
             ("sovagrid-hub/sovagrid_hub/persistence/servers.py", "terminal_access_policy("),
@@ -72,3 +76,14 @@ class ManagedSecurityStateTests(unittest.TestCase):
             self.assertFalse(worker.candidate_security_compatible(self.source))
         finally:
             unreadable.unlink()
+
+    def test_build_stamp_requires_the_managed_tree_verified_digest_and_guard(self):
+        build = SECURITY["terminal_build_stamp"]
+        supported = SECURITY["TERMINAL"]
+        managed = Path("/opt/sovagrid-src")
+        digest = "a" * 64
+        with patch.dict(build.__globals__, {"bundle_supports": lambda _: {supported}}):
+            self.assertEqual(build(managed, digest, guarded_supervisor=True), digest)
+            self.assertEqual(build(managed, digest, guarded_supervisor=False), "")
+            self.assertEqual(build(self.source, digest, guarded_supervisor=True), "")
+            self.assertEqual(build(managed, "", guarded_supervisor=True), "")

@@ -2188,6 +2188,7 @@ def _apply_locked(candidate_digest, expected_manifest, *, automatic=False, insta
                 install_env['SOVAGRID_HUB_BACKUP_BROKER_SNAPSHOT'] = '1'
                 install_env['SOVAGRID_SSH_GATEWAY_SNAPSHOT'] = '1'
                 install_env['SOVAGRID_WEB_AGENT_SNAPSHOT'] = '1'
+                install_env['SOVAGRID_TERMINAL_POLICY_GUARD'] = '1'
                 command(['bash', str(source / 'sovagrid-blueprint/run.sh'), *flags], timeout=2700,
                         stdout=output, env=install_env, pass_fds=(installation_descriptor,))
             refresh_service_units(folder / 'source-before', source, unit_states)
